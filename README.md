@@ -342,3 +342,4 @@ pytest -q
 **没有在交付环境中运行真实LongMemEval_S、远端LLM或真实本地embedding/cross-encoder权重。**因此没有提供虚构的目标正确率、真实case的最小N或attacker覆盖率。代码接口和离线逻辑已测试，模型/网络兼容性及正式研究指标需按上面的命令在实际环境中测量。
 # advmem
 # advmem
+# advmem
