@@ -1,4 +1,4 @@
-"""python -m admem.cli：check / prepare / bank / run / probe-suite / probe / export / evaluate / merge。"""
+"""python -m admem.cli：check / prepare / bank / run / bootstrap / probe-suite / probe / export / evaluate / longmemeval-eval / merge。"""
 from __future__ import annotations
 
 import argparse
@@ -109,9 +109,115 @@ def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memo
     return summary
 
 
+def _builder_case_metrics(case_out):
+    """Summarize Builder-only checks recorded by run_case(mode='build')."""
+    checkpoint = Path(case_out) / "checkpoint.json"
+    if not checkpoint.exists():
+        return {"status": "missing_checkpoint", "windows": 0}
+    state = read(checkpoint)
+    events = [event for event in state.get("events", []) if event.get("stage") == "build"]
+    legal = 0
+    faithful = 0
+    fallback = 0
+    for event in events:
+        checks = event.get("checks") or {}
+        if checks.get("legal") is True:
+            legal += 1
+            faith = checks.get("faith")
+            if isinstance(faith, dict) and faith.get("faithful") is True:
+                faithful += 1
+        if event.get("fallback") is True:
+            fallback += 1
+    total = len(events)
+    return {
+        "status": "ok",
+        "windows": total,
+        "json_valid": legal,
+        "faithful": faithful,
+        "fallback_windows": fallback,
+        "builder_json_rate": legal / total if total else None,
+        "builder_faith_rate": faithful / total if total else None,
+    }
+
+
+def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
+                     builder_role="BUILDER", all_memory=False):
+    """Run the existing Builder over a prepared LongMemEval split, then score QA.
+
+    The Builder phase only receives the prepared context/full history. Official
+    question/answer labels are read later by ``evaluate`` from private_eval.jsonl,
+    so they cannot leak into the Builder prompt. ``mode='build'`` deliberately
+    disables the attacker/audit loop and evaluates the selected Builder policy.
+    """
+    out = Path(out)
+    prepared = Path(prepared)
+    required = [prepared / "manifest.json", prepared / "private_eval.jsonl"]
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise ValueError(
+            "--prepared must point to a native admem prepared directory "
+            "(missing: " + ", ".join(missing) + "). Run `python -m admem.cli prepare "
+            "--data <LongMemEval.json> --out <prepared>` first; the "
+            "prepare_longmemeval_cases.py SFT split is not an evaluation input."
+        )
+    run_dir = out / "run"
+    eval_dir = out / "eval"
+    if (out / "summary.json").exists():
+        raise ValueError("Output directory already has summary.json; use a new directory")
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    reports = []
+    builder_cases = []
+    for context, full_path in contexts(prepared, split, limit, keys):
+        key = context["key"]
+        print(f"longmemeval-eval {key} split={split} "
+              f"type_hint={context['question_type'] if env.cfg.hint_mode == 'target_type' else 'hidden'}",
+              flush=True)
+        full = env.memory_module.FullMemory.load(full_path)
+        case_out = run_dir / key
+        try:
+            result = run_case(full, full_path, context, env, case_out,
+                              mode="build", bank=[], builder_role=builder_role)
+            metrics = _builder_case_metrics(case_out)
+            reports.append({"key": key, **result})
+            builder_cases.append({"key": key, "question_type": context["question_type"], **metrics})
+        except Unknown as exc:
+            report = {"key": key, "status": "unknown", "error": str(exc)}
+            reports.append(report)
+            builder_cases.append({"key": key, "question_type": context["question_type"],
+                                  "status": "unknown", "error": str(exc)})
+            write(run_dir / "summary.json", reports)
+            raise
+        write(run_dir / "summary.json", reports)
+
+    total_windows = sum(row.get("windows", 0) for row in builder_cases)
+    total_legal = sum(row.get("json_valid", 0) for row in builder_cases)
+    total_faithful = sum(row.get("faithful", 0) for row in builder_cases)
+    builder_summary = {
+        "split": split,
+        "builder_role": builder_role,
+        "cases": len(builder_cases),
+        "windows": total_windows,
+        "json_valid": total_legal,
+        "faithful": total_faithful,
+        "fallback_windows": sum(row.get("fallback_windows", 0) for row in builder_cases),
+        "builder_json_rate": total_legal / total_windows if total_windows else None,
+        "builder_faith_rate": total_faithful / total_windows if total_windows else None,
+        "by_case": builder_cases,
+    }
+    write(out / "builder_summary.json", builder_summary)
+
+    qa_summary = evaluate(prepared, run_dir, split, snapshot, env, eval_dir, limit, keys, all_memory)
+    summary = {"split": split, "builder": builder_summary, "qa": qa_summary,
+               "run_dir": str(run_dir), "eval_dir": str(eval_dir), "snapshot": snapshot,
+               "all_memory": all_memory}
+    write(out / "summary.json", summary)
+    return summary
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=["check", "prepare", "bank", "run", "bootstrap", "probe-suite", "probe", "export", "relocate", "evaluate", "merge"])
+    p.add_argument("command", choices=["check", "prepare", "bank", "run", "bootstrap", "probe-suite", "probe", "export", "relocate", "evaluate", "longmemeval-eval", "merge"])
     p.add_argument("--config", default="configs/type_aware.json")
     p.add_argument("--data")
     p.add_argument("--prepared")
@@ -189,6 +295,12 @@ def main(argv=None):
         p.error("This command requires --prepared")
     if a.command == "evaluate":
         print(evaluate(a.prepared, a.run_dir, a.split, a.snapshot, env, a.out, a.limit, a.keys, a.all_memory))
+        return
+    if a.command == "longmemeval-eval":
+        if not a.prepared:
+            p.error("longmemeval-eval requires --prepared")
+        print(longmemeval_eval(a.prepared, a.split, a.snapshot, env, a.out, a.limit, a.keys,
+                               builder_role=a.builder_role, all_memory=a.all_memory))
         return
     reports = []
     for context, full_path in contexts(a.prepared, a.split, a.limit, a.keys):
