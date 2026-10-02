@@ -125,7 +125,7 @@ python run.py build \
 
 如果要在真实 LongMemEval 上测 Builder，请使用 `admem` 的准备流程。它会把完整历史写入 `cases/`，把官方问题、答案和证据标签单独写入 `private_eval.jsonl`，并按完整历史分组后划分 train/val/test；Builder 阶段看不到这些评测标签。
 
-`longmemeval-eval --prepared` 接受的是下面命令生成的原生 prepared 目录。不要直接传入 `prepare_longmemeval_cases.py` 生成的 `train.json`/`*_builder.jsonl` 目录；后者是按 session 导出的 SFT 转换格式，字段和 split 名称都不同。需要评测同一份 LongMemEval 原始 JSON 时，直接重新运行下面的 `prepare` 即可。
+`longmemeval-eval --prepared` 接受下面命令生成的原生 prepared 目录。你也可以直接把 `prepare_longmemeval_cases.py` 生成的原始 `test.json` 和 `test_labels.jsonl` 传给 `--cases/--labels`；不要传 `*_builder.jsonl`，后者是按 session 导出的 SFT 格式，不是完整历史评测输入。
 
 以官方 S 数据为例（`--sizes` 三个数字必须加起来等于输入 case 总数）：
 
@@ -148,6 +148,19 @@ python -m admem.cli longmemeval-eval \
   --snapshot M_final \
   --out outputs/longmemeval_builder_test
 ```
+
+已有按 question_id 划分的真实 LongMemEval split 时，可以直接运行：
+
+```bash
+python -m admem.cli longmemeval-eval \
+  --config configs/type_aware.json \
+  --cases data/longmemeval_splits/test.json \
+  --labels data/longmemeval_splits/test_labels.jsonl \
+  --builder-role BUILDER \
+  --out outputs/longmemeval_test_qwen3_4b
+```
+
+`--cases` 只用于构建无损历史；问题和答案只在 Builder 完成后从 `--labels` 读取。文件名为 `test.json` 时会自动记录为 test split，也可显式传 `--split test`。
 
 先用 `--limit 1` 做配置和 API smoke test；正式运行请使用新的输出目录。结果包括 `builder_summary.json`（每个窗口的 JSON 合法率、faithfulness 和 fallback 统计）、`run/` 下的 `M_build.json`/`M_final.json`，以及 `eval/summary.json`。`longmemeval-eval` 沿用现有 Builder prompt 和 `run_case(mode="build")` 路径，不使用 probes 目录中的合成状态。`eval/` 是项目内的诊断 judge 结果；如需官方分数，仍应使用 LongMemEval 官方评测器。
 

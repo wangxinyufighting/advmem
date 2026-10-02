@@ -140,6 +140,236 @@ def _builder_case_metrics(case_out):
     }
 
 
+def _json_case_list(path):
+    """Read a LongMemEval split JSON produced by prepare_longmemeval_cases.py."""
+    value = read(path)
+    if isinstance(value, dict):
+        for key in ("data", "cases", "instances"):
+            if isinstance(value.get(key), list):
+                value = value[key]
+                break
+    if not isinstance(value, list) or not all(isinstance(row, dict) for row in value):
+        raise ValueError("--cases must be a JSON list of LongMemEval case objects")
+    required = {"haystack_session_ids", "haystack_dates", "haystack_sessions"}
+    if any(not required <= set(row) for row in value):
+        raise ValueError(
+            "--cases must contain raw LongMemEval cases with haystack_session_ids, "
+            "haystack_dates and haystack_sessions; do not pass *_builder.jsonl"
+        )
+    return value
+
+
+def _external_label_index(path):
+    """Index labels without exposing them to the Builder phase."""
+    result = {}
+    for row in rows(path):
+        if not isinstance(row, dict):
+            raise ValueError("--labels must contain JSON objects, one per line")
+        qid = row.get("question_id") or row.get("case_id")
+        if not isinstance(qid, str) or not qid:
+            raise ValueError("Each --labels row needs question_id or case_id")
+        if qid in result:
+            raise ValueError(f"Duplicate label for {qid}")
+        result[qid] = row
+    if not result:
+        raise ValueError("--labels is empty")
+    return result
+
+
+def _external_question(case, label):
+    """Convert custom split labels to Environment's private question schema."""
+    case_qid = str(case.get("question_id", ""))
+    label_qid = str(label.get("question_id") or label.get("case_id") or "")
+    if label_qid != case_qid:
+        raise ValueError(f"Label question_id {label_qid!r} does not match case {case_qid!r}")
+    question = label.get("q", label.get("question"))
+    answer = label.get("a", label.get("answer"))
+    qtype = label.get("type", label.get("question_type"))
+    qdate = label.get("question_date")
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError(f"Missing question label for {case_qid}")
+    if not isinstance(qtype, str) or not qtype.strip() or not isinstance(qdate, str) or not qdate.strip():
+        raise ValueError(f"Invalid question type/date label for {case_qid}")
+    if qtype != case.get("question_type") or qdate != case.get("question_date"):
+        raise ValueError(f"Label type/date does not match case {case_qid}")
+    # Native preparation uses str(answer), including for list/dict answers.
+    if not isinstance(answer, str):
+        answer = str(answer)
+    evidence = label.get("E", [])
+    if not isinstance(evidence, list):
+        evidence = []
+    return {"q": question, "a": answer, "type": qtype, "question_date": qdate,
+            "E": evidence, "abstention": bool(label.get("abstention", case_qid.endswith("_abs"))),
+            "question_id": case_qid}
+
+
+def _evaluate_external(cases, labels, run_dir, snapshot, env, out, all_memory=False):
+    """Evaluate memories built from an external split using an external labels JSONL."""
+    details = []
+    out = Path(out)
+    for record in cases:
+        key, full_path = record["key"], Path(record["full_path"])
+        qid = record["question_id"]
+        label = labels.get(qid)
+        if label is None:
+            # Some older splitters used case_id as the sole identifier.
+            label = labels.get(str(record.get("case_id", "")))
+        if label is None:
+            raise ValueError(f"No label for case {qid}")
+        q = _external_question(record, label)
+        try:
+            if snapshot == "full":
+                full = env.memory_module.FullMemory.load(full_path)
+                memory = [{"id": r, "text": f"Recorded on {s['date']}. {s['text']}",
+                           "prov": [r], "kind": "raw"}
+                          for r in full.ordered(full.rounds) for s in [neutral_round(full, r)]]
+            else:
+                memory = read(Path(run_dir) / key / (snapshot + ".json"))
+            result = env.answer(memory, q, all_memory=all_memory, abstention=q["abstention"])
+            details.append({"key": key, "question_id": q["question_id"], "type": q["type"],
+                "group": "abstention" if q["abstention"] else q["type"], "status": "ok",
+                "M_tokens": text_size(memory, env.counter), "entries": len(memory),
+                "raw_entries": sum(e.get("kind") == "raw" for e in memory),
+                "raw_token_fraction": text_size([e for e in memory if e.get("kind") == "raw"], env.counter) /
+                                      max(1, text_size(memory, env.counter)), **result})
+        except (Unknown, OSError, ValueError) as exc:
+            details.append({"key": key, "question_id": q["question_id"], "group":
+                            "abstention" if q["abstention"] else q["type"],
+                            "status": "error", "error": str(exc)})
+    write_rows(out / "cases.jsonl", details)
+    grouped = defaultdict(list)
+    for row in details:
+        grouped[row["group"]].append(row)
+        grouped["ALL_MICRO"].append(row)
+    summary = []
+    for typ, group in grouped.items():
+        judged = [row for row in group if row["status"] == "ok"]
+        correct = sum(row["correct"] for row in judged)
+        unknown = len(group) - len(judged)
+        summary.append({"group": typ, "selected": len(group), "judged": len(judged),
+            "correct": correct, "unknown": unknown,
+            "accuracy_completed": correct / len(judged) if judged else None,
+            "lower_all": correct / len(group), "upper_all": (correct + unknown) / len(group),
+            "mean_M_tokens": sum(row["M_tokens"] for row in judged) / len(judged) if judged else None})
+    write(out / "summary.json", {"snapshot": snapshot, "all_memory": all_memory,
+          "judge": "admem diagnostic; not official execution", "groups": summary})
+    write_rows(out / "predictions.jsonl", [{"question_id": row["question_id"],
+                                             "hypothesis": row["answer"]}
+                                            for row in details if row["status"] == "ok"])
+    return summary
+
+
+def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out, limit,
+                              keys=None, builder_role="BUILDER", all_memory=False):
+    """Run Builder on a raw split JSON, then score it with a separate labels JSONL.
+
+    ``case`` is reduced to FullMemory before it reaches ``run_case``.  The case-level
+    question/answer and all message labels therefore remain outside the Builder prompt.
+    """
+    out = Path(out)
+    if (out / "summary.json").exists():
+        raise ValueError("Output directory already has summary.json; use a new directory")
+    case_values = _json_case_list(cases_path)
+    labels = _external_label_index(labels_path)
+    run_dir, eval_dir = out / "run", out / "eval"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    records, seen = [], set()
+    for index, case in enumerate(case_values):
+        qid = case.get("question_id")
+        if not isinstance(qid, str) or not qid:
+            raise ValueError(f"Case {index} has no question_id")
+        if qid in seen:
+            raise ValueError(f"Duplicate case question_id {qid}")
+        seen.add(qid)
+        history = {name: case[name] for name in
+                   ("haystack_session_ids", "haystack_dates", "haystack_sessions")}
+        # Keep q/a and message-level evaluation labels outside the object passed
+        # to the Builder pipeline. FullMemory.build also strips these fields,
+        # but making the boundary explicit prevents future prompt leakage.
+        full = env.memory_module.FullMemory.build(history)
+        key = f"c{index:04d}"
+        case_dir = run_dir / key
+        full_path = case_dir / "full.json"
+        full.save(full_path)
+        context = {"key": key, "question_type": case.get("question_type", ""),
+                   "question_date": case.get("question_date", ""), "split": split,
+                   "full_hash": full.fingerprint}
+        records.append({"key": key, "question_id": qid,
+                        "case_id": str(case.get("case_id", "")),
+                        "question_type": case.get("question_type", ""),
+                        "question_date": case.get("question_date", ""),
+                        "context": context, "full": full,
+                        "full_path": str(full_path.resolve())})
+    missing = sorted(record["question_id"] for record in records
+                     if record["question_id"] not in labels
+                     and record.get("case_id", "") not in labels)
+    if missing:
+        raise ValueError(f"--labels missing {len(missing)} case(s), first: {missing[0]}")
+    valid_label_keys = set(seen)
+    valid_label_keys.update(record["case_id"] for record in records if record.get("case_id"))
+    extra = sorted(set(labels) - valid_label_keys)
+    if extra:
+        raise ValueError(f"--labels contains {len(extra)} unknown case(s), first: {extra[0]}")
+    if keys:
+        wanted = set(keys)
+        available = {value for record in records for value in
+                     (record["key"], record["question_id"], record.get("case_id", "")) if value}
+        unknown = sorted(wanted - available)
+        if unknown:
+            raise ValueError(f"Unknown --keys value for --cases: {unknown[0]}")
+    selected = [record for record in records if not keys or
+                record["key"] in keys or record["question_id"] in keys or
+                record.get("case_id", "") in keys]
+    if limit:
+        selected = selected[:limit]
+    # Validate label joins before spending Builder/API calls. The labels are
+    # still kept out of the history/context objects passed to run_case.
+    for record in selected:
+        label = labels.get(record["question_id"]) or labels.get(record.get("case_id", ""))
+        if label is None:
+            raise ValueError(f"No label for case {record['question_id']}")
+        _external_question(record, label)
+    reports, builder_cases = [], []
+    for record in selected:
+        key, full, context = record["key"], record["full"], record["context"]
+        print(f"longmemeval-eval {key} split={split} type_hint="
+              f"{context['question_type'] if env.cfg.hint_mode == 'target_type' else 'hidden'}", flush=True)
+        try:
+            result = run_case(full, record["full_path"], context, env, run_dir / key,
+                              mode="build", bank=[], builder_role=builder_role)
+            reports.append({"key": key, "question_id": record["question_id"], **result})
+            builder_cases.append({"key": key, "question_id": record["question_id"],
+                                  "question_type": context["question_type"], **_builder_case_metrics(run_dir / key)})
+        except Unknown as exc:
+            report = {"key": key, "question_id": record["question_id"],
+                      "status": "unknown", "error": str(exc)}
+            reports.append(report)
+            builder_cases.append({"key": key, "question_id": record["question_id"],
+                                  "question_type": context["question_type"], "status": "unknown",
+                                  "error": str(exc)})
+            write(run_dir / "summary.json", reports)
+            raise
+        write(run_dir / "summary.json", reports)
+    total_windows = sum(row.get("windows", 0) for row in builder_cases)
+    total_legal = sum(row.get("json_valid", 0) for row in builder_cases)
+    total_faithful = sum(row.get("faithful", 0) for row in builder_cases)
+    builder_summary = {"split": split, "builder_role": builder_role, "cases": len(builder_cases),
+        "windows": total_windows, "json_valid": total_legal, "faithful": total_faithful,
+        "fallback_windows": sum(row.get("fallback_windows", 0) for row in builder_cases),
+        "builder_json_rate": total_legal / total_windows if total_windows else None,
+        "builder_faith_rate": total_faithful / total_windows if total_windows else None,
+        "by_case": builder_cases}
+    write(out / "builder_summary.json", builder_summary)
+    qa_summary = _evaluate_external(selected, labels,
+                                    run_dir, snapshot, env, eval_dir, all_memory)
+    summary = {"split": split, "builder": builder_summary, "qa": qa_summary,
+               "run_dir": str(run_dir), "eval_dir": str(eval_dir), "snapshot": snapshot,
+               "all_memory": all_memory, "cases": str(Path(cases_path).resolve()),
+               "labels": str(Path(labels_path).resolve())}
+    write(out / "summary.json", summary)
+    return summary
+
+
 def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
                      builder_role="BUILDER", all_memory=False):
     """Run the existing Builder over a prepared LongMemEval split, then score QA.
@@ -221,8 +451,10 @@ def main(argv=None):
     p.add_argument("--config", default="configs/type_aware.json")
     p.add_argument("--data")
     p.add_argument("--prepared")
+    p.add_argument("--cases", help="longmemeval-eval raw split JSON (with --labels)")
+    p.add_argument("--labels", help="longmemeval-eval labels JSONL (with --cases)")
     p.add_argument("--out", required=True)
-    p.add_argument("--split", choices=["train", "val", "test"], default="train")
+    p.add_argument("--split", choices=["train", "val", "valid", "test"], default="train")
     p.add_argument("--sizes", nargs=3, type=int, default=[300, 50, 150])
     p.add_argument("--limit", type=int)
     p.add_argument("--keys", nargs="+")
@@ -242,6 +474,8 @@ def main(argv=None):
     p.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     p.add_argument("--adapter", help="merge时adapter目录；可从训练latest.json获取")
     a = p.parse_args(argv)
+    if a.split == "valid":
+        a.split = "val"
     if a.limit is not None and a.limit < 1 or a.variants < 1:
         p.error("limit/variants must be positive")
     cfg = Config.load(a.config)
@@ -291,14 +525,27 @@ def main(argv=None):
             p.error("probe requires --states and positive --samples")
         print(run_probe(a.states, env, a.out, a.samples, a.builder_role, a.limit))
         return
+    if a.command == "longmemeval-eval" and a.cases:
+        if a.prepared:
+            p.error("longmemeval-eval accepts either --prepared or --cases/--labels, not both")
+        if not a.labels:
+            p.error("longmemeval-eval with --cases requires --labels")
+        external_split = a.split
+        stem = Path(a.cases).stem.lower()
+        if a.split == "train" and stem in {"test", "valid", "val"}:
+            external_split = "val" if stem == "valid" else stem
+        print(longmemeval_eval_external(a.cases, a.labels, external_split, a.snapshot, env, a.out,
+                                        a.limit, a.keys, builder_role=a.builder_role,
+                                        all_memory=a.all_memory))
+        return
+    if a.command == "longmemeval-eval" and a.labels:
+        p.error("longmemeval-eval with --labels also requires --cases")
     if not a.prepared:
         p.error("This command requires --prepared")
     if a.command == "evaluate":
         print(evaluate(a.prepared, a.run_dir, a.split, a.snapshot, env, a.out, a.limit, a.keys, a.all_memory))
         return
     if a.command == "longmemeval-eval":
-        if not a.prepared:
-            p.error("longmemeval-eval requires --prepared")
         print(longmemeval_eval(a.prepared, a.split, a.snapshot, env, a.out, a.limit, a.keys,
                                builder_role=a.builder_role, all_memory=a.all_memory))
         return
