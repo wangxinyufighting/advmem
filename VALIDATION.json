@@ -1,0 +1,28 @@
+{
+  "checked_on": "2026-10-02",
+  "python": "3.13.5",
+  "torch": "2.10.0+cpu",
+  "pytest": "9.0.2",
+  "tests_passed": 55,
+  "tests_command": "ADMEM_CASE_ZIP=/mnt/data/0123.zip python -m pytest -q tests",
+  "python_3_10_syntax": "passed",
+  "cli_help": "passed",
+  "compileall": "passed",
+  "actual_cpu_gradient_tests": true,
+  "actual_uploaded_case_structure_test": true,
+  "uploaded_case_sessions": 45,
+  "uploaded_case_rounds": 236,
+  "uploaded_case_packs": 45,
+  "qwen_weights_loaded": false,
+  "real_cuda_training_run": false,
+  "real_llm_api_run": false,
+  "full_longmemeval_s_loaded": false,
+  "original_user_legacy_core_imported": false,
+  "distributed_verl_run": false,
+  "legacy_core_test_protocol": "explicit isolated interface doubles only; production uses project path and fails if missing",
+  "notes": [
+    "Real small-network SFT/GRPO gradient updates were tested; not Qwen fine-tuning.",
+    "Uploaded raw history/pack IDs were checked with test interface reader; not real embedding retrieval.",
+    "All reference conclusions in DESIGN and SOURCES are distinguished from implementation choices."
+  ]
+}

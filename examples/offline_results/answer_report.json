@@ -1,0 +1,87 @@
+{
+  "status": "retrieval_only",
+  "retrieved_hits": [
+    {
+      "id": "s1:r1",
+      "score": 0.01639344262295082,
+      "channels": [
+        "bm25"
+      ]
+    },
+    {
+      "id": "s3:r1",
+      "score": 0.016129032258064516,
+      "channels": [
+        "bm25"
+      ]
+    },
+    {
+      "id": "s1:r2",
+      "score": 0.00819672131147541,
+      "channels": [
+        "adjacent_round"
+      ]
+    }
+  ],
+  "visible_ids": [
+    "s1:r1",
+    "s3:r1",
+    "s1:r2"
+  ],
+  "context_chars": 433,
+  "retrieval_trace": [],
+  "coverage_kind": "visible_raw_rounds",
+  "evidence": {
+    "N_tested": 1,
+    "abstention": false,
+    "gold_session_ids": [
+      "pet_aug",
+      "pet_mar"
+    ],
+    "gold_round_ids": [
+      "s1:r1",
+      "s3:r1"
+    ],
+    "missing_gold_session_ids": [],
+    "min_observed_prefix_N": {
+      "any_pack_all_sessions": 1,
+      "any_pack_all_rounds": 1,
+      "union_all_sessions": 1,
+      "union_all_rounds": 1
+    },
+    "min_subset_within_generated_pool": {
+      "sessions": {
+        "status": "found",
+        "N": 1,
+        "pack_ids": [
+          "retrieval"
+        ]
+      },
+      "rounds": {
+        "status": "found",
+        "N": 1,
+        "pack_ids": [
+          "retrieval"
+        ]
+      }
+    },
+    "curve": [
+      {
+        "N": 1,
+        "pack_id": "retrieval",
+        "seed_id": "retrieval",
+        "pack_chars": 445,
+        "session_recall": 1.0,
+        "round_recall": 1.0,
+        "this_pack_all_sessions": true,
+        "this_pack_all_rounds": true,
+        "any_pack_all_sessions": true,
+        "any_pack_all_rounds": true,
+        "union_all_sessions": true,
+        "union_all_rounds": true,
+        "union_session_recall": 1.0,
+        "union_round_recall": 1.0
+      }
+    ]
+  }
+}

@@ -1,0 +1,249 @@
+{
+  "N_tested": 8,
+  "abstention": false,
+  "gold_session_ids": [
+    "pet_aug",
+    "pet_mar"
+  ],
+  "gold_round_ids": [
+    "s1:r1",
+    "s3:r1"
+  ],
+  "missing_gold_session_ids": [],
+  "min_observed_prefix_N": {
+    "any_pack_all_sessions": 3,
+    "any_pack_all_rounds": 3,
+    "union_all_sessions": 3,
+    "union_all_rounds": 3
+  },
+  "min_subset_within_generated_pool": {
+    "sessions": {
+      "status": "found",
+      "N": 1,
+      "pack_ids": [
+        "p00003"
+      ]
+    },
+    "rounds": {
+      "status": "found",
+      "N": 1,
+      "pack_ids": [
+        "p00003"
+      ]
+    }
+  },
+  "curve": [
+    {
+      "N": 1,
+      "pack_id": "p00001",
+      "seed_id": "work",
+      "pack_chars": 175,
+      "session_recall": 0.0,
+      "round_recall": 0.0,
+      "this_pack_all_sessions": false,
+      "this_pack_all_rounds": false,
+      "any_pack_all_sessions": false,
+      "any_pack_all_rounds": false,
+      "union_all_sessions": false,
+      "union_all_rounds": false,
+      "union_session_recall": 0.0,
+      "union_round_recall": 0.0
+    },
+    {
+      "N": 2,
+      "pack_id": "p00002",
+      "seed_id": "gardening",
+      "pack_chars": 148,
+      "session_recall": 0.0,
+      "round_recall": 0.0,
+      "this_pack_all_sessions": false,
+      "this_pack_all_rounds": false,
+      "any_pack_all_sessions": false,
+      "any_pack_all_rounds": false,
+      "union_all_sessions": false,
+      "union_all_rounds": false,
+      "union_session_recall": 0.0,
+      "union_round_recall": 0.0
+    },
+    {
+      "N": 3,
+      "pack_id": "p00003",
+      "seed_id": "pet_mar",
+      "pack_chars": 299,
+      "session_recall": 1.0,
+      "round_recall": 1.0,
+      "this_pack_all_sessions": true,
+      "this_pack_all_rounds": true,
+      "any_pack_all_sessions": true,
+      "any_pack_all_rounds": true,
+      "union_all_sessions": true,
+      "union_all_rounds": true,
+      "union_session_recall": 1.0,
+      "union_round_recall": 1.0
+    },
+    {
+      "N": 4,
+      "pack_id": "p00004",
+      "seed_id": "pet_aug",
+      "pack_chars": 445,
+      "session_recall": 1.0,
+      "round_recall": 1.0,
+      "this_pack_all_sessions": true,
+      "this_pack_all_rounds": true,
+      "any_pack_all_sessions": true,
+      "any_pack_all_rounds": true,
+      "union_all_sessions": true,
+      "union_all_rounds": true,
+      "union_session_recall": 1.0,
+      "union_round_recall": 1.0
+    },
+    {
+      "N": 5,
+      "pack_id": "p00005",
+      "seed_id": "gardening",
+      "pack_chars": 148,
+      "session_recall": 0.0,
+      "round_recall": 0.0,
+      "this_pack_all_sessions": false,
+      "this_pack_all_rounds": false,
+      "any_pack_all_sessions": true,
+      "any_pack_all_rounds": true,
+      "union_all_sessions": true,
+      "union_all_rounds": true,
+      "union_session_recall": 1.0,
+      "union_round_recall": 1.0
+    },
+    {
+      "N": 6,
+      "pack_id": "p00006",
+      "seed_id": "pet_mar",
+      "pack_chars": 299,
+      "session_recall": 1.0,
+      "round_recall": 1.0,
+      "this_pack_all_sessions": true,
+      "this_pack_all_rounds": true,
+      "any_pack_all_sessions": true,
+      "any_pack_all_rounds": true,
+      "union_all_sessions": true,
+      "union_all_rounds": true,
+      "union_session_recall": 1.0,
+      "union_round_recall": 1.0
+    },
+    {
+      "N": 7,
+      "pack_id": "p00007",
+      "seed_id": "pet_aug",
+      "pack_chars": 445,
+      "session_recall": 1.0,
+      "round_recall": 1.0,
+      "this_pack_all_sessions": true,
+      "this_pack_all_rounds": true,
+      "any_pack_all_sessions": true,
+      "any_pack_all_rounds": true,
+      "union_all_sessions": true,
+      "union_all_rounds": true,
+      "union_session_recall": 1.0,
+      "union_round_recall": 1.0
+    },
+    {
+      "N": 8,
+      "pack_id": "p00008",
+      "seed_id": "work",
+      "pack_chars": 175,
+      "session_recall": 0.0,
+      "round_recall": 0.0,
+      "this_pack_all_sessions": false,
+      "this_pack_all_rounds": false,
+      "any_pack_all_sessions": true,
+      "any_pack_all_rounds": true,
+      "union_all_sessions": true,
+      "union_all_rounds": true,
+      "union_session_recall": 1.0,
+      "union_round_recall": 1.0
+    }
+  ],
+  "repeated_sampling": {
+    "pool_size": 4,
+    "trials": 20,
+    "summary": {
+      "any_pack_all_sessions": {
+        "successes": 20,
+        "trials": 20,
+        "median_N_conditional_on_success": 1.5
+      },
+      "any_pack_all_rounds": {
+        "successes": 20,
+        "trials": 20,
+        "median_N_conditional_on_success": 1.5
+      },
+      "union_all_sessions": {
+        "successes": 20,
+        "trials": 20,
+        "median_N_conditional_on_success": 1.5
+      },
+      "union_all_rounds": {
+        "successes": 20,
+        "trials": 20,
+        "median_N_conditional_on_success": 1.5
+      }
+    },
+    "curve": [
+      {
+        "N": 1,
+        "any_pack_all_sessions_probability": 0.5,
+        "any_pack_all_rounds_probability": 0.5,
+        "union_all_sessions_probability": 0.5,
+        "union_all_rounds_probability": 0.5
+      },
+      {
+        "N": 2,
+        "any_pack_all_sessions_probability": 0.85,
+        "any_pack_all_rounds_probability": 0.85,
+        "union_all_sessions_probability": 0.85,
+        "union_all_rounds_probability": 0.85
+      },
+      {
+        "N": 3,
+        "any_pack_all_sessions_probability": 1.0,
+        "any_pack_all_rounds_probability": 1.0,
+        "union_all_sessions_probability": 1.0,
+        "union_all_rounds_probability": 1.0
+      },
+      {
+        "N": 4,
+        "any_pack_all_sessions_probability": 1.0,
+        "any_pack_all_rounds_probability": 1.0,
+        "union_all_sessions_probability": 1.0,
+        "union_all_rounds_probability": 1.0
+      },
+      {
+        "N": 5,
+        "any_pack_all_sessions_probability": 1.0,
+        "any_pack_all_rounds_probability": 1.0,
+        "union_all_sessions_probability": 1.0,
+        "union_all_rounds_probability": 1.0
+      },
+      {
+        "N": 6,
+        "any_pack_all_sessions_probability": 1.0,
+        "any_pack_all_rounds_probability": 1.0,
+        "union_all_sessions_probability": 1.0,
+        "union_all_rounds_probability": 1.0
+      },
+      {
+        "N": 7,
+        "any_pack_all_sessions_probability": 1.0,
+        "any_pack_all_rounds_probability": 1.0,
+        "union_all_sessions_probability": 1.0,
+        "union_all_rounds_probability": 1.0
+      },
+      {
+        "N": 8,
+        "any_pack_all_sessions_probability": 1.0,
+        "any_pack_all_rounds_probability": 1.0,
+        "union_all_sessions_probability": 1.0,
+        "union_all_rounds_probability": 1.0
+      }
+    ]
+  }
+}

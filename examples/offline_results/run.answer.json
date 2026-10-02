@@ -1,0 +1,24 @@
+{
+  "args": {
+    "command": "answer",
+    "data": "examples/demo_case.json",
+    "case_index": 0,
+    "question_id": null,
+    "out": "examples/offline_results",
+    "full": null,
+    "embedding": "none",
+    "embed_model": null,
+    "reranker_model": null,
+    "cache": ".cache",
+    "memory": null,
+    "k": 3,
+    "steps": 0,
+    "expand": 1,
+    "context_chars": 80000,
+    "retrieval_only": true
+  },
+  "case_id": "demo_pets_001",
+  "case_hash": "afcb5fb932dee901c75a119276b63719493d98753b826011575a8d66bbac5095",
+  "full_hash": "e05eadd399ffe64c6d20ebf04aadfff4a265beab6d2e44b29a8cec36ff7ab7f5",
+  "code_version": "1.0"
+}

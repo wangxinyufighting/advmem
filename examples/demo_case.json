@@ -1,0 +1,77 @@
+[
+  {
+    "question_id": "demo_pets_001",
+    "question_type": "multi-session",
+    "question": "What pets have I adopted this year, and what are their names?",
+    "answer": "A cat named Milo in March and a dog named Rex in August.",
+    "question_date": "2023/09/01 (Fri) 12:00",
+    "haystack_session_ids": [
+      "pet_aug",
+      "gardening",
+      "pet_mar",
+      "work"
+    ],
+    "haystack_dates": [
+      "2023/08/03 (Thu) 09:00",
+      "2023/02/11 (Sat) 12:00",
+      "2023/03/05 (Sun) 08:00",
+      "2023/06/08 (Thu) 18:00"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "user",
+          "content": "I adopted a pet dog named Rex this August.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Congratulations on adopting Rex!"
+        },
+        {
+          "role": "user",
+          "content": "What supplies should I get?"
+        },
+        {
+          "role": "assistant",
+          "content": "Start with a leash, bowls, food, and a bed."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I grow tomatoes on my balcony."
+        },
+        {
+          "role": "assistant",
+          "content": "A sunny spot and consistent watering help."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I adopted a pet cat named Milo this March.",
+          "has_answer": true
+        },
+        {
+          "role": "assistant",
+          "content": "Congratulations on adopting Milo!"
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "I started a software engineering project in June."
+        },
+        {
+          "role": "assistant",
+          "content": "Write down the requirements and make a small prototype."
+        }
+      ]
+    ],
+    "answer_session_ids": [
+      "pet_mar",
+      "pet_aug"
+    ]
+  }
+]

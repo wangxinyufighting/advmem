@@ -1,0 +1,28 @@
+{
+  "offline_tests_passed": 29,
+  "real_uploaded_case_payload_replays": 270,
+  "replay_detail": "45 uploaded packs x 6 types; checks neutral IDs, visibility and exact role/content preservation; NO LLM invocation.",
+  "pack27_payload_check": {
+    "pack_id": "p00027",
+    "visible_rounds": 14,
+    "seed_rounds": 6,
+    "s39:r2_is_seed": true,
+    "raw_session_id_hidden": true,
+    "preserved_original_message_text": true
+  },
+  "real_llm_generation_tested": false,
+  "user_latest_agents_source_available": false,
+  "installer_validation": "AST dry-run/apply tested on known-layout fixture; incompatible source layouts rejected.",
+  "prompt_hashes": {
+    "single-session-user": "c4858e0d27a0a8f0bbcf5b163b083fcbbd996b21b3202cbf95cce00b86ba5d76",
+    "single-session-assistant": "da7a01bd4cafb105a15a98a486bc1b7213c264a548b71e2dc3f3c431eb828dac",
+    "single-session-preference": "85263d7c98c1706c31c037b2b5aa89125af955ede6458e248c32019078486cfd",
+    "multi-session": "4672d0361863a48d1984c03bb95abfed0f442ec57e9c96b7088d1965dfa7c7f4",
+    "knowledge-update": "9f99cbbeffaa36d6475ac73be61c55acf8a47a033b76d5553945c90f66da150d",
+    "temporal-reasoning": "98e5243f8909b81217d34babaa4607fe1e7e290a67db61b64e274305e97e7478",
+    "gate_oracle": "2dbbafcf1bc114ff0b2f6db1122579d230cf03b32a05291cef7966eff317e055",
+    "gate_screen": "aea1792dab27b70d6e7f62936780c97a59ea2cad20a47b14b1c25b74cda70016",
+    "gate_support": "0964580c128455534c25054ab1d568d05bc216f51973c3316d92438b91c6b9aa"
+  },
+  "python_3_10_grammar": "passed"
+}

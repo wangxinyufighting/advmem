@@ -1,0 +1,70 @@
+{
+  "gardening": {
+    "status": "unaudited",
+    "visits": [
+      {
+        "pack_id": "p00002",
+        "sweep": 0,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      },
+      {
+        "pack_id": "p00005",
+        "sweep": 1,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      }
+    ]
+  },
+  "pet_mar": {
+    "status": "unaudited",
+    "visits": [
+      {
+        "pack_id": "p00003",
+        "sweep": 0,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      },
+      {
+        "pack_id": "p00006",
+        "sweep": 1,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      }
+    ]
+  },
+  "work": {
+    "status": "unaudited",
+    "visits": [
+      {
+        "pack_id": "p00001",
+        "sweep": 0,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      },
+      {
+        "pack_id": "p00008",
+        "sweep": 1,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      }
+    ]
+  },
+  "pet_aug": {
+    "status": "unaudited",
+    "visits": [
+      {
+        "pack_id": "p00004",
+        "sweep": 0,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      },
+      {
+        "pack_id": "p00007",
+        "sweep": 1,
+        "memory_version": "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+        "state": "pack_ready"
+      }
+    ]
+  }
+}

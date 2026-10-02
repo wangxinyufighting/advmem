@@ -1,0 +1,150 @@
+{
+  "schema": 1,
+  "fingerprint": "e05eadd399ffe64c6d20ebf04aadfff4a265beab6d2e44b29a8cec36ff7ab7f5",
+  "sessions": [
+    {
+      "session_id": "pet_aug",
+      "node_id": "s1",
+      "original_index": 0,
+      "date": "2023/08/03 (Thu) 09:00",
+      "sort_date": "2023-08-03T09:00:00+00:00",
+      "rids": [
+        "s1:r1",
+        "s1:r2"
+      ]
+    },
+    {
+      "session_id": "gardening",
+      "node_id": "s2",
+      "original_index": 1,
+      "date": "2023/02/11 (Sat) 12:00",
+      "sort_date": "2023-02-11T12:00:00+00:00",
+      "rids": [
+        "s2:r1"
+      ]
+    },
+    {
+      "session_id": "pet_mar",
+      "node_id": "s3",
+      "original_index": 2,
+      "date": "2023/03/05 (Sun) 08:00",
+      "sort_date": "2023-03-05T08:00:00+00:00",
+      "rids": [
+        "s3:r1"
+      ]
+    },
+    {
+      "session_id": "work",
+      "node_id": "s4",
+      "original_index": 3,
+      "date": "2023/06/08 (Thu) 18:00",
+      "sort_date": "2023-06-08T18:00:00+00:00",
+      "rids": [
+        "s4:r1"
+      ]
+    }
+  ],
+  "rounds": [
+    {
+      "rid": "s1:r1",
+      "session_id": "pet_aug",
+      "position": 0,
+      "message_indices": [
+        0,
+        1
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "I adopted a pet dog named Rex this August."
+        },
+        {
+          "role": "assistant",
+          "content": "Congratulations on adopting Rex!"
+        }
+      ]
+    },
+    {
+      "rid": "s1:r2",
+      "session_id": "pet_aug",
+      "position": 1,
+      "message_indices": [
+        2,
+        3
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "What supplies should I get?"
+        },
+        {
+          "role": "assistant",
+          "content": "Start with a leash, bowls, food, and a bed."
+        }
+      ]
+    },
+    {
+      "rid": "s2:r1",
+      "session_id": "gardening",
+      "position": 0,
+      "message_indices": [
+        0,
+        1
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "I grow tomatoes on my balcony."
+        },
+        {
+          "role": "assistant",
+          "content": "A sunny spot and consistent watering help."
+        }
+      ]
+    },
+    {
+      "rid": "s3:r1",
+      "session_id": "pet_mar",
+      "position": 0,
+      "message_indices": [
+        0,
+        1
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "I adopted a pet cat named Milo this March."
+        },
+        {
+          "role": "assistant",
+          "content": "Congratulations on adopting Milo!"
+        }
+      ]
+    },
+    {
+      "rid": "s4:r1",
+      "session_id": "work",
+      "position": 0,
+      "message_indices": [
+        0,
+        1
+      ],
+      "messages": [
+        {
+          "role": "user",
+          "content": "I started a software engineering project in June."
+        },
+        {
+          "role": "assistant",
+          "content": "Write down the requirements and make a small prototype."
+        }
+      ]
+    }
+  ],
+  "chronological_ids": [
+    "gardening",
+    "pet_mar",
+    "work",
+    "pet_aug"
+  ]
+}

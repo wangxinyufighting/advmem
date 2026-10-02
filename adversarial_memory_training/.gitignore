@@ -1,0 +1,10 @@
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+.cache/
+.venv*/
+data/
+outputs/
+checkpoints/
+wandb/

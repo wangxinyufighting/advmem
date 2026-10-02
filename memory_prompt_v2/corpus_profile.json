@@ -1,0 +1,65 @@
+{
+  "source": "longmemeval_questions.txt",
+  "source_sha256": "211d3cd4dd5e2b3f31fba006e5ec4459573b10f7a480b41630b579e5b208f00c",
+  "total": 500,
+  "question_type_counts": {
+    "single-session-user": 70,
+    "multi-session": 133,
+    "single-session-preference": 30,
+    "temporal-reasoning": 133,
+    "knowledge-update": 78,
+    "single-session-assistant": 56
+  },
+  "abstention_inferred_from_answer_text": {
+    "single-session-user": 6,
+    "multi-session": 12,
+    "temporal-reasoning": 6,
+    "knowledge-update": 6
+  },
+  "abstention_inferred_total": 30,
+  "answerable_inferred_total": 470,
+  "abstention_inferred_indices": [
+    64,
+    65,
+    66,
+    67,
+    68,
+    69,
+    126,
+    127,
+    128,
+    129,
+    130,
+    131,
+    227,
+    228,
+    229,
+    230,
+    231,
+    232,
+    360,
+    361,
+    362,
+    363,
+    364,
+    365,
+    436,
+    437,
+    438,
+    439,
+    440,
+    441
+  ],
+  "qualification": "The export has no question_id/_abs flags or source histories. Abstention is inferred from answer wording, not verified official flags.",
+  "review_flags": [
+    {
+      "index": 127,
+      "issue": "Reference starts with 0 but explains only that no visit was mentioned; do not learn absence=>zero as a general rule."
+    },
+    {
+      "index": 318,
+      "issue": "Reference gives 14 days and 8 days inclusive; internally inconsistent endpoint convention. Source histories needed; no automatic correction."
+    }
+  ],
+  "prompt_development_exposure": "All 500 exported questions and answers were available during this revision. Not a pristine held-out evaluation."
+}
