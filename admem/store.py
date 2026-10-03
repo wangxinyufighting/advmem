@@ -88,8 +88,21 @@ def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, l
             removed.update(ids)
             continue
         text, prov = op["text"], op["prov"]
-        if not isinstance(text, str) or not text.strip() or counter.count(text) > limit:
-            raise InvalidAction("Empty/non-string/overlong entry text")
+        
+        # if not isinstance(text, str) or not text.strip() or counter.count(text) > limit:
+        #     raise InvalidAction("Empty/non-string/overlong entry text")
+        
+        # Keep these failures separate: a single aggregate reason made it
+        # impossible to tell whether the model omitted text or exceeded the
+        # tokenizer budget.
+        if not isinstance(text, str):
+            raise InvalidAction("Entry text must be a string")
+        if not text.strip():
+            raise InvalidAction("Entry text is empty")
+        text_tokens = counter.count(text)
+        if text_tokens > limit:
+            raise InvalidAction(f"Entry text exceeds {limit} tokens ({text_tokens})")
+        
         if not isinstance(prov, list) or any(not isinstance(r, str) for r in prov) or len(set(prov)) != len(prov):
             raise InvalidAction("Invalid provenance list")
         parent_prov = {r for i in ids for r in index[i]["prov"]}
