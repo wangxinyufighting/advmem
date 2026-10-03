@@ -164,6 +164,20 @@ python -m admem.cli longmemeval-eval \
 
 `--cases` 只用于构建无损历史；问题和答案只在 Builder 完成后从 `--labels` 读取。文件名为 `test.json` 时会自动记录为 test split，也可显式传 `--split test`。
 
+可用 `--question-types` 只评测指定题型，并与 `--keys`、`--limit` 组合。例如：
+
+```bash
+python -m admem.cli longmemeval-eval \
+  --config configs/type_aware.json \
+  --cases data/longmemeval_splits/test.json \
+  --labels data/longmemeval_splits/test_labels.jsonl \
+  --split test --question-types temporal-reasoning knowledge-update \
+  --limit 2 --builder-role BUILDER \
+  --out outputs/longmemeval_temporal_update_smoke
+```
+
+题型名称包括 `single-session-user`、`single-session-assistant`、`single-session-preference`、`multi-session`、`knowledge-update` 和 `temporal-reasoning`。原始 `--cases` 路径仍会扫描并校验整个 split 的 case/label 对齐，但只为筛选后的 case 构建 `FullMemory` 并调用模型。
+
 先用 `--limit 1` 做配置和 API smoke test；正式运行请使用新的输出目录。结果包括 `builder_summary.json`（每个窗口的 JSON 合法率、faithfulness 和 fallback 统计）、`run/` 下的 `M_build.json`/`M_final.json`，以及 `eval/summary.json`。`longmemeval-eval` 沿用现有 Builder prompt 和 `run_case(mode="build")` 路径，不使用 probes 目录中的合成状态。`eval/` 是项目内的诊断 judge 结果；如需官方分数，仍应使用 LongMemEval 官方评测器。
 
 若要在 Python 中直接使用：

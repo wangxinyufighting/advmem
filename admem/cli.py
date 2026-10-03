@@ -65,11 +65,12 @@ def relocate_states(input_path, prepared, output, core_memory):
     return len(migrated)
 
 
-def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memory=False):
+def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memory=False,
+             question_types=None):
     # 只有此独立命令读取官方q/a；结果不能反馈给同一test case的memory编辑。
     golds = {q["key"]: q for q in rows(Path(prepared) / "private_eval.jsonl")}
     details = []
-    for context, full_path in contexts(prepared, split, limit, keys):
+    for context, full_path in contexts(prepared, split, limit, keys, question_types):
         key = context["key"]
         q = golds[key]
         try:
@@ -286,7 +287,8 @@ def _evaluate_external(cases, labels, run_dir, snapshot, env, out, all_memory=Fa
 
 
 def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out, limit,
-                              keys=None, builder_role="BUILDER", all_memory=False):
+                              keys=None, builder_role="BUILDER", all_memory=False,
+                              question_types=None):
     """Run Builder on a raw split JSON, then score it with a separate labels JSONL.
 
     ``case`` is reduced to FullMemory before it reaches ``run_case``.  The case-level
@@ -299,7 +301,7 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
     labels = _external_label_index(labels_path)
     run_dir, eval_dir = out / "run", out / "eval"
     run_dir.mkdir(parents=True, exist_ok=True)
-    records, seen = [], set()
+    metadata, seen = [], set()
     for index, case in enumerate(case_values):
         qid = case.get("question_id")
         if not isinstance(qid, str) or not qid:
@@ -307,46 +309,62 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
         if qid in seen:
             raise ValueError(f"Duplicate case question_id {qid}")
         seen.add(qid)
-        history = _history_for_builder(case)
+        metadata.append({"key": f"c{index:04d}", "question_id": qid,
+                         "case_id": str(case.get("case_id", "")),
+                         "question_type": case.get("question_type", ""),
+                         "question_date": case.get("question_date", ""),
+                         "case": case})
+    # Validate the complete split/label join before selecting a type or limit,
+    # but defer FullMemory/tokenizer work until after that selection.
+    missing = sorted(row["question_id"] for row in metadata
+                     if row["question_id"] not in labels
+                     and row.get("case_id", "") not in labels)
+    if missing:
+        raise ValueError(f"--labels missing {len(missing)} case(s), first: {missing[0]}")
+    valid_label_keys = set(seen)
+    valid_label_keys.update(row["case_id"] for row in metadata if row.get("case_id"))
+    extra = sorted(set(labels) - valid_label_keys)
+    if extra:
+        raise ValueError(f"--labels contains {len(extra)} unknown case(s), first: {extra[0]}")
+    wanted_types = set(question_types or [])
+    if keys:
+        wanted = set(keys)
+        available = {value for row in metadata for value in
+                     (row["key"], row["question_id"], row.get("case_id", "")) if value}
+        unknown = sorted(wanted - available)
+        if unknown:
+            raise ValueError(f"Unknown --keys value for --cases: {unknown[0]}")
+    selected_meta = [row for row in metadata if (not keys or
+                    row["key"] in keys or row["question_id"] in keys or
+                    row.get("case_id", "") in keys)
+                    and (not wanted_types or row["question_type"] in wanted_types)]
+    if limit:
+        selected_meta = selected_meta[:limit]
+    if not selected_meta:
+        detail = ", ".join(sorted(wanted_types)) if wanted_types else "the requested keys/split"
+        raise ValueError(f"No LongMemEval cases matched {detail}")
+
+    records = []
+    for meta in selected_meta:
+        history = _history_for_builder(meta["case"])
         # Keep q/a and message-level evaluation labels outside the object passed
         # to the Builder pipeline. FullMemory.build also strips these fields,
         # but making the boundary explicit prevents future prompt leakage.
         full = env.memory_module.FullMemory.build(history)
-        key = f"c{index:04d}"
+        key = meta["key"]
         case_dir = run_dir / key
         full_path = case_dir / "full.json"
         full.save(full_path)
-        context = {"key": key, "question_type": case.get("question_type", ""),
-                   "question_date": case.get("question_date", ""), "split": split,
+        context = {"key": key, "question_type": meta["question_type"],
+                   "question_date": meta["question_date"], "split": split,
                    "full_hash": full.fingerprint}
-        records.append({"key": key, "question_id": qid,
-                        "case_id": str(case.get("case_id", "")),
-                        "question_type": case.get("question_type", ""),
-                        "question_date": case.get("question_date", ""),
+        records.append({"key": key, "question_id": meta["question_id"],
+                        "case_id": meta["case_id"],
+                        "question_type": meta["question_type"],
+                        "question_date": meta["question_date"],
                         "context": context, "full": full,
                         "full_path": str(full_path.resolve())})
-    missing = sorted(record["question_id"] for record in records
-                     if record["question_id"] not in labels
-                     and record.get("case_id", "") not in labels)
-    if missing:
-        raise ValueError(f"--labels missing {len(missing)} case(s), first: {missing[0]}")
-    valid_label_keys = set(seen)
-    valid_label_keys.update(record["case_id"] for record in records if record.get("case_id"))
-    extra = sorted(set(labels) - valid_label_keys)
-    if extra:
-        raise ValueError(f"--labels contains {len(extra)} unknown case(s), first: {extra[0]}")
-    if keys:
-        wanted = set(keys)
-        available = {value for record in records for value in
-                     (record["key"], record["question_id"], record.get("case_id", "")) if value}
-        unknown = sorted(wanted - available)
-        if unknown:
-            raise ValueError(f"Unknown --keys value for --cases: {unknown[0]}")
-    selected = [record for record in records if not keys or
-                record["key"] in keys or record["question_id"] in keys or
-                record.get("case_id", "") in keys]
-    if limit:
-        selected = selected[:limit]
+    selected = records
     # Validate label joins before spending Builder/API calls. The labels are
     # still kept out of the history/context objects passed to run_case.
     for record in selected:
@@ -396,7 +414,7 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
 
 
 def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
-                     builder_role="BUILDER", all_memory=False):
+                     builder_role="BUILDER", all_memory=False, question_types=None):
     """Run the existing Builder over a prepared LongMemEval split, then score QA.
 
     The Builder phase only receives the prepared context/full history. Official
@@ -423,7 +441,7 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
 
     reports = []
     builder_cases = []
-    for context, full_path in contexts(prepared, split, limit, keys):
+    for context, full_path in contexts(prepared, split, limit, keys, question_types):
         key = context["key"]
         print(f"longmemeval-eval {key} split={split} "
               f"type_hint={context['question_type'] if env.cfg.hint_mode == 'target_type' else 'hidden'}",
@@ -462,7 +480,8 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
     }
     write(out / "builder_summary.json", builder_summary)
 
-    qa_summary = evaluate(prepared, run_dir, split, snapshot, env, eval_dir, limit, keys, all_memory)
+    qa_summary = evaluate(prepared, run_dir, split, snapshot, env, eval_dir, limit, keys,
+                          all_memory, question_types)
     summary = {"split": split, "builder": builder_summary, "qa": qa_summary,
                "run_dir": str(run_dir), "eval_dir": str(eval_dir), "snapshot": snapshot,
                "all_memory": all_memory}
@@ -483,6 +502,8 @@ def main(argv=None):
     p.add_argument("--sizes", nargs=3, type=int, default=[300, 50, 150])
     p.add_argument("--limit", type=int)
     p.add_argument("--keys", nargs="+")
+    p.add_argument("--question-types", nargs="+",
+                   help="只评测指定 LongMemEval question_type，可与 --keys/--limit 组合")
     p.add_argument("--mode", choices=["build", "closed_loop"], default="closed_loop")
     p.add_argument("--builder-role", default="BUILDER")
     p.add_argument("--attacker-role", default="ATTACKER")
@@ -561,21 +582,24 @@ def main(argv=None):
             external_split = "val" if stem == "valid" else stem
         print(longmemeval_eval_external(a.cases, a.labels, external_split, a.snapshot, env, a.out,
                                         a.limit, a.keys, builder_role=a.builder_role,
-                                        all_memory=a.all_memory))
+                                        all_memory=a.all_memory,
+                                        question_types=a.question_types))
         return
     if a.command == "longmemeval-eval" and a.labels:
         p.error("longmemeval-eval with --labels also requires --cases")
     if not a.prepared:
         p.error("This command requires --prepared")
     if a.command == "evaluate":
-        print(evaluate(a.prepared, a.run_dir, a.split, a.snapshot, env, a.out, a.limit, a.keys, a.all_memory))
+        print(evaluate(a.prepared, a.run_dir, a.split, a.snapshot, env, a.out, a.limit, a.keys,
+                       a.all_memory, a.question_types))
         return
     if a.command == "longmemeval-eval":
         print(longmemeval_eval(a.prepared, a.split, a.snapshot, env, a.out, a.limit, a.keys,
-                               builder_role=a.builder_role, all_memory=a.all_memory))
+                               builder_role=a.builder_role, all_memory=a.all_memory,
+                               question_types=a.question_types))
         return
     reports = []
-    for context, full_path in contexts(a.prepared, a.split, a.limit, a.keys):
+    for context, full_path in contexts(a.prepared, a.split, a.limit, a.keys, a.question_types):
         key = context["key"]
         print(f"{a.command} {key} split={context['split']} type_hint={context['question_type'] if cfg.hint_mode == 'target_type' else 'hidden'}", flush=True)
         full = legacy[0].FullMemory.load(full_path)

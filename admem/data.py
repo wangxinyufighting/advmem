@@ -124,10 +124,14 @@ def prepare(data, out, core_memory, sizes=(300, 50, 150), seed=0):
     return split_report
 
 
-def contexts(prepared, split, limit=None, keys=None):
+def contexts(prepared, split, limit=None, keys=None, question_types=None):
     p = Path(prepared)
     manifest = read(p / "manifest.json")
-    entries = [r for r in manifest["cases"] if r["split"] == split and (keys is None or r["key"] in keys)]
+    wanted_types = set(question_types or [])
+    entries = [r for r in manifest["cases"]
+               if r["split"] == split
+               and (keys is None or r["key"] in keys)
+               and (not wanted_types or r.get("question_type") in wanted_types)]
     if limit:
         entries = entries[:limit]
     for row in entries:
