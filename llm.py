@@ -34,13 +34,50 @@ class Client:
                    os.getenv(f"{role}_API_KEY", os.getenv("LLM_API_KEY", "EMPTY")), cache_dir,
                    int(os.getenv("MAX_API_CALLS", "10000")))
 
+    @staticmethod
+    def _response_error(endpoint: str, result: Any) -> str | None:
+        """Return a diagnostic for provider envelopes that are not usable.
+
+        Some gateways return HTTP 200 with ``{"error": ...}`` for an upstream
+        outage.  Treating that as a successful cache entry makes every later
+        retry fail with a misleading ``KeyError: choices``.
+        """
+        if not isinstance(result, dict):
+            return "Provider response is not a JSON object"
+        error = result.get("error")
+        if error is not None:
+            if isinstance(error, dict):
+                message = error.get("message") or str(error)
+                code = error.get("code")
+                metadata = error.get("metadata")
+                error_type = metadata.get("error_type") if isinstance(metadata, dict) else None
+                details = ", ".join(str(v) for v in (code, error_type) if v is not None)
+                return f"Provider error{f' ({details})' if details else ''}: {message}"
+            return f"Provider error: {error}"
+        if endpoint.endswith("/chat/completions"):
+            choices = result.get("choices")
+            if not isinstance(choices, list) or not choices:
+                return "Chat completion response has no choices"
+        elif endpoint.endswith("/embeddings"):
+            data = result.get("data")
+            if not isinstance(data, list):
+                return "Embedding response has no data"
+        return None
+
     def post(self, endpoint: str, payload: dict, nonce: str = "") -> dict:
         # nonce 区分同一 prompt 的独立采样，但不修改发给模型的内容。
         key = digest([self.base_url, endpoint, payload, nonce])
         path = self.cache_dir / (key + ".json")
         if path.exists():
-            self.cache_hits += 1
-            return read_json(path)["response"]
+            try:
+                cached = read_json(path)
+                response = cached.get("response") if isinstance(cached, dict) else None
+                if self._response_error(endpoint, response) is None:
+                    self.cache_hits += 1
+                    return response
+            except (OSError, ValueError, TypeError, KeyError):
+                # Ignore malformed/stale cache files and retry the provider.
+                pass
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         req = urllib.request.Request(self.base_url + endpoint, raw, method="POST", headers={
                 "Authorization": f"Bearer {self.api_key}",
@@ -55,6 +92,12 @@ class Client:
             try:
                 with urllib.request.urlopen(req, timeout=int(os.getenv("API_TIMEOUT", "120"))) as res:
                     result = json.loads(res.read())
+                response_error = self._response_error(endpoint, result)
+                if response_error is not None:
+                    last = response_error
+                    if attempt < 2:
+                        time.sleep(2 ** attempt)
+                    continue
                 # 缓存含实验原文及响应，但绝不含 API key。
                 write_json(path, {"model": self.model, "base_url": self.base_url,
                                   "request": payload, "response": result})
