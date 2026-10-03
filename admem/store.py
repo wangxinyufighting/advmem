@@ -61,6 +61,10 @@ def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, l
     visible_ids, source_ids, full_ids = set(visible_ids), set(source_ids), set(full_ids)
     if not visible_ids <= index.keys() or not source_ids <= full_ids:
         raise ValueError("Corrupt edit context")
+    # A first stream window must not silently turn the entire memory into a
+    # vacuous no-op.  The caller can fall back to the raw window instead.
+    if mode == "stream" and not memory and source_ids and not action["ops"]:
+        raise InvalidAction("NOOP is not allowed for a nonempty source and empty stream memory")
     used, removed, created, replaced = set(), set(), [], {}
     for pos, op in enumerate(action["ops"]):
         if not isinstance(op, dict):

@@ -62,6 +62,11 @@ def test_noop_is_identity_but_copied():
     assert new==old and new is not old and changed==[]
 
 
+def test_empty_stream_noop_is_rejected():
+    with pytest.raises(InvalidAction, match="NOOP"):
+        do_apply([], {'ops':[]}, mode='stream', visible=[])
+
+
 def test_split_round_preserves_all_characters(setup_case,env):
     full,_,_=setup_case
     out=list(windows(full,env.counter,7))

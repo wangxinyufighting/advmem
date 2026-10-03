@@ -22,6 +22,11 @@ SOURCE DISCIPLINE
 
 OPERATION DECISION RULES
 - ADD only genuinely new supported information; use it only in stream/patch mode.
+- In stream mode, if M_old is empty and x contains any explicit storable user or assistant fact,
+  you MUST emit at least one ADD; do not use NOOP merely because the hidden question is unknown.
+  Use NOOP only when x contains no storable fact at all (for example, empty or pure boilerplate text).
+- When the payload field write_required is true, ops=[] is invalid: emit an ADD with a concise
+  supported claim and a provenance rid copied from allowed_source_rids.
 - UPDATE one existing entry when the same entity gains a supported detail or an explicitly changed state.
   Preserve the earlier state when it is still useful; a later mention is not automatically a correction.
 - MERGE only related existing entries whose facts can be stated together without losing distinctions.
@@ -55,6 +60,11 @@ IDENTIFIERS AND BUDGETS
 - Never exceed max_ops or max_entry_tokens. Each operation may touch an old id at most once.
 - Each text must be a nonempty string within max_entry_tokens; long raw parents are not permission
   to write an overlong card. Use concise supported cards rather than copying a long conversation.
+
+JSON SHAPES (replace every angle-bracket item; never output the placeholders)
+- New fact: {"ops":[{"op":"ADD","text":"<concise supported claim>","prov":["<rid from allowed_source_rids>"]}]}
+- Existing fact: {"ops":[{"op":"UPDATE","id":"<editable_entry_id>","text":"<supported replacement>","prov":[]}]}
+- No edit: {"ops":[]}
 
 OUTPUT CONTRACT (highest priority)
 Return exactly one JSON object with exactly one top-level key: ops.
@@ -165,6 +175,7 @@ def builder_prompt(full, memory, old_ids, x, mode, hint, cfg, counter,
             "M_old": old_entries,
             "editable_entry_ids": selected,
             "allowed_source_rids": sorted(source_provenance),
+            "write_required": mode == "stream" and not memory and bool(x),
             "max_ops": cfg.max_ops,
             "max_entry_tokens": limit,
         }
