@@ -184,14 +184,27 @@ def main(argv=None):
                             if len(completion) >= a.max_new_tokens and completion[-1] != tokenizer.eos_token_id:
                                 reward_text += "\n[TRUNCATED_OUTPUT]"
                             detail = env.score(full, state, reward_text)
-                            group.append(Rollout(ids, completion, text, old, ref, float(detail["reward"]), detail))
+                            # Builder constraints (for example refine/no-op) are encoded in
+                            # effective_reward.  The raw reward intentionally remains in the
+                            # detail payload for diagnostics, but must not drive GRPO.
+                            if "effective_reward" not in detail:
+                                raise Unknown("Reward detail missing effective_reward")
+                            reward = float(detail["effective_reward"])
+                            if not torch.isfinite(torch.tensor(reward)):
+                                raise Unknown("Reward detail has non-finite effective_reward")
+                            group.append(Rollout(ids, completion, text, old, ref, reward, detail))
                     except Unknown as exc:
                         # 一条环境判分失败则整组不更新，防止只保留较易判分的动作。
                         group_logs.append({"state": row["id"], "status": "environment_error", "error": str(exc)})
                         write_rows(out / "last_group_errors.jsonl", group_logs)
                         raise  # fail-fast，网络修好后再resume，不烧完整轮API预算。
                     adv, std = advantages([r.reward for r in group])
-                    group_logs.append({"state": row["id"], "std": std, "rewards": [r.reward for r in group],
+                    group_logs.append({"state": row["id"], "std": std,
+                                       # ``rewards`` is the value used by GRPO.  Keep the
+                                       # un-gated values separately so reward debugging does
+                                       # not accidentally change the optimization signal.
+                                       "rewards": [r.reward for r in group],
+                                       "raw_rewards": [float(r.detail["reward"]) for r in group],
                                        "responses": [r.text for r in group]})
                     if std > 1e-8:
                         candidates.append((std, group))

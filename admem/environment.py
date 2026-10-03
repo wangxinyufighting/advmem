@@ -250,7 +250,8 @@ class Environment:
             if set(value) != {"items"} or not isinstance(value["items"], list) or len(value["items"]) > self.cfg.questions_per_pack:
                 raise InvalidAction("items schema/budget violation")
         except InvalidAction as exc:
-            return {"reward": -0.1, "reason": str(exc), "legal": False}
+            return {"reward": -0.1, "effective_reward": -0.1,
+                    "reason": str(exc), "legal": False}
         pack = self.pack_module.Pack(**state["pack"])
         seen = set(state.get("seen_keys", []))
         rewards, details = [], []
@@ -271,7 +272,12 @@ class Environment:
             rewards.append(0.5 + 0.5 * repairable)
             details.append({"status": "accepted", "item": q, "defect": defect})
         # 固定题数分母：不让单道简单题比多道有价值题占便宜；空列表reward=0。
-        return {"reward": sum(rewards) / self.cfg.questions_per_pack, "legal": True, "items": details}
+        reward = sum(rewards) / self.cfg.questions_per_pack
+        # Attacker rewards currently have no family-specific gate, so the
+        # effective value equals the base value.  Keep the same schema as the
+        # builder path so every training entry point optimizes one field.
+        return {"reward": reward, "effective_reward": reward,
+                "legal": True, "items": details}
 
     def score(self, full, state, completion):
         if state["role"] == "builder":

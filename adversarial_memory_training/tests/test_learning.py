@@ -9,6 +9,7 @@ import torch
 from admem.learning import Rollout, advantages, completion_logp, grpo_loss, optimize_groups
 from admem.common import write_rows
 from admem.train import load_training_records
+from admem import verl_reward
 
 
 class TinyLoRA(torch.nn.Module):
@@ -141,3 +142,39 @@ def test_sft_and_grpo_filter_different_states(tmp_path):
     write_rows(p,[base,{**base,'id':'b','state':{**base['state'],'tests':[{}]},'completion':None}])
     assert [x['id'] for x in load_training_records(p,'builder','sft')]==['a']
     assert [x['id'] for x in load_training_records(p,'builder','grpo')]==['b']
+
+
+def test_verl_reward_uses_effective_reward(monkeypatch,tmp_path):
+    """The distributed reward hook must apply gates, not the diagnostic score."""
+    state_path=tmp_path/'state.json'
+    state={'split':'train','role':'builder','full_path':'unused.json',
+           'full_hash':'full-hash','environment_fingerprint':'cfg-hash'}
+    from admem.common import write
+    write(state_path, {'state':state})
+
+    class FakeCfg:
+        def fingerprint(self):
+            return 'cfg-hash'
+
+    class FakeFull:
+        fingerprint='full-hash'
+
+        @classmethod
+        def load(cls,path):
+            assert path == 'unused.json'
+            return cls()
+
+    fake_env=NS(
+        cfg=FakeCfg(),
+        memory_module=NS(FullMemory=FakeFull),
+        score=lambda full, current_state, completion: {
+            'reward': 1.25, 'effective_reward': 0.0,
+        },
+    )
+    monkeypatch.setattr(verl_reward, 'environment', lambda path: fake_env)
+    score=verl_reward.compute_score(
+        'admem_builder', '{}', ground_truth='',
+        extra_info={'split':'train','state_path':str(state_path),
+                    'config':'config.json'},
+    )
+    assert score == 0.0

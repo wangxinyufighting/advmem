@@ -106,6 +106,26 @@ def test_builder_prompt_hides_all_test_questions(setup_case,env):
     assert 'Ask the assistant' not in text
 
 
+def test_refine_prompt_requires_safe_shortening_before_noop(setup_case,env):
+    full,path,ctx=setup_case
+    state=builder_state(full,path,ctx,memory(),[], 'refine',[],env,old_ids=['m1','m2'])
+    system=state['prompt'][0]['content']
+    assert 'overrides the generic NOOP rule' in system
+    assert 'no safe shortening exists' in system
+    assert 'In refine mode, two identical cards are redundant' in system
+
+
+def test_temporal_prompt_requires_resolved_absolute_date(setup_case,env):
+    full,path,ctx=setup_case
+    ctx['question_type']='temporal-reasoning'
+    state=builder_state(full,path,ctx,[],[
+        {'rid':'s1:r1','date':'2023-01-05','text':'Yesterday I bought a lamp.'}
+    ], 'stream',[],env)
+    system=state['prompt'][0]['content']
+    assert 'stored text must include the resolved absolute date' in system
+    assert "do not store only 'yesterday'" in system
+
+
 def test_hidden_baseline_same_card_budget(setup_case,env):
     full,path,ctx=setup_case
     ctx['question_type']='multi-session'
@@ -178,6 +198,59 @@ def test_builder_reward_uses_raw_action_no_fallback(setup_case,env):
     assert good['accuracy']==1 and good['faith'] and good['reward']>1
 
 
+def test_refine_noop_keeps_raw_answer_reward_but_zeroes_effective_reward(setup_case,env):
+    """A correct-but-uncompressed refine proposal must not train as a success."""
+    full,_,_=setup_case
+    state=state_for(env,setup_case)
+    state['mode']='refine'
+    state['x']=[]
+    state['M']=[
+        {'id':'m1','text':'The user\'s cat is named Milo.','prov':['s1:r1'],'kind':'card'},
+        {'id':'m2','text':'The user\'s cat is named Milo.','prov':['s1:r1'],'kind':'card'},
+    ]
+    state['old_ids']=['m1','m2']
+    result=env.builder_score(full,state,'{"ops":[]}')
+    assert result['legal'] and result['faith'] and result['accuracy']==1
+    assert result['family_constraint_pass'] is False
+    assert result['family_constraint_reason']=='memory was not shortened'
+    assert result['reward']==1 and result['effective_reward']==0
+
+
+def test_refine_merge_preserves_effective_reward(setup_case,env):
+    """A valid merge that shortens memory remains eligible for reward."""
+    full,_,_=setup_case
+    state=state_for(env,setup_case)
+    state['mode']='refine'
+    state['x']=[]
+    state['M']=[
+        {'id':'m1','text':'The user\'s cat is named Milo.','prov':['s1:r1'],'kind':'card'},
+        {'id':'m2','text':'The user\'s cat is named Milo.','prov':['s1:r1'],'kind':'card'},
+    ]
+    state['old_ids']=['m1','m2']
+    action={'ops':[{'op':'MERGE','ids':['m1','m2'],
+                    'text':"The user's cat is named Milo.",'prov':[]}]}
+    result=env.builder_score(full,state,json.dumps(action))
+    assert result['legal'] and result['faith'] and result['accuracy']==1
+    assert result['family_constraint_pass'] is True
+    assert result['after_tokens']<result['before_tokens']
+    assert result['effective_reward']==result['reward'] and result['effective_reward']>0
+
+
+def test_noop_repeat_rejects_redundant_update_in_effective_reward(setup_case,env):
+    """NOOP family must score an unnecessary update as zero effective reward."""
+    full,_,_=setup_case
+    state=state_for(env,setup_case)
+    state['M']=[{'id':'m1','text':"The user's cat is named Milo.",'prov':['s1:r1'],'kind':'card'}]
+    state['old_ids']=['m1']
+    action={'ops':[{'op':'UPDATE','id':'m1',
+                    'text':"The user's cat is named Milo.",'prov':['s1:r1']}]}
+    result=env.builder_score(full,state,json.dumps(action),family='noop_repeat')
+    assert result['legal'] and result['faith'] and result['accuracy']==1
+    assert result['family_constraint_pass'] is False
+    assert result['family_constraint_reason']=='NOOP must contain an empty ops list'
+    assert result['reward']>0 and result['effective_reward']==0
+
+
 def test_unfaithful_action_gets_no_accuracy_bonus(setup_case,env):
     full,_,_=setup_case;state=state_for(env,setup_case)
     result=env.builder_score(full,state,json.dumps({'ops':[{'op':'ADD','text':'Milo UNSUPPORTED','prov':['s1:r1']}]}))
@@ -222,6 +295,7 @@ def test_attacker_reward_duplicate_same_question_not_different_fact(setup_case,e
     state=attacker_state(full,path,ctx,[],pack,[],env,0)
     result=env.attacker_score(full,state,json.dumps({'items':[q(),q()]}))
     assert result['reward']==1/env.cfg.questions_per_pack
+    assert result['effective_reward']==result['reward']
     assert result['items'][1]['status']=='duplicate'
 
 

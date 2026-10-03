@@ -42,13 +42,18 @@ OPERATION DECISION RULES
 - DELETE only an entry that is explicitly contradicted, obsolete by a clear correction, or redundant.
 - In patch mode, if x only repeats a fact already represented in M_old and adds no detail or state
   change, MUST return {"ops":[]} rather than UPDATE merely to add duplicate provenance.
-- In refine mode, treat M_old as the complete candidate set: when a safe merge or deduplication would
-  shorten it without losing facts, emit that MERGE/DELETE/UPDATE. Use NOOP only when no safe shortening exists.
-- Use an empty ops list when the fact is already represented, irrelevant, or not safely supported.
+- In refine mode, treat M_old as the complete candidate set. This rule overrides the generic NOOP rule:
+  when a safe merge or deduplication would shorten it without losing facts, you MUST emit that
+  MERGE/DELETE/UPDATE. Use NOOP only when no safe shortening exists (for example, there is no
+  redundancy or lossless consolidation).
+- In stream/patch mode, use an empty ops list when the fact is already represented, irrelevant, or
+  not safely supported. In refine mode, use an empty ops list only when no safe shortening exists.
 - In refine mode ADD is forbidden: remove redundancy only, and preserve all retained facts.
 
 DECISION EXAMPLES
-- Existing "likes tea" plus "loves tea" is a duplicate: use NOOP, not UPDATE.
+- In stream/patch mode, if x only repeats an existing fact, use NOOP rather than UPDATE.
+- In refine mode, two identical cards are redundant: use MERGE (or DELETE the redundant card),
+  not NOOP; the resulting memory must be shorter.
 - Source "is trying to use a foam roller" supports an attempt, not an established routine.
 - Existing "trains Monday and Friday" plus "now trains Tuesday and Thursday" is an update:
   retain the earlier schedule when it may be asked for, and record the new boundary.
@@ -125,7 +130,8 @@ BUILDER_TYPE_GUIDANCE = {
         "relative time only when the source date is explicit; never invent date precision. "
         "A source saying 'Yesterday I bought X' describes an event one calendar day before its "
         "report date, not on the report date. For example, report date 2023-01-05 plus 'Yesterday' "
-        "means event date 2023-01-04; write the resolved date and retain the relative wording. "
+        "means event date 2023-01-04; the stored text must include the resolved absolute date (do not "
+        "store only 'yesterday') and should retain the relative wording when useful. "
         "Adapt the calculation to the actual source. "
         "Keep the original relative wording when useful. Do not add first/only/no-other-event claims."
     ),

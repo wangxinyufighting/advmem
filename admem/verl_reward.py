@@ -25,4 +25,10 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     if full.fingerprint != state["full_hash"]:
         raise ValueError("Reward full memory changed")
     # 不使用ground_truth字段中的官方答案（导出时它为空）。环境失败抛错停止job，绝不return0。
-    return float(env.score(full, state, solution_str)["reward"])
+    detail = env.score(full, state, solution_str)
+    # ``reward`` is the diagnostic/base score.  The effective score applies
+    # family constraints (e.g. refine must shorten and noop must be empty),
+    # and is the only score suitable for policy optimization.
+    if "effective_reward" not in detail:
+        raise Unknown("Reward detail missing effective_reward")
+    return float(detail["effective_reward"])
