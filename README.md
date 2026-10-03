@@ -87,6 +87,8 @@ export EMBED_MODEL="你的embedding模型名"
 
 `.env.example` 提供完整示例；复制并填写后可以 `source .env`，脚本不自动读取 dotenv。不支持 `response_format` 的服务可设 `LLM_JSON_MODE=0`；不接受默认 temperature/max_tokens 的模型通过 `LLM_EXTRA_BODY` 显式覆盖。HTTP 接口依据 [Chat Completions](https://developers.openai.com/api/reference/resources/chat) 和 [Embeddings](https://developers.openai.com/api/reference/resources/embeddings/methods/create)，没有假定任意兼容服务都支持全部参数。
 
+如果判官返回 `finish_reason=length`，日志中的 `[TRUNCATED_OUTPUT]` 表示输出预算耗尽，不是记忆或 faithfulness 判定失败。判官 JSON 的第二次尝试会自动将输出预算翻倍，默认上限为 `16384`；可用 `JUDGE_MAX_TOKENS`、`JUDGE_JSON_RETRY_MAX_TOKENS`（或对应的 `LLM_` 变量）调整。使用 Qwen3/vLLM 等默认启用思考的服务时，也可以在服务支持的前提下关闭判官思考，例如 `JUDGE_EXTRA_BODY='{"chat_template_kwargs":{"enable_thinking":false}}'`，以免思考 token 吃完整个 JSON 输出预算。
+
 ## 4. 数据准备：不要悄悄换成 cleaned
 
 官方原始数据仓库的 S 文件名是 `longmemeval_s`，远端没有 `.json` 后缀；本地可以保存成 `longmemeval_s.json`：

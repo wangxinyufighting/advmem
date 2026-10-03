@@ -247,29 +247,21 @@ class Remote:
         self.tag = digest([role, self.client.model, self.client.base_url])
         self.retry_dir = Path(cache) / "judge_retries"
 
-    def complete(self, prompt, nonce, temperature=0.0, max_tokens=None):
+    def complete(self, prompt, nonce, temperature=0.0, max_tokens=None,
+                 output_tokens=None):
+        """Complete one request, optionally overriding its output-token budget.
+
+        ``output_tokens`` is used only by the JSON parser's bounded retry.  It
+        is applied after role-specific ``*_EXTRA_BODY`` overrides so that
+        services using ``max_completion_tokens`` (rather than the legacy
+        ``max_tokens``) receive the larger retry budget as well.  The initial
+        request remains byte-for-byte compatible with the configured body.
+        """
         if max_tokens is None:
             max_tokens = int(os.getenv(f"{self.role}_MAX_TOKENS",
                                        os.getenv("LLM_MAX_TOKENS", "4096")))
         body = {"model": self.client.model, "messages": prompt, "temperature": temperature,
                 "max_tokens": max_tokens}
-        
-        if os.getenv("DEBUG_LLM_REQUEST") == "1":
-            print(
-                json.dumps(
-                    {
-                        "model": body.get("model"),
-                        "temperature": body.get("temperature"),
-                        "top_p": body.get("top_p"),
-                        "seed": body.get("seed"),
-                        "max_tokens": body.get("max_tokens"),
-                        "nonce": nonce,
-                    },
-                    ensure_ascii=False,
-                ),
-                file=sys.stderr,
-                flush=True,
-            )
         
         if os.getenv("LLM_JSON_MODE", "1") == "1":
             body["response_format"] = {"type": "json_object"}
@@ -279,6 +271,34 @@ class Remote:
                 body.pop(key, None)
             else:
                 body[key] = value
+        if output_tokens is not None:
+            # Keep the caller's chosen parameter spelling.  A few compatible
+            # APIs reject a request containing both spellings, so do not add a
+            # second key when one is already present.  If EXTRA_BODY removed
+            # both defaults, restore the legacy spelling for this retry only.
+            budget_keys = [key for key in ("max_tokens", "max_completion_tokens")
+                           if key in body]
+            if not budget_keys:
+                budget_keys = ["max_tokens"]
+            for key in budget_keys:
+                body[key] = output_tokens
+        if os.getenv("DEBUG_LLM_REQUEST") == "1":
+            print(
+                json.dumps(
+                    {
+                        "model": body.get("model"),
+                        "temperature": body.get("temperature"),
+                        "top_p": body.get("top_p"),
+                        "seed": body.get("seed"),
+                        "max_tokens": body.get("max_tokens"),
+                        "max_completion_tokens": body.get("max_completion_tokens"),
+                        "nonce": nonce,
+                    },
+                    ensure_ascii=False,
+                ),
+                file=sys.stderr,
+                flush=True,
+            )
         if self.client.calls >= self.client.max_calls:
             raise Unknown("MAX_API_CALLS exhausted; stop and inspect the budget before resuming")
         try:
@@ -295,13 +315,56 @@ class Remote:
     def json(self, prompt, nonce):
         # 判官格式错误属于环境未知，不能变成被训练策略的负奖励。
         path = self.retry_dir / (digest([self.tag, prompt, nonce]) + ".json")
-        attempt = read(path)["attempt"] if path.exists() else 0
+        previous = read(path) if path.exists() else {}
+        attempt = previous.get("attempt", 0)
+        # A reasoning model can spend the whole output budget before emitting
+        # its JSON.  On a retry, increase only the request's output budget; do
+        # not change builder/attacker sampling or silently accept partial JSON.
+        retry_budget = self._json_retry_budget(attempt)
         for _ in range(2):
             raw = None
             try:
-                raw = self.complete(prompt, f"{nonce}:json_attempt={attempt}")
+                request_nonce = f"{nonce}:json_attempt={attempt}"
+                if retry_budget is None:
+                    # Preserve the original call shape for the initial
+                    # request, including compatibility with lightweight test
+                    # doubles that only accept ``prompt, nonce``.
+                    raw = self.complete(prompt, request_nonce)
+                else:
+                    raw = self.complete(prompt, request_nonce,
+                                        output_tokens=retry_budget)
                 return parse_json_object(raw)
             except InvalidAction as exc:
                 attempt += 1
                 write(path, {"attempt": attempt, "error": str(exc), "raw": raw})
+                retry_budget = self._json_retry_budget(attempt)
         raise Unknown(f"{self.role} JSON invalid after two attempts; inspect {path}")
+
+    def _json_retry_budget(self, attempt):
+        """Return a bounded retry budget, or ``None`` for the first request."""
+        if attempt <= 0:
+            return None
+        configured = int(os.getenv(f"{self.role}_MAX_TOKENS",
+                                   os.getenv("LLM_MAX_TOKENS", "4096")))
+        if configured < 1:
+            raise ValueError(f"{self.role}_MAX_TOKENS must be positive")
+        try:
+            extras = json.loads(os.getenv(self.role + "_EXTRA_BODY",
+                                          os.getenv("LLM_EXTRA_BODY", "{}")))
+        except (TypeError, ValueError):
+            extras = {}
+        # The effective cap is whichever spelling the configured service uses.
+        # Ignore null/non-numeric values; complete() will retain the configured
+        # request shape and the retry falls back to the role default.
+        for key in ("max_completion_tokens", "max_tokens"):
+            value = extras.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                configured = int(value)
+                break
+        cap = int(os.getenv(f"{self.role}_JSON_RETRY_MAX_TOKENS",
+                            os.getenv("LLM_JSON_RETRY_MAX_TOKENS", "16384")))
+        if cap < 1:
+            raise ValueError("LLM_JSON_RETRY_MAX_TOKENS must be positive")
+        # Never make the retry smaller than the already configured request if
+        # a user intentionally chose a cap above the default retry ceiling.
+        return max(configured, min(configured * (2 ** min(attempt, 30)), cap))
