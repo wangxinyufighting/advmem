@@ -126,6 +126,18 @@ def test_temporal_prompt_requires_resolved_absolute_date(setup_case,env):
     assert "do not store only 'yesterday'" in system
 
 
+def test_builder_prompt_separates_new_entities_and_source_provenance(setup_case,env):
+    full,path,ctx=setup_case
+    state=builder_state(full,path,ctx,
+                        [{'id':'m1','text':'The user owns a cat.','prov':['s0:r1'],'kind':'card'}],
+                        [{'rid':'s1:r1','date':'2023','text':'I adopted a dog.'}],
+                        'patch',[],env,old_ids=['m1'])
+    system=state['prompt'][0]['content']
+    assert 'different entity or an independent new event is a new fact: use ADD' in system
+    assert 'prov MUST include the corresponding rid(s) from allowed_source_rids' in system
+    assert 'Use [] only when the replacement text relies entirely on the edited parents' in system
+
+
 def test_hidden_baseline_same_card_budget(setup_case,env):
     full,path,ctx=setup_case
     ctx['question_type']='multi-session'

@@ -36,7 +36,10 @@ OPERATION DECISION RULES
   Use NOOP only when x contains no storable fact at all (for example, empty or pure boilerplate text).
 - When the payload field write_required is true, ops=[] is invalid: emit an ADD with a concise
   supported claim and a provenance rid copied from allowed_source_rids.
-- UPDATE one existing entry when the same entity gains a supported detail or an explicitly changed state.
+- UPDATE one existing entry only when the same entity gains a supported detail or an explicitly changed
+  state. A different entity or an independent new event is a new fact: use ADD and leave the old entry
+  unchanged. For example, an old card saying "the user owns a cat" plus x saying "the user adopted a
+  dog" requires ADD for the dog, not UPDATE of the cat card.
   Preserve the earlier state when it is still useful; a later mention is not automatically a correction.
 - MERGE only related existing entries whose facts can be stated together without losing distinctions.
 - DELETE only an entry that is explicitly contradicted, obsolete by a clear correction, or redundant.
@@ -73,7 +76,10 @@ IDENTIFIERS AND BUDGETS
 - UPDATE/DELETE ids must be in editable_entry_ids. MERGE ids must contain at least two distinct editable ids.
 - ADD prov must be a nonempty list of distinct rids from allowed_source_rids.
 - UPDATE/MERGE prov may contain rids from allowed_source_rids or the actual edited parents' prov,
-  not another old entry's prov. Use [] when relying only on parents; the host retains their prov automatically.
+  not another old entry's prov. If the written text contains any new, changed, or otherwise supported
+  detail taken from x, prov MUST include the corresponding rid(s) from allowed_source_rids. Use []
+  only when the replacement text relies entirely on the edited parents; the host retains their prov
+  automatically. Never use [] to hide a source fact that was copied into the new text.
 - If a required id or provenance is not in the payload, use {"ops":[]} instead of guessing.
 - Never exceed max_ops or max_entry_tokens. Each operation may touch an old id at most once.
 - Treat max_entry_tokens as a hard validator, not a suggestion: keep each written text to one
@@ -86,6 +92,13 @@ JSON SHAPES (replace every angle-bracket item; never output the placeholders)
 - New fact: {"ops":[{"op":"ADD","text":"<concise supported claim>","prov":["<rid from allowed_source_rids>"]}]}
 - Existing fact: {"ops":[{"op":"UPDATE","id":"<editable_entry_id>","text":"<supported replacement>","prov":[]}]}
 - No edit: {"ops":[]}
+
+PROVENANCE EXAMPLES
+- Old card "the user owns a cat" plus x "the user adopted a dog": ADD a dog card; do not UPDATE the cat card.
+- Old card "the user studies biology" plus x "the user now studies chemistry": UPDATE that same card,
+  and include x's rid in prov because the replacement contains the changed subject.
+- MERGE two old cards without adding facts from x: prov=[] is valid because the merged text uses only
+  the edited parents. If x adds a date or detail to that merged text, include x's rid instead.
 
 OUTPUT CONTRACT (highest priority)
 Return exactly one JSON object with exactly one top-level key: ops.
