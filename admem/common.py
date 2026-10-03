@@ -254,10 +254,6 @@ class Remote:
         body = {"model": self.client.model, "messages": prompt, "temperature": temperature,
                 "max_tokens": max_tokens}
         
-        import json
-        import os
-        import sys
-        
         if os.getenv("DEBUG_LLM_REQUEST") == "1":
             print(
                 json.dumps(
