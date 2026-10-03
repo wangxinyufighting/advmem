@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import http.client
 import os
 import time
 import urllib.error
@@ -63,7 +64,8 @@ class Client:
                 last = f"HTTP {exc.code}: {message}"
                 if exc.code != 429 and exc.code < 500:
                     raise ModelError(last) from exc
-            except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            except (http.client.IncompleteRead, http.client.RemoteDisconnected,
+                    urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
                 last = str(exc)
             if attempt < 2:
                 time.sleep(2 ** attempt)

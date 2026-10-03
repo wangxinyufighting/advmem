@@ -47,6 +47,35 @@ class Embedder:
         else:
             raise ValueError("embedding backend 必须是 local 或 api")
 
+    def _local_max_length(self) -> int:
+        """Return a limit accepted by both SentenceTransformer and its encoder."""
+        configured = getattr(self.encoder, "max_seq_length", 0)
+        limits = []
+        if isinstance(configured, (int, float)) and configured > 0:
+            limits.append(int(configured))
+        first = self.encoder._first_module() if hasattr(self.encoder, "_first_module") else None
+        config = getattr(getattr(first, "auto_model", None), "config", None)
+        positions = getattr(config, "max_position_embeddings", 0)
+        if isinstance(positions, (int, float)) and positions > 0:
+            limits.append(int(positions))
+        return max(16, min(limits) if limits else 256)
+
+    def _token_ids(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        """Tokenize without permanently changing the shared model tokenizer."""
+        tokenizer = self.encoder.tokenizer
+        old_limit = getattr(tokenizer, "model_max_length", None)
+        changed = isinstance(old_limit, (int, float)) and old_limit < 10**9
+        if changed:
+            tokenizer.model_max_length = 10**9
+        try:
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens, verbose=False)
+            except TypeError:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+        finally:
+            if changed:
+                tokenizer.model_max_length = old_limit
+
     def split(self, text: str) -> list[str]:
         if self.backend == "api":
             # API 的索引切片使用字符预算；不会截断/改写原文库。
@@ -55,10 +84,13 @@ class Embedder:
                 raise ValueError("EMBED_CHUNK_CHARS 必须 >=32")
             return [text[i:i + size] for i in range(0, len(text), size)] or [" "]
         tokenizer = self.encoder.tokenizer
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        reserve = max(len(tokenizer.encode(p, add_special_tokens=False))
+        # Tokenize the complete text for splitting, but restore the shared
+        # tokenizer metadata immediately; SentenceTransformer may use it to
+        # truncate inputs during encode().
+        ids = self._token_ids(text)
+        reserve = max(len(self._token_ids(p))
                       for p in [self.query_prefix, self.document_prefix]) + 8
-        size = max(16, self.encoder.max_seq_length - reserve)
+        size = max(16, self._local_max_length() - reserve)
         # 用模型自己的 tokenizer 分块，防止 SentenceTransformer 悄悄截尾。
         return [tokenizer.decode(ids[i:i + size], skip_special_tokens=True)
                 for i in range(0, len(ids), size)] or [" "]
@@ -67,6 +99,18 @@ class Embedder:
         prefix = self.query_prefix if query else self.document_prefix
         values = [prefix + (s or " ") for s in chunks]
         if self.backend == "local":
+            # Decoding token slices can add spaces or normalization tokens.
+            # Refit each value against the encoder's actual position limit so
+            # stale tokenizer metadata can never reach the BERT position table.
+            tokenizer = self.encoder.tokenizer
+            limit = self._local_max_length()
+            prefix_ids = len(self._token_ids(prefix))
+            budget = max(1, limit - prefix_ids - 2)  # [CLS] and [SEP]
+            safe_values = []
+            for chunk in chunks:
+                ids = self._token_ids(chunk)[:budget]
+                safe_values.append(prefix + tokenizer.decode(ids, skip_special_tokens=True))
+            values = safe_values
             vectors = self.encoder.encode(values, batch_size=32, normalize_embeddings=True,
                                           show_progress_bar=False)
         else:

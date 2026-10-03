@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import os
 import sys
 from dataclasses import asdict, dataclass
@@ -62,6 +63,64 @@ def parse(text):
     return value
 
 
+def parse_json_object(text):
+    """Parse a model response while preserving strict action parsing elsewhere.
+
+    Judge/reader APIs occasionally wrap an otherwise valid object in a Markdown
+    fence or a short explanation.  Builder and attacker actions continue to use
+    ``parse`` above so that such wrappers remain illegal training outputs.
+    """
+    if not isinstance(text, str):
+        raise InvalidAction("Model response is not text")
+    raw = text.lstrip("\ufeff").strip()
+    if not raw:
+        raise InvalidAction("Model response is empty")
+    if "[TRUNCATED_OUTPUT]" in raw:
+        raise InvalidAction("Model response was truncated")
+
+    candidates = []
+    if re.search(r"</think>\s*", raw, flags=re.IGNORECASE):
+        candidates.append(re.split(r"</think>\s*", raw, flags=re.IGNORECASE)[-1])
+    fences = list(re.finditer(r"```(?:json)?\s*\n?(.*?)```", raw,
+                              flags=re.IGNORECASE | re.DOTALL))
+    if len(fences) == 1:
+        candidates.append(fences[0].group(1).strip())
+    candidates.append(raw)
+    decoder = json.JSONDecoder()
+
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if not candidate:
+            continue
+        try:
+            value = json.loads(candidate)
+        except (TypeError, ValueError):
+            value = None
+        if isinstance(value, dict):
+            return value
+        if value is not None:
+            continue
+
+        # Allow one object surrounded by prose, but reject ambiguous output
+        # containing two independent top-level objects.
+        objects = []
+        for start, char in enumerate(candidate):
+            if char != "{":
+                continue
+            try:
+                value, end = decoder.raw_decode(candidate, start)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                objects.append((start, end, value))
+        maximal = [item for item in objects if not any(
+            other[0] <= item[0] and item[1] <= other[1] and other[:2] != item[:2]
+            for other in objects)]
+        if len(maximal) == 1:
+            return maximal[0][2]
+    raise InvalidAction("Model response does not contain one JSON object")
+
+
 @lru_cache(maxsize=8)
 def implementation_hash(project):
     sources = {"admem/" + p.name: p for p in Path(__file__).parent.glob("*.py")}
@@ -71,9 +130,9 @@ def implementation_hash(project):
 
 @dataclass
 class Config:
-    project: str = "."
+    project: str = "/root/autodl-tmp/advmem"
     cache: str = ".cache/admem"
-    tokenizer: str = "Qwen/Qwen3-4B-Instruct-2507"
+    tokenizer: str = "/root/autodl-tmp/model/Qwen3-4B-Instruct-2507"
     tokenizer_revision: str | None = None
     hint_mode: str = "target_type"  # 用户要求的基线；另有 hidden 对照。
     embedding: str = "local"
@@ -142,6 +201,14 @@ class TokenBudget:
     def __init__(self, model, revision=None):
         from transformers import AutoTokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model, revision=revision, trust_remote_code=False)
+        # TokenBudget counts complete prompts; it never truncates them. Some
+        # locally exported tokenizers carry a stale 256-token model_max_length
+        # even though the configured Builder/Reader budgets are much larger.
+        # Raise only the tokenizer-side warning threshold; the actual model
+        # service remains responsible for enforcing its context window.
+        tokenizer_limit = getattr(self.tokenizer, "model_max_length", 0)
+        if not isinstance(tokenizer_limit, (int, float)) or tokenizer_limit < 10**9:
+            self.tokenizer.model_max_length = 10**9
 
     def count(self, text):
         return len(self.tokenizer.encode(text, add_special_tokens=False))
@@ -180,7 +247,10 @@ class Remote:
         self.tag = digest([role, self.client.model, self.client.base_url])
         self.retry_dir = Path(cache) / "judge_retries"
 
-    def complete(self, prompt, nonce, temperature=0.0, max_tokens=4096):
+    def complete(self, prompt, nonce, temperature=0.0, max_tokens=None):
+        if max_tokens is None:
+            max_tokens = int(os.getenv(f"{self.role}_MAX_TOKENS",
+                                       os.getenv("LLM_MAX_TOKENS", "4096")))
         body = {"model": self.client.model, "messages": prompt, "temperature": temperature,
                 "max_tokens": max_tokens}
         
@@ -231,9 +301,11 @@ class Remote:
         path = self.retry_dir / (digest([self.tag, prompt, nonce]) + ".json")
         attempt = read(path)["attempt"] if path.exists() else 0
         for _ in range(2):
+            raw = None
             try:
-                return parse(self.complete(prompt, f"{nonce}:json_attempt={attempt}"))
-            except InvalidAction:
+                raw = self.complete(prompt, f"{nonce}:json_attempt={attempt}")
+                return parse_json_object(raw)
+            except InvalidAction as exc:
                 attempt += 1
-                write(path, {"attempt": attempt})
-        raise Unknown(f"{self.role} judge JSON invalid after two attempts")
+                write(path, {"attempt": attempt, "error": str(exc), "raw": raw})
+        raise Unknown(f"{self.role} JSON invalid after two attempts; inspect {path}")

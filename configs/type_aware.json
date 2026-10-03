@@ -1,5 +1,5 @@
 {
-  "project": "/root/autodl-tmp/full_memory_lab",
+  "project": ".",
   "cache": ".cache/admem",
   "tokenizer": "/root/autodl-tmp/model/Qwen3-4B-Instruct-2507",
   "tokenizer_revision": null,
