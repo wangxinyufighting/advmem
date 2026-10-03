@@ -92,7 +92,13 @@ def test_builder_prompt_hides_all_test_questions(setup_case,env):
     text=json.dumps(state['prompt'])
     assert 'SECRET_TEST_QUESTION' not in text and 'SECRET_TEST_ANSWER' not in text
     assert 'answer_SECRET' not in text
-    assert json.loads(state['prompt'][1]['content'])['task_type']=='single-session-user'
+    payload=json.loads(state['prompt'][1]['content'])
+    assert payload['task_type']=='single-session-user'
+    assert payload['editable_entry_ids']==[]
+    assert payload['allowed_source_rids']==['s1:r1']
+    assert 'type_guidance' not in payload
+    assert 'STORAGE HINT:' in state['prompt'][0]['content']
+    assert 'Ask the assistant' not in text
 
 
 def test_hidden_baseline_same_card_budget(setup_case,env):
@@ -103,6 +109,32 @@ def test_hidden_baseline_same_card_budget(setup_case,env):
     b=builder_state(full,path,ctx,[],[],'stream',[],env)
     assert a['entry_limit']==b['entry_limit']
     assert 'task_type' not in json.loads(b['prompt'][1]['content'])
+
+
+@pytest.mark.parametrize('qtype,forbidden', [
+    ('single-session-preference', 'Store only constraints explicitly stated'),
+    ('temporal-reasoning', 'TEMPORAL MEMORY CHECK'),
+])
+def test_hidden_builder_does_not_leak_type_rules(setup_case,env,qtype,forbidden):
+    full,path,ctx=setup_case
+    ctx['question_type']=qtype
+    env.cfg.hint_mode='hidden'
+    state=builder_state(full,path,ctx,[],[{'rid':'s1:r1','date':'2023','text':'Yesterday I bought a lamp.'}], 'stream',[],env)
+    text=json.dumps(state['prompt'])
+    assert qtype not in text
+    assert forbidden not in text
+
+
+def test_builder_budget_includes_type_specific_rules(setup_case,env):
+    full,path,ctx=setup_case
+    ctx['question_type']='temporal-reasoning'
+    env.cfg.builder_input_tokens=100000
+    state=builder_state(full,path,ctx,[],[{'rid':'s1:r1','date':'2023','text':'Yesterday I bought a lamp.'}], 'stream',[],env)
+    json.loads(state['prompt'][1]['content'])
+    budget=env.counter.prompt_count(state['prompt'])
+    env.cfg.builder_input_tokens=budget
+    bounded=builder_state(full,path,ctx,[],[{'rid':'s1:r1','date':'2023','text':'Yesterday I bought a lamp.'}], 'stream',[],env)
+    assert env.counter.prompt_count(bounded['prompt'])<=budget
 
 
 def test_attacker_sees_declared_type_but_not_original_ids(setup_case,env):

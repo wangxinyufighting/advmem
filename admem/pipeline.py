@@ -11,52 +11,6 @@ from .prompts import attacker_messages, builder_prompt, source_view
 from .store import apply, augment, neutral_round, question_key, raw_chunks, text_size
 
 
-PREFERENCE_BUILDER_RULES = """Additional rules for single-session-preference memory:
-- Store only constraints explicitly stated by the user.
-- Do not answer a future question or write a recommendation.
-- Do not write an answer rubric or phrases such as \"a good answer should\".
-- Do not invent duration, cost, equipment, location, bedtime, or activity constraints.
-- Keep a compact record of the user's documented preference and nothing else.
-"""
-
-TEMPORAL_BUILDER_RULES = """Additional rules for temporal-reasoning memory:
-- Treat the recorded date attached to each source round as the reference date for
-  relative expressions; it is the date of the report, not automatically the event date.
-- Resolve a relative expression only when that reference date is explicitly visible:
-  yesterday = one calendar day before the reference date, tomorrow = one day after,
-  and N days/weeks later = add that interval.
-- Example: a round dated 2023-01-05 saying ``Yesterday I bought X`` means
-  ``X was bought on 2023-01-04``. Never copy 2023-01-05 as the event date in this case.
-- A compact entry for that pattern is: ``Bought X on 2023-01-04 (source:
-  "Yesterday" on 2023-01-05).`` Keep the operation JSON-only and cite the source rid.
-- Full worked operation (replace the entity and rid with the actual source):
-  source ``date=2023-01-05, text=Yesterday I bought X`` must become exactly
-  ``{"ops":[{"op":"ADD","text":"Bought X on 2023-01-04 (source: \\\"Yesterday\\\" on 2023-01-05).","prov":["s1:r1"]}]}``.
-  This is an operation-format example; do not copy its names, dates, or rid when
-  the current source is different. The report date 2023-01-05 is not the event date.
-- Preserve the original relative wording together with the resolved date when useful.
-- Write only supported events and temporal relations; do not add claims such as
-  "the only event", "first event", or "no other events" unless the source states them.
-- Do not invent a date when the source date is missing or ambiguous.
-"""
-
-
-def _append_builder_instruction(prompt, instruction):
-    """兼容字符串 prompt 和 OpenAI messages 列表。"""
-    if isinstance(prompt, str):
-        return prompt.rstrip() + "\n\n" + instruction
-    if isinstance(prompt, list):
-        result = list(prompt)
-        if result and isinstance(result[-1], dict) and result[-1].get("role") == "user":
-            last = dict(result[-1])
-            last["content"] = str(last.get("content", "")).rstrip() + "\n\n" + instruction
-            result[-1] = last
-        else:
-            result.append({"role": "user", "content": instruction})
-        return result
-    raise TypeError(f"Unsupported builder prompt type: {type(prompt)!r}")
-
-
 def make_pool(full, env):
     idx = env.index(full.documents())
     sampler = env.pack_module.Sampler(full, idx, seed=env.cfg.seed, neighbors=env.cfg.neighbors,
@@ -105,36 +59,27 @@ def clean_question(q):
 
 def builder_state(full, full_path, context, memory, x, mode, tests, env, old_ids=None):
     ids = related(memory, x, env) if old_ids is None else old_ids
-    prompt, visible, cap = builder_prompt(full, memory, ids, x, mode, hint(context, env.cfg), env.cfg, env.counter)
-    if context.get("question_type") == "single-session-preference":
-        prompt = _append_builder_instruction(prompt, PREFERENCE_BUILDER_RULES)
-    if context.get("question_type") == "temporal-reasoning":
-        # Put temporal arithmetic in a high-priority system message. Small
-        # instruction models often copy the report date when the rule is
-        # appended after the large user JSON payload.
-        temporal_system = (
+    visible_type = context.get("question_type") if env.cfg.hint_mode == "target_type" else None
+    extra_system = ""
+    if visible_type == "temporal-reasoning":
+        # Put temporal arithmetic in the single system message and count the
+        # addition before selecting the old-entry subset. Small instruction
+        # models often copy the report date when this rule is appended later.
+        extra_system = (
             "TEMPORAL MEMORY CHECK (must follow before emitting JSON):\n"
             "1. A source object's date is the report/reference date, not automatically the event date.\n"
-            "2. For a source dated 2023-01-05 whose text says \"Yesterday I bought X\", "
-            "the only supported event date is 2023-01-04.\n"
-            "3. Correct example (adapt X/name, do not copy its literals): "
-            "{\"ops\":[{\"op\":\"ADD\",\"text\":\"Bought X on 2023-01-04 (source phrase: Yesterday; report date: 2023-01-05).\",\"prov\":[\"s1:r1\"]}]}\n"
-            "4. Never output 2023-01-05 as X's event date in that case.\n"
-            "5. Do not add first/only/no-other-event claims.\n"
-            "6. Output exactly one JSON object with an ADD/UPDATE/MERGE operation and source provenance."
+            "2. If a source says \"Yesterday I bought X\", the event date is one calendar day "
+            "before that source's report date.\n"
+            "3. Preserve the relative wording alongside the resolved event date when useful.\n"
+            "4. Never use the report date as X's event date in that case.\n"
+            "5. Cite only a provenance rid copied verbatim from the current payload's allowed_source_rids.\n"
+            "6. Do not add first/only/no-other-event claims.\n"
+            "7. Output exactly one JSON object; do not output a worked example, Markdown, or a thinking block."
         )
-        if isinstance(prompt, list):
-            # Keep a single system message: some local Qwen/vLLM chat
-            # templates silently discard additional system messages.
-            original = list(prompt)
-            if original and isinstance(original[0], dict) and original[0].get("role") == "system":
-                first = dict(original[0])
-                first["content"] = temporal_system + "\n\n" + str(first.get("content", ""))
-                prompt = [first] + original[1:]
-            else:
-                prompt = [{"role": "system", "content": temporal_system}] + original
-        else:
-            prompt = temporal_system + "\n\n" + _append_builder_instruction(prompt, TEMPORAL_BUILDER_RULES)
+    prompt, visible, cap = builder_prompt(
+        full, memory, ids, x, mode, hint(context, env.cfg), env.cfg, env.counter,
+        extra_system=extra_system,
+    )
     tests = list({question_key(q): clean_question(q) for q in tests}.values())
     return {"role": "builder", "mode": mode, "split": context["split"], "case_key": context["key"],
             "full_path": str(Path(full_path).resolve()), "full_hash": full.fingerprint,
