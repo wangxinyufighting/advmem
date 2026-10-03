@@ -14,8 +14,17 @@ SOURCE DISCIPLINE
 - Record only claims explicitly supported by x or by an entry being updated/merged.
 - Keep speaker, status, certainty, dates, quantities, units, list positions, and scope exact.
 - A user report is not an assistant suggestion, plan, hypothetical, or completed action.
+- Before writing each clause, identify the exact speaker and sentence that supports it. An assistant
+  recommendation, example, option list, placeholder, or explanation is not a user choice, action,
+  plan, purchase, habit, or belief unless the user explicitly adopts it later. Preserve attribution
+  when storing assistant content; never silently rewrite it as something the user did or prefers.
+- Keep user hedges and status words literal: "might", "thinking of", "need to", "will try", and
+  "considering" remain uncertain or future; a request for advice is not acceptance of the advice.
 - Preserve uncertainty and relative wording unless an explicit source date anchors the conversion.
 - Mention time is not automatically event time. Do not invent precision.
+- Conversation timestamps are report dates, not acquisition, completion, or event dates unless the
+  speaker explicitly gives that date. Do not add venues, motivations, rankings, superlatives, prices
+  paid, or causal explanations that are absent from the cited source.
 - Distinct facts can coexist. Do not delete a useful fact just because another fact has the same topic.
 - An excerpt may be only part of a long round; do not assume you saw the rest.
 - Do not add cumulative snapshots as independent increments. Keep entries independently understandable.
@@ -58,6 +67,9 @@ IDENTIFIERS AND BUDGETS
   not another old entry's prov. Use [] when relying only on parents; the host retains their prov automatically.
 - If a required id or provenance is not in the payload, use {"ops":[]} instead of guessing.
 - Never exceed max_ops or max_entry_tokens. Each operation may touch an old id at most once.
+- Treat max_entry_tokens as a hard validator, not a suggestion: keep each written text to one
+  atomic claim and target at most 120 tokens. Never paste a whole source round or concatenate
+  several unrelated facts into one card; retain the qualifiers needed for that one claim.
 - Each text must be a nonempty string within max_entry_tokens; long raw parents are not permission
   to write an overlong card. Use concise supported cards rather than copying a long conversation.
 
@@ -164,6 +176,15 @@ def builder_prompt(full, memory, old_ids, x, mode, hint, cfg, counter,
         # Include type instructions before counting the final prompt, and keep
         # them in the single system message used by local chat templates.
         system = "STORAGE HINT: " + BUILDER_TYPE_GUIDANCE[hint] + "\n\n" + system
+    if mode == "patch":
+        system = (
+            "PATCH REPAIR CHECK (follow only when mode is patch):\n"
+            "Treat x as the repair window selected from an active memory defect. Compare supported "
+            "facts and qualifiers in x with M_old; restore useful details missing or lossy in M_old "
+            "with ADD or UPDATE while retaining prior facts that are not contradicted. Do not infer "
+            "a hidden question or answer from patch mode, and do not treat a provenance rid alone as "
+            "proof that every fact from that round survived compression.\n\n" + system
+        )
     if extra_system:
         system = extra_system.rstrip() + "\n\n" + system
     while True:
