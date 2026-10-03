@@ -40,6 +40,10 @@ OPERATION DECISION RULES
   Preserve the earlier state when it is still useful; a later mention is not automatically a correction.
 - MERGE only related existing entries whose facts can be stated together without losing distinctions.
 - DELETE only an entry that is explicitly contradicted, obsolete by a clear correction, or redundant.
+- In patch mode, if x only repeats a fact already represented in M_old and adds no detail or state
+  change, MUST return {"ops":[]} rather than UPDATE merely to add duplicate provenance.
+- In refine mode, treat M_old as the complete candidate set: when a safe merge or deduplication would
+  shorten it without losing facts, emit that MERGE/DELETE/UPDATE. Use NOOP only when no safe shortening exists.
 - Use an empty ops list when the fact is already represented, irrelevant, or not safely supported.
 - In refine mode ADD is forbidden: remove redundancy only, and preserve all retained facts.
 
@@ -120,7 +124,9 @@ BUILDER_TYPE_GUIDANCE = {
         "Preserve event dates, report dates, relative expressions, durations, and ordering. Resolve "
         "relative time only when the source date is explicit; never invent date precision. "
         "A source saying 'Yesterday I bought X' describes an event one calendar day before its "
-        "report date, not on the report date. Adapt the calculation to the actual source. "
+        "report date, not on the report date. For example, report date 2023-01-05 plus 'Yesterday' "
+        "means event date 2023-01-04; write the resolved date and retain the relative wording. "
+        "Adapt the calculation to the actual source. "
         "Keep the original relative wording when useful. Do not add first/only/no-other-event claims."
     ),
 }
