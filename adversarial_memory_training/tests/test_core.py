@@ -9,7 +9,7 @@ from admem.common import InvalidAction, Unknown, Config, digest, parse, read, ro
 from admem.store import apply, augment, raw_chunks, question_key, text_size
 from admem.pipeline import builder_state, attacker_state, Collector, run_case, windows, generate_bank
 from admem.environment import boolean
-from admem.data import prepare, contexts, policy_type, hint
+from admem.data import prepare, contexts, history_for_builder, policy_type, hint
 from admem.probes import make_suite
 from admem.cli import export_states
 from admem.bootstrap import bootstrap
@@ -361,6 +361,20 @@ def test_prepare_split_isolates_identical_histories(case,env,tmp_path):
         assert set(ctx)=={'key','question_type','question_date','full_hash','split'}
     assert all(len(s)==1 for s in by.values())
     assert len(list(rows(out/'private_eval.jsonl')))==12
+
+
+def test_history_for_builder_disambiguates_duplicate_session_ids(case):
+    duplicate=copy.deepcopy(case)
+    duplicate['haystack_session_ids']=['s0','s0','s1','s0']
+    duplicate['haystack_dates']=['2023-01-01','2023-01-02','2023-01-03','2023-01-04']
+    duplicate['haystack_sessions']=[[{'role':'user','content':c}] for c in 'abcd']
+    history=history_for_builder(duplicate)
+    assert history['haystack_session_ids']==['s0','s0__duplicate_1','s1','s0__duplicate_2']
+    # Dates, order and message text stay byte-for-byte identical.
+    assert history['haystack_dates']==duplicate['haystack_dates']
+    assert history['haystack_sessions'] is duplicate['haystack_sessions']
+    # Cases without duplicates are left untouched.
+    assert history_for_builder(case)['haystack_session_ids']==case['haystack_session_ids']
 
 
 def test_raw_data_target_changes_do_not_change_full(case):

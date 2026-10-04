@@ -72,6 +72,32 @@ def assign_splits(catalog, sizes, seed):
             for i, s in enumerate(names)}
 
 
+def history_for_builder(case):
+    """Whitelist history and disambiguate duplicate source session IDs.
+
+    Some LongMemEval exports reuse a session ID inside one case. FullMemory
+    needs unique internal keys, so only the duplicate key is suffixed; dates,
+    messages, ordering, and all message text remain unchanged.
+    """
+    seen = {}
+    used = set()
+    session_ids = []
+    for value in case["haystack_session_ids"]:
+        base = str(value)
+        occurrence = seen.get(base, 0)
+        seen[base] = occurrence + 1
+        candidate = base if occurrence == 0 else f"{base}__duplicate_{occurrence}"
+        while candidate in used:
+            occurrence += 1
+            seen[base] = occurrence + 1
+            candidate = f"{base}__duplicate_{occurrence}"
+        used.add(candidate)
+        session_ids.append(candidate)
+    return {"haystack_session_ids": session_ids,
+            "haystack_dates": case["haystack_dates"],
+            "haystack_sessions": case["haystack_sessions"]}
+
+
 def prepare(data, out, core_memory, sizes=(300, 50, 150), seed=0):
     out = Path(out)
     if (out / "manifest.json").exists():
@@ -82,7 +108,9 @@ def prepare(data, out, core_memory, sizes=(300, 50, 150), seed=0):
         if qid in seen:
             raise ValueError("Duplicate question_id")
         seen.add(qid)
-        full = core_memory.FullMemory.build(case)
+        # Only the session IDs are disambiguated for FullMemory's internal keys;
+        # the original case (incl. haystack_sessions) is still used for labels.
+        full = core_memory.FullMemory.build(history_for_builder(case))
         key = f"c{i:04d}"
         folder = out / "cases" / key
         full.save(folder / "full.json")

@@ -6,7 +6,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from .common import Config, TokenBudget, Unknown, connect, digest, read, rows, write, write_rows
-from .data import contexts, prepare
+from .data import contexts, history_for_builder, prepare
 from .environment import Environment
 from .pipeline import Collector, generate_bank, run_case
 from .probes import make_suite, run_probe
@@ -177,32 +177,6 @@ def _external_label_index(path):
     return result
 
 
-def _history_for_builder(case):
-    """Whitelist history and disambiguate duplicate source session IDs.
-
-    Some LongMemEval exports reuse a session ID inside one case. FullMemory
-    needs unique internal keys, so only the duplicate key is suffixed; dates,
-    messages, ordering, and all message text remain unchanged.
-    """
-    seen = {}
-    used = set()
-    session_ids = []
-    for value in case["haystack_session_ids"]:
-        base = str(value)
-        occurrence = seen.get(base, 0)
-        seen[base] = occurrence + 1
-        candidate = base if occurrence == 0 else f"{base}__duplicate_{occurrence}"
-        while candidate in used:
-            occurrence += 1
-            seen[base] = occurrence + 1
-            candidate = f"{base}__duplicate_{occurrence}"
-        used.add(candidate)
-        session_ids.append(candidate)
-    return {"haystack_session_ids": session_ids,
-            "haystack_dates": case["haystack_dates"],
-            "haystack_sessions": case["haystack_sessions"]}
-
-
 def _external_question(case, label):
     """Convert custom split labels to Environment's private question schema."""
     case_qid = str(case.get("question_id", ""))
@@ -346,7 +320,7 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
 
     records = []
     for meta in selected_meta:
-        history = _history_for_builder(meta["case"])
+        history = history_for_builder(meta["case"])
         # Keep q/a and message-level evaluation labels outside the object passed
         # to the Builder pipeline. FullMemory.build also strips these fields,
         # but making the boundary explicit prevents future prompt leakage.
