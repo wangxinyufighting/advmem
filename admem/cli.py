@@ -9,7 +9,7 @@ from .common import Config, Progress, TokenBudget, Unknown, connect, digest, rea
 from .data import contexts, history_for_builder, prepare
 from .environment import Environment
 from .pipeline import Collector, generate_bank, run_case
-from .probes import make_suite, run_probe
+from .probes import make_suite, run_attacker_probe, run_probe
 from .bootstrap import bootstrap
 from .store import neutral_round, text_size
 
@@ -497,7 +497,7 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("command", choices=["check", "prepare", "bank", "run", "bootstrap", "probe-suite", "probe", "export", "relocate", "evaluate", "longmemeval-eval", "merge"])
+    p.add_argument("command", choices=["check", "prepare", "bank", "run", "bootstrap", "probe-suite", "probe", "attacker-probe", "export", "relocate", "evaluate", "longmemeval-eval", "merge"])
     p.add_argument("--config", default="configs/type_aware.json")
     p.add_argument("--data")
     p.add_argument("--prepared")
@@ -519,6 +519,7 @@ def main(argv=None):
     p.add_argument("--bank", help="bank命令输出根目录，用于stream训练状态的自生成问答奖励")
     p.add_argument("--role", choices=["builder", "attacker"], default="builder")
     p.add_argument("--samples", type=int, default=8)
+    p.add_argument("--max-packs", type=int, help="attacker-probe：每个case最多探测多少个pack")
     p.add_argument("--variants", type=int, default=5)
     p.add_argument("--states", help="probe的状态JSONL或export的collector根目录")
     p.add_argument("--parquet", action="store_true")
@@ -578,6 +579,17 @@ def main(argv=None):
         if not a.states or a.samples < 1:
             p.error("probe requires --states and positive --samples")
         print(run_probe(a.states, env, a.out, a.samples, a.builder_role, a.limit))
+        return
+    if a.command == "attacker-probe":
+        if not a.prepared:
+            p.error("attacker-probe requires --prepared")
+        if a.samples < 2:
+            p.error("attacker-probe requires --samples >= 2（否则无法测组内方差）")
+        entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
+        summary = run_attacker_probe(entries, env, a.out, samples=a.samples,
+                                     role=a.attacker_role, max_packs=a.max_packs)
+        print({k: summary[k] for k in ("groups", "signal_group_rate", "reward_std_mean",
+                                       "reward_overall_mean", "reward_min", "reward_max")})
         return
     if a.command == "longmemeval-eval" and a.cases:
         if a.prepared:

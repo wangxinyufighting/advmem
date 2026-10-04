@@ -445,6 +445,18 @@ def test_empty_q_skips_refine(setup_case,env,tmp_path):
     assert all(p.get('mode')!='refine' for p in payloads)
 
 
+def test_attacker_probe_reports_learning_signal(setup_case,env,tmp_path):
+    from admem.probes import run_attacker_probe
+    full,path,ctx=setup_case
+    out=tmp_path/'probe'
+    summary=run_attacker_probe([(ctx,path)],env,out,samples=3)
+    assert summary['groups']>=1 and summary['samples_per_group']==3
+    assert len(summary['per_group'])==summary['groups']
+    assert (out/'samples.jsonl').exists() and (out/'summary.json').exists()
+    assert all('reward' in row for row in rows(out/'samples.jsonl'))
+    assert all('raw_text' in row for row in rows(out/'raw_samples.jsonl'))
+
+
 def test_bank_retries_transient_api_failure_without_dropping_case(setup_case,env,tmp_path,monkeypatch):
     full,path,ctx=setup_case
     remote=env.policy('ATTACKER');original=remote.complete;calls={'n':0}

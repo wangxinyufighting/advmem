@@ -7,8 +7,8 @@ import json
 from pathlib import Path
 from statistics import mean, pstdev
 
-from .common import Unknown, digest, read, write, write_rows, parse
-from .pipeline import builder_state
+from .common import Progress, Unknown, digest, read, write, write_rows, parse
+from .pipeline import attacker_state, builder_state, make_pool
 from .store import neutral_round
 
 
@@ -140,6 +140,95 @@ def make_suite(env, out, variants=5):
             suite.append({"id": digest(state), "family": family, "state": state, "prompt": state["prompt"]})
     write_rows(out / "probes.jsonl", suite)
     return suite
+
+
+def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_packs=None,
+                       temperature=0.7):
+    """诊断 attacker reward 是否有组内学习信号（GRPO 要求每个 prompt 内 reward 有方差）。
+
+    对每个 pack 构造一个 attacker state（honor ``cfg.attacker_type_filter`` 等开关），
+    采样 ``samples`` 条 completion，用 ``env.attacker_score`` 打分；报告组内 std、
+    非零方差组占比、reward 分布。reward 全部相同 = 无梯度信号。
+    """
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    samples_path, raw_path = out / "samples.jsonl", out / "raw_samples.jsonl"
+    for path in (samples_path, raw_path):
+        if path.exists():
+            path.unlink()
+    records = []
+    for context, full_path in contexts_iter:
+        full = env.memory_module.FullMemory.load(full_path)
+        pool = make_pool(full, env)
+        if max_packs:
+            pool = pool[:max_packs]
+        bar = Progress(len(pool), label=f"{context['key']} attacker-probe")
+        for pi, pack in enumerate(pool):
+            state = attacker_state(full, full_path, context, [], pack, [], env, ["probe", pi])
+            if state is None:
+                bar.update(suffix=f"p{pi} type_infeasible")
+                continue
+            group = []
+            for i in range(samples):
+                nonce = "probe:" + digest([context["key"], pi, i, env.policy(role).tag])
+                raw = env.policy(role).complete(state["prompt"], nonce, temperature=temperature)
+                raw_text = _json_text(raw)
+                try:
+                    scored = dict(env.attacker_score(full, state, raw))
+                except Unknown as exc:
+                    write(out / "interrupted.json", {"case": context["key"], "pack": pi,
+                                                     "sample": i, "error": str(exc)})
+                    raise
+                record = {
+                    "case_key": context["key"], "pack": pi, "sample_idx": i,
+                    "qtype": state["qtype"], "temperature": temperature, "nonce": nonce,
+                    "raw_hash": hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16],
+                    "reward": scored.get("reward"),
+                    "effective_reward": scored.get("effective_reward"),
+                    "legal": scored.get("legal"), "reason": scored.get("reason"),
+                }
+                records.append(record)
+                group.append(record)
+                _append_jsonl(samples_path, record)
+                _append_jsonl(raw_path, {"case_key": context["key"], "pack": pi,
+                                         "sample_idx": i, "raw_text": raw_text})
+            rewards = [float(r["reward"]) for r in group if r.get("reward") is not None]
+            std = pstdev(rewards) if len(rewards) > 1 else 0.0
+            bar.update(suffix=f"p{pi} qtype={state['qtype']} mean={mean(rewards) if rewards else float('nan'):.3f} std={std:.3f}")
+        bar.close()
+
+    groups = defaultdict(list)
+    for record in records:
+        groups[(record["case_key"], record["pack"])].append(record)
+    per_group = []
+    for (case_key, pack), group in sorted(groups.items()):
+        rewards = [float(r["reward"]) for r in group if r.get("reward") is not None]
+        if len(rewards) < 2:
+            continue
+        per_group.append({
+            "case_key": case_key, "pack": pack, "qtype": group[0].get("qtype"),
+            "samples": len(rewards), "mean": mean(rewards), "std": pstdev(rewards),
+            "min": min(rewards), "max": max(rewards),
+            "unique_rewards": len(set(rewards)), "unique_raw": len({r["raw_hash"] for r in group}),
+        })
+    all_rewards = [float(r["reward"]) for r in records if r.get("reward") is not None]
+    signal = [g for g in per_group if g["std"] > 1e-8]
+    summary = {
+        "role": role, "model": env.policy(role).client.model, "temperature": temperature,
+        "groups": len(per_group), "samples_per_group": samples,
+        "groups_with_signal": len(signal),
+        "signal_group_rate": len(signal) / len(per_group) if per_group else None,
+        "reward_std_mean": mean([g["std"] for g in per_group]) if per_group else None,
+        "reward_overall_mean": mean(all_rewards) if all_rewards else None,
+        "reward_overall_std": pstdev(all_rewards) if len(all_rewards) > 1 else None,
+        "reward_min": min(all_rewards) if all_rewards else None,
+        "reward_max": max(all_rewards) if all_rewards else None,
+        "negative_rate": mean(float(r < 0) for r in all_rewards) if all_rewards else None,
+        "zero_rate": mean(float(r == 0) for r in all_rewards) if all_rewards else None,
+        "per_group": per_group,
+    }
+    write(out / "summary.json", summary)
+    return summary
 
 
 def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
