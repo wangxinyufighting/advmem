@@ -58,9 +58,13 @@ def summarize(root: Path, prepared: Path) -> dict:
             gini_like.append(max(sessions.values()) / sum(sessions.values()))
     accepted = sum(c["accepted"] for c in by_type.values())
     asked = accepted + sum(c["rejected"] for c in by_type.values())
+    infeasible = sum(c["type_infeasible"] for c in by_type.values())
+    invalid = sum(c["invalid"] for c in by_type.values())
     bank = stats["bank"] or 1
     return {
-        "cases": stats["cases"], "packs": stats["packs"],
+        "cases": stats["cases"], "packs": stats["packs"], "type_infeasible_packs": infeasible,
+        "invalid_output_rate": round(invalid / max(1, stats["packs"] - infeasible), 3),
+        "bank_per_feasible_pack": round(stats["bank"] / max(1, stats["packs"] - infeasible), 3),
         "prompt_tokens_p50/p90/max": [pct(tokens, .5), pct(tokens, .9), max(tokens, default=None)],
         "questions_proposed": asked, "gate_accept_rate": round(accepted / asked, 3) if asked else None,
         "bank_questions": stats["bank"],
@@ -77,10 +81,20 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--prepared", required=True)
     ap.add_argument("runs", nargs="+")
+    ap.add_argument("--json", help="把完整结果另存为JSON")
     a = ap.parse_args()
-    for run in a.runs:
-        print(run)
-        print(json.dumps(summarize(Path(run), Path(a.prepared)), ensure_ascii=False, indent=2))
+    results = {run: summarize(Path(run), Path(a.prepared)) for run in a.runs}
+    if a.json:
+        Path(a.json).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
+    cols = ["cases", "packs", "type_infeasible_packs", "prompt_tokens_p50/p90/max", "invalid_output_rate",
+            "gate_accept_rate", "bank_per_feasible_pack", "distinct_rounds_per_question",
+            "same_E_repeat_rate", "top_session_share_mean", "impersonal_rate"]
+    print("| metric | " + " | ".join(Path(r).name for r in a.runs) + " |")
+    print("|---" * (len(a.runs) + 1) + "|")
+    for c in cols:
+        print(f"| {c} | " + " | ".join(str(results[r][c]) for r in a.runs) + " |")
+    for r in a.runs:
+        print(f"\n{Path(r).name} by_type: {json.dumps(results[r]['by_type'], ensure_ascii=False)}")
 
 
 if __name__ == "__main__":
