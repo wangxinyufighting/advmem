@@ -519,7 +519,9 @@ def main(argv=None):
     p.add_argument("--bank", help="bank命令输出根目录，用于stream训练状态的自生成问答奖励")
     p.add_argument("--role", choices=["builder", "attacker"], default="builder")
     p.add_argument("--samples", type=int, default=8)
-    p.add_argument("--max-packs", type=int, help="attacker-probe：每个case最多探测多少个pack")
+    p.add_argument("--max-packs", type=int, help="attacker-probe：每个case取前N个pack")
+    p.add_argument("--pack-sample", type=int, help="attacker-probe：每个case随机抽N个pack（比--max-packs更适合抽样测试）")
+    p.add_argument("--pack-seed", type=int, default=0, help="attacker-probe随机抽pack的种子")
     p.add_argument("--variants", type=int, default=5)
     p.add_argument("--states", help="probe的状态JSONL或export的collector根目录")
     p.add_argument("--parquet", action="store_true")
@@ -587,7 +589,8 @@ def main(argv=None):
             p.error("attacker-probe requires --samples >= 2（否则无法测组内方差）")
         entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
         summary = run_attacker_probe(entries, env, a.out, samples=a.samples,
-                                     role=a.attacker_role, max_packs=a.max_packs)
+                                     role=a.attacker_role, max_packs=a.max_packs,
+                                     pack_sample=a.pack_sample, pack_seed=a.pack_seed)
         print({k: summary[k] for k in ("groups", "signal_group_rate", "reward_std_mean",
                                        "reward_overall_mean", "reward_min", "reward_max")})
         return

@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import defaultdict
 import hashlib
 import json
+import random
 from pathlib import Path
 from statistics import mean, pstdev
 
@@ -143,12 +144,15 @@ def make_suite(env, out, variants=5):
 
 
 def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_packs=None,
-                       temperature=0.7):
+                       temperature=0.7, pack_sample=None, pack_seed=0):
     """诊断 attacker reward 是否有组内学习信号（GRPO 要求每个 prompt 内 reward 有方差）。
 
     对每个 pack 构造一个 attacker state（honor ``cfg.attacker_type_filter`` 等开关），
     采样 ``samples`` 条 completion，用 ``env.attacker_score`` 打分；报告组内 std、
     非零方差组占比、reward 分布。reward 全部相同 = 无梯度信号。
+
+    ``pack_sample=N`` 随机抽 N 个 pack（可复现，seed 由 ``pack_seed+case`` 决定）
+    而非跑满该 case 的所有 session；``max_packs=N`` 仍是取前 N 个。
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -160,7 +164,11 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
     for context, full_path in contexts_iter:
         full = env.memory_module.FullMemory.load(full_path)
         pool = make_pool(full, env)
-        if max_packs:
+        if pack_sample is not None:
+            rng = random.Random(digest([pack_seed, context["key"]]))
+            if pack_sample < len(pool):
+                pool = sorted(rng.sample(pool, pack_sample), key=lambda p: p.pack_id)
+        elif max_packs:
             pool = pool[:max_packs]
         bar = Progress(len(pool), label=f"{context['key']} attacker-probe")
         for pi, pack in enumerate(pool):
@@ -180,7 +188,9 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
                                                      "sample": i, "error": str(exc)})
                     raise
                 record = {
-                    "case_key": context["key"], "pack": pi, "sample_idx": i,
+                    "case_key": context["key"], "pack": pi, "pack_id": pack.pack_id,
+                    "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None,
+                    "sample_idx": i,
                     "qtype": state["qtype"], "temperature": temperature, "nonce": nonce,
                     "raw_hash": hashlib.sha256(raw_text.encode("utf-8")).hexdigest()[:16],
                     "reward": scored.get("reward"),
@@ -206,7 +216,8 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
         if len(rewards) < 2:
             continue
         per_group.append({
-            "case_key": case_key, "pack": pack, "qtype": group[0].get("qtype"),
+            "case_key": case_key, "pack": pack, "pack_id": group[0].get("pack_id"),
+            "seed": group[0].get("seed"), "qtype": group[0].get("qtype"),
             "samples": len(rewards), "mean": mean(rewards), "std": pstdev(rewards),
             "min": min(rewards), "max": max(rewards),
             "unique_rewards": len(set(rewards)), "unique_raw": len({r["raw_hash"] for r in group}),

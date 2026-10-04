@@ -457,6 +457,16 @@ def test_attacker_probe_reports_learning_signal(setup_case,env,tmp_path):
     assert all('raw_text' in row for row in rows(out/'raw_samples.jsonl'))
 
 
+def test_attacker_probe_pack_sample_is_limited_and_deterministic(setup_case,env,tmp_path):
+    from admem.probes import run_attacker_probe
+    full,path,ctx=setup_case
+    first=run_attacker_probe([(ctx,path)],env,tmp_path/'p1',samples=2,pack_sample=1)
+    second=run_attacker_probe([(ctx,path)],env,tmp_path/'p2',samples=2,pack_sample=1)
+    assert first['groups']==1
+    assert [(g['case_key'],g['pack']) for g in first['per_group']]==\
+           [(g['case_key'],g['pack']) for g in second['per_group']]
+
+
 def test_bank_retries_transient_api_failure_without_dropping_case(setup_case,env,tmp_path,monkeypatch):
     full,path,ctx=setup_case
     remote=env.policy('ATTACKER');original=remote.complete;calls={'n':0}
