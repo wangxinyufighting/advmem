@@ -1,6 +1,6 @@
 """策略提示词全部英文；中文只用于源码注释。"""
 from .common import messages, Unknown
-from .audit_prompts import attacker_prompt, build_payload
+from .audit_prompts import attacker_prompt, attacker_rids, build_payload
 from .store import neutral_round
 
 BUILDER = """You are a memory editor, not a question writer or answer generator.
@@ -273,21 +273,38 @@ def builder_prompt(full, memory, old_ids, x, mode, hint, cfg, counter,
         selected.pop()  # 只裁候选旧条目，x中的原文不丢。
 
 
+def evidence_usage(accepted):
+    usage = {}
+    for q in accepted:
+        for rid in dict.fromkeys(q["E"]):
+            usage[rid] = usage.get(rid, 0) + 1
+    return usage
+
+
 def attacker_messages(full, pack, qtype, date, memory, accepted, cfg, counter):
+    """返回(prompt, visible_rids)。visible_rids是attacker可引用的E范围，gate按它校验。"""
     marks = {}
     for e in memory:
         for rid in e["prov"]:
             marks.setdefault(rid, []).append(e["id"])
+    visible = attacker_rids(full, pack, qtype, cfg.attacker_view)
+    view = type(pack)(**{**pack.to_dict(), "rids": visible})
     prior = {"full_hash": full.fingerprint, "accepted_items": accepted}
-    payload = build_payload(full, pack, qtype, date, cfg.questions_per_pack, marks, prior)
-    payload["memory_entries"] = [{"id": e["id"], "text": e["text"], "prov": e["prov"]}
-                                 for e in memory if set(e["prov"]) & set(pack.rids)][:cfg.old_entries]
-    prompt = messages(attacker_prompt(qtype) + "\nThe optional memory_entries are the current editable memory; "
-                      "use them to identify omissions, but only raw rounds are factual evidence.", payload)
+    payload = build_payload(full, view, qtype, date, cfg.questions_per_pack, marks, prior,
+                            view=cfg.attacker_view, usage=evidence_usage(accepted),
+                            max_context_items=cfg.attacker_context_items)
+    entries = [{"id": e["id"], "text": e["text"], "prov": e["prov"]}
+               for e in memory if set(e["prov"]) & set(visible)][:cfg.attacker_memory_entries]
+    system = attacker_prompt(qtype)
+    if entries:
+        payload["memory_entries"] = entries
+        system += ("\nThe optional memory_entries are the current editable memory; "
+                   "use them to identify omissions, but only raw rounds are factual evidence.")
+    prompt = messages(system, payload)
     if counter.prompt_count(prompt) > cfg.attacker_input_tokens:
         payload.pop("memory_entries", None)
         payload.pop("audit_context", None)
         prompt = messages(attacker_prompt(qtype), payload)
     if counter.prompt_count(prompt) > cfg.attacker_input_tokens:
         raise Unknown("Attacker pack exceeds token budget; rebuild smaller packs, do not truncate evidence")
-    return prompt
+    return prompt, visible

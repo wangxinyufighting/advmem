@@ -159,6 +159,15 @@ class Config:
     defect_mode: str = "strict"  # strict 是v1；direct另作诊断性扩展。
     fallback: bool = True
     seed: int = 0
+    # attacker：compact只给非种子round的user消息；type_filter按种子内容预筛可出题型。
+    attacker_view: str = "full"
+    attacker_type_filter: bool = False
+    seed_min_personal: int = 1
+    attacker_memory_entries: int = 20
+    attacker_context_items: int = 24
+    # 防reward hacking：反复引用同一round按1/(1+平均已用次数)衰减；非SSA题证据无一人称个人陈述时降权。
+    evidence_novelty: bool = True
+    impersonal_weight: float = 0.25
 
     @classmethod
     def load(cls, path):
@@ -167,6 +176,11 @@ class Config:
             raise ValueError("Unknown hint_mode/defect_mode")
         if c.embedding not in {"none", "local", "api"} or c.gate_mode not in {"basic", "full"}:
             raise ValueError("Unknown embedding/gate_mode")
+        if c.attacker_view not in {"full", "compact"}:
+            raise ValueError("Unknown attacker_view")
+        if (min(c.seed_min_personal, c.attacker_memory_entries, c.attacker_context_items) < 0
+                or not 0 <= c.impersonal_weight <= 1):
+            raise ValueError("Invalid attacker settings")
         numeric = [c.reader_k, c.reader_tokens, c.window_tokens, c.old_entries, c.max_ops,
                    c.builder_input_tokens, c.attacker_input_tokens, c.judge_input_tokens,
                    c.entry_tokens, c.timeline_tokens, c.questions_per_pack, c.sweeps]

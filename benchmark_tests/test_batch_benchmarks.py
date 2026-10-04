@@ -642,3 +642,15 @@ def test_api_key_not_recorded_and_budget_change_allowed(tmp_path, engine, monkey
     monkeypatch.setenv("MAX_API_CALLS", "99999")
     reader.main(command(data, out) + ["--resume"])
     assert len(engine.answers) == 1
+
+
+def test_model_visible_renders_hide_raw_session_ids():
+    """answer_* 等原始 session ID 是数据集标签，reader/attacker/judge 看到的文本里不能出现。"""
+    case = case_data()
+    case["haystack_session_ids"] = ["answer_LEAK_early", "sharegpt_LEAK_late"]
+    full = FullMemory.build(case)
+    rendered = [full.render(list(full.rounds)), full.render(list(full.rounds), {})]
+    rendered += [d.render() for d in full.documents()]
+    for text in rendered:
+        assert "LEAK" not in text
+    assert "session=s1" in rendered[0] and "sessions=s2" in rendered[-1]

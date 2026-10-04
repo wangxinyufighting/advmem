@@ -447,3 +447,64 @@ def test_collector_identity_excludes_only_full_path(tmp_path):
     assert c.save(base)==first
     base['full_hash']='different_content'
     assert c.save(base)!=first
+
+
+def mixed_case():
+    """种子s1是个人陈述；s2是无一人称的通用问答（类似sharegpt）。"""
+    return {'question_type':'single-session-user','question_date':'2023-04-01',
+            'haystack_session_ids':['personal','generic'],'haystack_dates':['2023-01-01','2023-02-01'],
+            'haystack_sessions':[[{'role':'user','content':'My cat is named Milo.'},
+                                  {'role':'assistant','content':'Noted. LONG_ASSISTANT_TEXT'}],
+                                 [{'role':'user','content':'Explain binary search.'},
+                                  {'role':'assistant','content':'Binary search halves the range. HIDDEN_NEIGHBOR'}]]}
+
+
+def test_compact_view_hides_neighbor_assistant_and_restricts_evidence(env,tmp_path):
+    full=Full.build(mixed_case());ctx={'key':'k','split':'train','question_type':'multi-session','question_date':'2023-04-01'}
+    env.cfg.attacker_view='compact'
+    pack=Pack('p',full.fingerprint,'personal','session',0,['s1:r1'],list(full.rounds))
+    state=attacker_state(full,tmp_path/'f.json',ctx,[],pack,[],env,0)
+    text=json.dumps(state['prompt'])
+    assert 'LONG_ASSISTANT_TEXT' in text and 'HIDDEN_NEIGHBOR' not in text and 'assistant_elided' in text
+    assert state['pack']['rids']==['s1:r1','s2:r1']
+    ctx['question_type']='single-session-user'
+    single=attacker_state(full,tmp_path/'f.json',ctx,[],pack,[],env,0)
+    assert single['pack']['rids']==['s1:r1'] and 'binary search' not in json.dumps(single['prompt'])
+    question={'q':'Explain?','a':'Milo','type':'single-session-user','question_date':'2023-04-01','E':['s2:r1']}
+    result=env.gate(full,Pack(**single['pack']),question,'2023-04-01','single-session-user')
+    assert result['status']=='rejected'
+
+
+def test_type_filter_skips_infeasible_pack_without_calling_attacker(env,tmp_path):
+    full=Full.build(mixed_case());ctx={'key':'k','split':'train','question_type':'single-session-user','question_date':'2023-04-01'}
+    env.cfg.attacker_type_filter=True
+    generic=Pack('p',full.fingerprint,'generic','session',0,['s2:r1'],list(full.rounds))
+    assert attacker_state(full,tmp_path/'f.json',ctx,[],generic,[],env,0) is None
+    ctx['question_type']='single-session-assistant'
+    assert attacker_state(full,tmp_path/'f.json',ctx,[],generic,[],env,0)['qtype']=='single-session-assistant'
+    env.cfg.hint_mode='hidden'
+    for i in range(20):
+        assert attacker_state(full,tmp_path/'f.json',ctx,[],generic,[],env,i)['qtype']=='single-session-assistant'
+    assert not env.control['prompts']
+
+
+def test_attacker_reward_decays_on_reused_evidence(setup_case,env):
+    full,path,ctx=setup_case
+    pack=Pack('p',full.fingerprint,'seed','session',0,['s1:r1'],list(full.rounds))
+    other=q();other['q']="What did I name my cat?"
+    fresh=attacker_state(full,path,ctx,[],pack,[],env,0)
+    reused=attacker_state(full,path,ctx,[],pack,[q()],env,0)
+    first=env.attacker_score(full,fresh,json.dumps({'items':[q(),other]}))
+    assert [i['weight'] for i in first['items']]==[1.0,0.5]
+    assert env.attacker_score(full,reused,json.dumps({'items':[other]}))['items'][0]['weight']==0.5
+    env.cfg.evidence_novelty=False
+    assert env.attacker_score(full,fresh,json.dumps({'items':[q(),other]}))['reward']==2/env.cfg.questions_per_pack
+
+
+def test_attacker_reward_downweights_impersonal_evidence(env,tmp_path):
+    case=mixed_case();case['haystack_sessions'][0][0]['content']='The cat is named Milo.'
+    full=Full.build(case);ctx={'key':'k','split':'train','question_type':'single-session-user','question_date':'2023-04-01'}
+    pack=Pack('p',full.fingerprint,'personal','session',0,['s1:r1'],list(full.rounds))
+    state=attacker_state(full,tmp_path/'f.json',ctx,[],pack,[],env,0)
+    result=env.attacker_score(full,state,json.dumps({'items':[q()]}))
+    assert result['items'][0]['weight']==env.cfg.impersonal_weight

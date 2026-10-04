@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .common import Remote, Unknown, InvalidAction, digest, messages, parse
 from . import prompts
-from .audit_prompts import TYPES, GATE_ORACLE_SYSTEM, GATE_SUPPORT_SYSTEM
+from .audit_prompts import TYPES, GATE_ORACLE_SYSTEM, GATE_SUPPORT_SYSTEM, personal_score
 from .store import apply, augment, question_key, raw_chunks, text_size
 
 
@@ -254,6 +254,7 @@ class Environment:
                     "reason": str(exc), "legal": False}
         pack = self.pack_module.Pack(**state["pack"])
         seen = set(state.get("seen_keys", []))
+        usage = dict(state.get("evidence_usage", {}))
         rewards, details = [], []
         for q in value["items"]:
             gate = self.gate(full, pack, q, state["date"], state["qtype"])
@@ -269,8 +270,11 @@ class Environment:
             seen.add(key)
             defect = self.defect(full, state["M"], q)
             repairable = defect["kind"] not in {"none", "unresolved"}
-            rewards.append(0.5 + 0.5 * repairable)
-            details.append({"status": "accepted", "item": q, "defect": defect})
+            weight = self.evidence_weight(full, q, usage)
+            for rid in q["E"]:
+                usage[rid] = usage.get(rid, 0) + 1
+            rewards.append((0.5 + 0.5 * repairable) * weight)
+            details.append({"status": "accepted", "item": q, "defect": defect, "weight": weight})
         # 固定题数分母：不让单道简单题比多道有价值题占便宜；空列表reward=0。
         reward = sum(rewards) / self.cfg.questions_per_pack
         # Attacker rewards currently have no family-specific gate, so the
@@ -278,6 +282,18 @@ class Environment:
         # builder path so every training entry point optimizes one field.
         return {"reward": reward, "effective_reward": reward,
                 "legal": True, "items": details}
+
+    def evidence_weight(self, full, q, usage):
+        """同一round被反复出题时边际收益递减；非SSA题证据里没有一人称个人陈述时降权。
+
+        不做按E硬去重：同一round的不同属性仍可得分，只是逐题递减，使"围着一个session刷题"
+        的收益有上界（调和级数）而不是线性增长。"""
+        weight = 1.0
+        if self.cfg.evidence_novelty:
+            weight /= 1 + sum(usage.get(r, 0) for r in q["E"]) / len(q["E"])
+        if q["type"] != "single-session-assistant" and personal_score(full, q["E"]) == 0:
+            weight *= self.cfg.impersonal_weight
+        return weight
 
     def score(self, full, state, completion):
         if state["role"] == "builder":

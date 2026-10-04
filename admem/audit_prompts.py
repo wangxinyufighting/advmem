@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any, Mapping
 
-PROMPT_VERSION = "memory-audit-en-v2.0"
+PROMPT_VERSION = "memory-audit-en-v2.1"
 TYPES = (
     "single-session-user", "single-session-assistant", "single-session-preference",
     "multi-session", "knowledge-update", "temporal-reasoning",
@@ -23,6 +23,8 @@ SOURCE AND TRUST
   and completed events are different. A suggestion does not prove that the user followed it.
 - Assistant-history questions ask what the assistant previously said, not what is true on the web.
 - Round IDs and session IDs are opaque addresses, never clues about answer relevance.
+- A round with assistant_elided=true shows only the user's messages. Never ask about, answer from,
+  or cite the hidden assistant text of such a round.
 - A nonempty referenced_by_memory field means provenance was cited; it does not mean every
   fact in that round survived compression. An empty field does not prove a memory defect.
 
@@ -32,6 +34,8 @@ QUESTION SELECTION
   corrections, and details embedded in long messages. Do not consider only the first or last round.
 - When the requested type permits, prefer useful facts in seed rounds before repeatedly using
   retrieved neighbors. Connect seed facts to other sessions when this is genuinely required.
+- prior_questions, when present, counts earlier accepted questions citing that round. Prefer
+  rounds with few prior questions; a heavily questioned round needs a genuinely different fact.
 - Within this batch, vary the tested subject, attribute, time scope, or reasoning operation.
   Rewording the same fact is not new coverage. Two different facts in the same round are allowed.
 - If audit_context is provided, use its local, previously accepted questions to avoid repetitions
@@ -100,7 +104,10 @@ objects include a named recommendation, a list element at a stated ordinal posit
 cell, a recipe quantity, a link, a handle, an identifier, a project objective, a created story
 attribute, or an earlier step or move. Read long replies beyond their openings. When asking for
 an ordinal item, preserve the original list boundaries and numbering; do not count a summary.
-Phrase the question as a callback to that conversation, not a general-knowledge exam. Evidence
+Phrase the question as a callback to that conversation, not a general-knowledge exam: ask for
+something the user would plausibly want back ("you suggested a few ... earlier, which one ...?",
+"remind me what you said about ..."). Use an ordinal position only when the user would naturally
+refer to the list that way; do not turn every list into position trivia. Evidence
 must locate the relevant assistant output or enough surrounding dialogue to resolve the callback.
 The type describes the prior-assistant interaction being recalled; it is not determined solely
 by whether an isolated answer token also appeared in a user message. Do not fix the earlier reply
@@ -119,7 +126,9 @@ exclusivity, or dislike of alternatives. Do not require unverifiable current pri
 hours, events, or external recommendations as the historical gold answer.
 """,
     "multi-session": """TYPE: multi-session
-Require information from at least two distinct sessions, not merely two citations. Useful
+Require information from at least two distinct sessions, not merely two citations. The most
+natural form aggregates one attribute of one kind of personal item or event across sessions
+("How many ... have I ...?", "How much did I spend on ... in total?"). Useful
 operations include counting distinct events/items, summing amounts or durations, differences,
 ratios or percentages, averages, comparisons, completing a set, and resolving a fact via a
 cross-session reference. Explicitly check the collection, operands, units, denominator, and
@@ -227,7 +236,8 @@ def attacker_prompt(qtype: str) -> str:
     return ATTACKER_SYSTEM + "\n" + TYPE_GUIDANCE[qtype]
 
 
-def _as_prior_context(value: Mapping[str, Any] | None, visible: set[str], full_hash: str) -> dict:
+def _as_prior_context(value: Mapping[str, Any] | None, visible: set[str], full_hash: str,
+                      limit: int = 24) -> dict:
     """只取相关题；调用方必须提供本case经gate接受的自生成题，而非目标题。"""
     if not value:
         return {}
@@ -252,18 +262,27 @@ def _as_prior_context(value: Mapping[str, Any] | None, visible: set[str], full_h
         selected.append({"q": entry["q"], "a": entry["a"], "type": entry["type"],
                          "question_date": entry.get("question_date"), "E": evidence})
     # 这是局部有界提示，而不是完整覆盖账本；不缩写已保留题的文字。
-    return {"accepted_items": selected[-24:], "omitted_relevant_items": max(0, len(selected) - 24)}
+    kept = selected[-limit:] if limit else []
+    if not kept:
+        return {}
+    return {"accepted_items": kept, "omitted_relevant_items": len(selected) - len(kept)}
 
 
 def build_payload(full: Any, pack: Any, qtype: str, date: str, n_questions: int = 4,
                   marks: Mapping[str, list[str]] | None = None,
-                  audit_context: Mapping[str, Any] | None = None) -> dict:
-    """只读原文白名单；原始 answer_* session ID 不进入模型视图，也不改 F。"""
+                  audit_context: Mapping[str, Any] | None = None, *, view: str = "full",
+                  usage: Mapping[str, int] | None = None, max_context_items: int = 24) -> dict:
+    """只读原文白名单；原始 answer_* session ID 不进入模型视图，也不改 F。
+
+    view="compact" 时非种子 round 只显示 user 消息（给小模型减负）；被隐去的
+    assistant 原文仍在 F 中，gate 用完整 source_view 核验。"""
     qtype = ALIASES.get(qtype, qtype)
     if qtype not in TYPES or not isinstance(date, str) or not date:
         raise ValueError("Invalid question type or question date")
     if type(n_questions) is not int or n_questions < 0:
         raise ValueError("n_questions must be a nonnegative integer")
+    if view not in VIEWS:
+        raise ValueError(f"Unknown attacker view: {view}")
     if pack.full_hash != full.fingerprint:
         raise ValueError("Pack/full-memory fingerprint mismatch")
     rids = list(pack.rids)
@@ -285,16 +304,74 @@ def build_payload(full: Any, pack: Any, qtype: str, date: str, n_questions: int 
             if not isinstance(m.get("role"), str) or not isinstance(m.get("content"), str):
                 raise ValueError("Round messages require string role/content")
             messages.append({"role": m["role"], "content": m["content"]})
-        rounds.append({"rid": rid, "session": rid.split(":")[0],
-                       "session_date": full.sessions[r.session_id].date, "is_seed": rid in seed,
-                       "referenced_by_memory": linked, "messages": messages})
+        entry = {"rid": rid, "session": rid.split(":")[0],
+                 "session_date": full.sessions[r.session_id].date, "is_seed": rid in seed,
+                 "referenced_by_memory": linked}
+        if view == "compact" and rid not in seed:
+            shown = [m for m in messages if m["role"] == "user"]
+            if not shown:
+                raise ValueError("Compact view needs user text in non-seed rounds; filter with attacker_rids")
+            if len(shown) < len(messages):
+                entry["assistant_elided"] = True
+            messages = shown
+        if usage is not None:
+            entry["prior_questions"] = int(usage.get(rid, 0))
+        rounds.append(dict(entry, messages=messages))
     payload = {"type": qtype, "question_date": date, "n_questions": n_questions,
                "max_evidence_rounds": 8 if qtype in {"multi-session", "knowledge-update", "temporal-reasoning"} else 3,
                "rounds": rounds}
-    context = _as_prior_context(audit_context, set(rids), full.fingerprint)
+    context = _as_prior_context(audit_context, set(rids), full.fingerprint, max_context_items)
     if context:
         payload["audit_context"] = context
     return payload
+
+
+VIEWS = ("full", "compact")
+SINGLE_SESSION = {"single-session-user", "single-session-assistant", "single-session-preference"}
+# 只看文本的一人称个人事实标记；不读session ID前缀等数据集标签。
+_PERSONAL = re.compile(r"\b(?:my|mine|I['’]m|I['’]ve|I was|I had|I recently|I just)\b", re.I)
+
+
+def personal_score(full: Any, rids) -> int:
+    return sum(len(_PERSONAL.findall(m["content"])) for rid in rids
+               for m in full.rounds[rid].messages if m.get("role") == "user")
+
+
+def attacker_rids(full: Any, pack: Any, qtype: str, view: str) -> list[str]:
+    """compact：单session题只给种子；跨session题给种子+含user文本的邻居。"""
+    qtype = ALIASES.get(qtype, qtype)
+    if view == "full":
+        return list(pack.rids)
+    if view not in VIEWS:
+        raise ValueError(f"Unknown attacker view: {view}")
+    seed = set(pack.seed_rids)
+    if qtype in SINGLE_SESSION:
+        return [rid for rid in pack.rids if rid in seed]
+    return [rid for rid in pack.rids if rid in seed or
+            any(m.get("role") == "user" for m in full.rounds[rid].messages)]
+
+
+def feasible_types(full: Any, pack: Any, min_personal: int = 0) -> list[str]:
+    """不看目标题的可出题性预筛：用户事实类题要求种子含个人陈述，避免强迫在通用问答上编题。"""
+    seed = list(pack.seed_rids)
+    seed_sessions = {full.rounds[r].session_id for r in seed}
+    others = {}
+    for rid in pack.rids:
+        sid = full.rounds[rid].session_id
+        if sid not in seed_sessions:
+            others.setdefault(sid, []).append(rid)
+    personal = personal_score(full, seed) >= min_personal
+    allowed = []
+    for t in TYPES:
+        if t == "single-session-assistant":
+            ok = any(m.get("role") == "assistant" for r in seed for m in full.rounds[r].messages)
+        elif t == "multi-session":
+            ok = personal and any(personal_score(full, v) >= min_personal for v in others.values())
+        else:
+            ok = personal
+        if ok:
+            allowed.append(t)
+    return allowed
 
 
 def render_evidence(full: Any, rids) -> str:

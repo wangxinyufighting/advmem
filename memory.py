@@ -66,7 +66,9 @@ class Document:
     neighbors: list[str]
 
     def render(self) -> str:
-        return f"[{self.id} | {self.date} | sessions={','.join(self.session_ids)}]\n{self.text}"
+        # 原始 session ID（如 answer_*）是数据集标签，只留给评测/排除；模型视图用由 rid 推出的中性 sN。
+        nodes = dict.fromkeys(rid.split(":", 1)[0] for rid in self.prov)
+        return f"[{self.id} | {self.date} | sessions={','.join(nodes)}]\n{self.text}"
 
 
 class FullMemory:
@@ -155,7 +157,8 @@ class FullMemory:
             if marks is not None:
                 mids = marks.get(rid, [])
                 mark = f"[∈M: {','.join(mids)}] " if mids else "[∉M] "
-            parts.append(f"{mark}[{rid} | session={r.session_id} | {self.sessions[r.session_id].date}]\n{r.text}")
+            s = self.sessions[r.session_id]
+            parts.append(f"{mark}[{rid} | session={s.node_id} | {s.date}]\n{r.text}")
         return "\n\n".join(parts)
 
     def save(self, path: str | Path) -> None:

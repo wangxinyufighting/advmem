@@ -7,7 +7,8 @@ from pathlib import Path
 
 from .common import InvalidAction, Unknown, digest, parse, read, write, write_rows
 from .data import hint, policy_type
-from .prompts import attacker_messages, builder_prompt, source_view
+from .audit_prompts import feasible_types
+from .prompts import attacker_messages, builder_prompt, evidence_usage, source_view
 from .store import apply, augment, neutral_round, question_key, raw_chunks, text_size
 
 
@@ -88,13 +89,20 @@ def builder_state(full, full_path, context, memory, x, mode, tests, env, old_ids
 
 
 def attacker_state(full, full_path, context, memory, pack, accepted, env, identity):
-    qtype = policy_type(context, env.cfg, identity)
-    prompt = attacker_messages(full, pack, qtype, context["question_date"], memory, accepted, env.cfg, env.counter)
+    """题型对该pack不可出题时返回None：调用方记为type_infeasible，不调用attacker、不产生奖励。"""
+    allowed = feasible_types(full, pack, env.cfg.seed_min_personal) if env.cfg.attacker_type_filter else None
+    qtype = policy_type(context, env.cfg, identity, allowed)
+    if qtype is None:
+        return None
+    prompt, visible = attacker_messages(full, pack, qtype, context["question_date"], memory, accepted,
+                                        env.cfg, env.counter)
+    # gate只接受attacker实际看到的round作E；compact视图下隐去的邻居不能被引用。
+    pack = type(pack)(**{**pack.to_dict(), "rids": visible})
     return {"role": "attacker", "split": context["split"], "case_key": context["key"],
             "full_path": str(Path(full_path).resolve()), "full_hash": full.fingerprint,
             "hint_mode": env.cfg.hint_mode, "environment_fingerprint": env.cfg.fingerprint(), "M": deepcopy(memory), "pack": pack.to_dict(),
             "date": context["question_date"], "qtype": qtype, "prompt": prompt,
-            "seen_keys": [question_key(q) for q in accepted]}
+            "seen_keys": [question_key(q) for q in accepted], "evidence_usage": evidence_usage(accepted)}
 
 
 class Collector:
@@ -203,14 +211,18 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
             for pi, pack in enumerate(pool):
                 identity = [namespace, sweep, pi]
                 state = attacker_state(full, full_path, context, memory, pack, accepted, env, identity)
-                raw = propose(state, env, attacker_role, f"{namespace}:audit:{sweep}:{pi}")
-                evaluation = env.attacker_score(full, state, raw)
-                if collect:
+                if state is None:
+                    evaluation = {"legal": True, "items": [], "skipped": "type_infeasible"}
+                else:
+                    raw = propose(state, env, attacker_role, f"{namespace}:audit:{sweep}:{pi}")
+                    evaluation = env.attacker_score(full, state, raw)
+                if collect and state is not None:
                     # teacher出题SFT只收本来就有效的完整输出，不能把gate修订答案写成policy输出。
                     all_valid = evaluation.get("items") and all(r["status"] == "accepted" for r in evaluation["items"])
                     collect.save(state, raw if all_valid else None, {"gate": bool(all_valid)})
                 ledger.append({"seed": pack.seed_id, "sweep": sweep, "M_hash": digest(state["M"]),
-                               "status": "asked" if evaluation.get("items") else "audited_empty" if evaluation.get("legal") else "invalid_output"})
+                               "status": evaluation.get("skipped") or ("asked" if evaluation.get("items") else
+                                         "audited_empty" if evaluation.get("legal") else "invalid_output")})
                 infos = list(evaluation.get("items", []))
                 # 旧active问题不因为duplicate去重就永久失去修复机会；每轮最多重试一次。
                 infos.extend({"status": "accepted", "item": clean_question(q)} for q in qbook
@@ -304,6 +316,10 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
     pool = make_pool(full, env)
     for pi, pack in enumerate(pool):
         state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
+        if state is None:
+            logs.append({"pack": pi, "status": "type_infeasible"})
+            continue
+        pack = env.pack_module.Pack(**state["pack"])
         raw = propose(state, env, role, "bank:" + digest([state["prompt"], env.policy(role).tag]))
         try:
             data = parse(raw)

@@ -143,8 +143,11 @@ def hint(context, cfg):
     return context["question_type"] if cfg.hint_mode == "target_type" else None
 
 
-def policy_type(context, cfg, identity):
+def policy_type(context, cfg, identity, allowed=None):
+    """target_type固定为case题型；不在allowed内时返回None（该pack跳过，不强迫编题）。"""
     from .audit_prompts import TYPES
     if cfg.hint_mode == "target_type":
-        return context["question_type"]
-    return TYPES[int(digest([cfg.seed, identity]), 16) % len(TYPES)]
+        qtype = context["question_type"]
+        return qtype if allowed is None or qtype in allowed else None
+    choices = [t for t in TYPES if allowed is None or t in allowed]
+    return choices[int(digest([cfg.seed, identity]), 16) % len(choices)] if choices else None

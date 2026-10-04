@@ -307,7 +307,14 @@ python run.py attack \
 
 `--n` 是pack数，`--questions-per-pack`是**每pack最多题数**；不是4次采样每次再输出4题。给定空列表是合法行为，不用问题填满预算。
 
-attacker 输入只有：原文pack、M provenance标记、题型、case允许使用的 `question_date`。不传目标问题/答案/当前case的目标题型/证据标签。`question_date`逐字复制；题型使用官方名称，并接受设计中的 `preference` / `temporal` 别名。
+attacker 输入只有：原文pack、M provenance标记、题型、case允许使用的 `question_date`。不传目标问题/答案/证据标签。`question_date`逐字复制；题型使用官方名称，并接受设计中的 `preference` / `temporal` 别名。
+
+题型来源由 `hint_mode` 决定。`configs/type_aware.json`（`target_type`）把**当前case的官方题型**交给 attacker/builder，属于有意的类型已知诊断基线，不是无标签设定；`configs/type_hidden.json`（`hidden`）按pack确定性随机抽题型，才是主结果设定。admem 中可用以下配置给 4B attacker 减负、抑制刷分：
+
+- `attacker_view: "compact"`：单session题型只给种子session；跨session题型给种子全文+邻居的user消息（`assistant_elided`），被隐去的round不允许作为E。
+- `attacker_type_filter: true`：按种子文本预筛可出题型（SSA要求种子有assistant回复；其余题型要求一人称个人陈述≥`seed_min_personal`；multi-session另需一个有个人陈述的邻居session）。不可出时该pack记为 `type_infeasible`，不调用attacker、不产生奖励。
+- `evidence_novelty`：同一round被反复出题时奖励按 `1/(1+已用次数均值)` 递减；`impersonal_weight`：非SSA题的E里没有一人称个人陈述时乘该权重。
+- `attacker_memory_entries` / `attacker_context_items`：控制附带的M条目和已接受题提示数量，设为0即不附带。
 
 ```json
 {"items":[{"q":"...","question_date":"...","a":"...",
