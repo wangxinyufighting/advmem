@@ -133,9 +133,29 @@ def test_builder_prompt_separates_new_entities_and_source_provenance(setup_case,
                         [{'rid':'s1:r1','date':'2023','text':'I adopted a dog.'}],
                         'patch',[],env,old_ids=['m1'])
     system=state['prompt'][0]['content']
-    assert 'different entity or an independent new event is a new fact: use ADD' in system
+    assert 'ADD when x introduces an independent topic, entity, or event' in system
+    assert 'one card can retain the old and new details without conflating them' in system
+    assert 'adopted Buddy' in system and 'adopted Scout' in system
     assert 'prov MUST include the corresponding rid(s) from allowed_source_rids' in system
     assert 'Use [] only when the replacement text relies entirely on the edited parents' in system
+
+
+def test_assistant_task_prompt_preserves_assistant_attribution(setup_case,env):
+    full,path,ctx=setup_case
+    ctx['question_type']='single-session-assistant'
+    state=builder_state(
+        full,path,ctx,[],
+        [{'rid':'s1:r1','date':'2023',
+          'text':'Assistant: Consider better lighting, the Rise_0 monitor stand, and a footrest.'}],
+        'stream',[],env,
+    )
+    system=state['prompt'][0]['content']
+    assert 'TASK-TYPE SPEAKER OVERRIDE' in system
+    assert 'Assistant turns are the target memory content' in system
+    assert 'never "The user wants/chose/bought/uses ..."' in system
+    assert 'user messages are locator context' in system
+    assert 'The assistant said to consider better lighting' in system
+    assert 'split it into contiguous ranges across ADD cards' in system
 
 
 def test_hidden_baseline_same_card_budget(setup_case,env):
@@ -150,6 +170,7 @@ def test_hidden_baseline_same_card_budget(setup_case,env):
 
 @pytest.mark.parametrize('qtype,forbidden', [
     ('single-session-preference', 'Store only constraints explicitly stated'),
+    ('single-session-assistant', 'TASK-TYPE SPEAKER OVERRIDE'),
     ('temporal-reasoning', 'TEMPORAL MEMORY CHECK'),
 ])
 def test_hidden_builder_does_not_leak_type_rules(setup_case,env,qtype,forbidden):
