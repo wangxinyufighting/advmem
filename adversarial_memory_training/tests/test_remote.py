@@ -52,6 +52,22 @@ def test_json_retry_expands_truncated_judge_budget(tmp_path, monkeypatch):
     assert client.requests[1][1]["max_tokens"] == 8192
 
 
+def test_json_retry_when_reasoning_returns_null_content(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    client = _FakeClient([
+        {"choices": [{"finish_reason": "length", "message": {"content": None}}]},
+        {"choices": [{"finish_reason": "stop", "message": {"content": '{"correct": true}'}}]},
+    ])
+    _FakeCore.client = client
+
+    result = Remote("JUDGE", _FakeCore, tmp_path / "api").json(
+        [{"role": "user", "content": "judge"}], "case")
+
+    assert result == {"correct": True}
+    assert client.requests[0][1]["max_tokens"] == 4096
+    assert client.requests[1][1]["max_tokens"] == 8192
+
+
 def test_json_retry_expands_max_completion_tokens_without_adding_max_tokens(
     tmp_path, monkeypatch
 ):

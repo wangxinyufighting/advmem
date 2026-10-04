@@ -26,6 +26,7 @@ def summarize(root: Path, prepared: Path) -> dict:
     stats = Counter()
     by_type = defaultdict(Counter)
     tokens, gini_like = [], []
+    failed = sum(1 for p in root.iterdir() if (p / "failed.json").exists())
     for case in sorted(p for p in root.iterdir() if (p / "bank_log.json").exists()):
         logs = json.loads((case / "bank_log.json").read_text(encoding="utf-8"))
         bank = json.loads((case / "bank.json").read_text(encoding="utf-8"))
@@ -62,7 +63,8 @@ def summarize(root: Path, prepared: Path) -> dict:
     invalid = sum(c["invalid"] for c in by_type.values())
     bank = stats["bank"] or 1
     return {
-        "cases": stats["cases"], "packs": stats["packs"], "type_infeasible_packs": infeasible,
+        "cases": stats["cases"], "failed_cases": failed,
+        "packs": stats["packs"], "type_infeasible_packs": infeasible,
         "invalid_output_rate": round(invalid / max(1, stats["packs"] - infeasible), 3),
         "bank_per_feasible_pack": round(stats["bank"] / max(1, stats["packs"] - infeasible), 3),
         "prompt_tokens_p50/p90/max": [pct(tokens, .5), pct(tokens, .9), max(tokens, default=None)],
@@ -86,7 +88,7 @@ def main():
     results = {run: summarize(Path(run), Path(a.prepared)) for run in a.runs}
     if a.json:
         Path(a.json).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    cols = ["cases", "packs", "type_infeasible_packs", "prompt_tokens_p50/p90/max", "invalid_output_rate",
+    cols = ["cases", "failed_cases", "packs", "type_infeasible_packs", "prompt_tokens_p50/p90/max", "invalid_output_rate",
             "gate_accept_rate", "bank_per_feasible_pack", "distinct_rounds_per_question",
             "same_E_repeat_rate", "top_session_share_mean", "impersonal_rate"]
     print("| metric | " + " | ".join(Path(r).name for r in a.runs) + " |")

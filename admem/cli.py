@@ -5,7 +5,7 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 
-from .common import Config, TokenBudget, Unknown, connect, digest, read, rows, write, write_rows
+from .common import Config, Progress, TokenBudget, Unknown, connect, digest, read, rows, write, write_rows
 from .data import contexts, history_for_builder, prepare
 from .environment import Environment
 from .pipeline import Collector, generate_bank, run_case
@@ -63,6 +63,28 @@ def relocate_states(input_path, prepared, output, core_memory):
         raise ValueError("No states to relocate")
     write_rows(output, migrated)
     return len(migrated)
+
+
+def _mark_failed(out, key, command, exc):
+    """Record a case-level API/service failure without deleting partial output.
+
+    The case is dropped from the run (not scored as wrong).  For ``bank`` the
+    half-written ``bank.json``/``bank_log.json`` are renamed to ``*.partial.*``
+    so downstream reports skip the incomplete case while the raw evidence
+    stays on disk for debugging.
+    """
+    folder = Path(out) / key
+    folder.mkdir(parents=True, exist_ok=True)
+    write(folder / "failed.json", {"key": key, "command": command,
+                                   "status": "unknown", "error": str(exc)})
+    if command == "bank":
+        for name in ("bank.json", "bank_log.json"):
+            src = folder / name
+            if src.exists():
+                dst = folder / (src.stem + ".partial" + src.suffix)
+                if dst.exists():
+                    dst.unlink()
+                src.replace(dst)
 
 
 def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memory=False,
@@ -347,10 +369,10 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
             raise ValueError(f"No label for case {record['question_id']}")
         _external_question(record, label)
     reports, builder_cases = [], []
+    bar = Progress(len(selected), label="longmemeval-eval")
     for record in selected:
         key, full, context = record["key"], record["full"], record["context"]
-        print(f"longmemeval-eval {key} split={split} type_hint="
-              f"{context['question_type'] if env.cfg.hint_mode == 'target_type' else 'hidden'}", flush=True)
+        state = context["question_type"] if env.cfg.hint_mode == "target_type" else "hidden"
         try:
             result = run_case(full, record["full_path"], context, env, run_dir / key,
                               mode="build", bank=[], builder_role=builder_role)
@@ -358,15 +380,20 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
             builder_cases.append({"key": key, "question_id": record["question_id"],
                                   "question_type": context["question_type"], **_builder_case_metrics(run_dir / key)})
         except Unknown as exc:
+            # 单个case的API/服务失败：丢弃该样本，继续后面的case。
             report = {"key": key, "question_id": record["question_id"],
                       "status": "unknown", "error": str(exc)}
             reports.append(report)
             builder_cases.append({"key": key, "question_id": record["question_id"],
                                   "question_type": context["question_type"], "status": "unknown",
                                   "error": str(exc)})
+            _mark_failed(run_dir, key, "longmemeval-eval", exc)
             write(run_dir / "summary.json", reports)
-            raise
+            bar.update(suffix=f"{key} split={split} type_hint={state} FAILED")
+            continue
         write(run_dir / "summary.json", reports)
+        bar.update(suffix=f"{key} split={split} type_hint={state}")
+    bar.close()
     total_windows = sum(row.get("windows", 0) for row in builder_cases)
     total_legal = sum(row.get("json_valid", 0) for row in builder_cases)
     total_faithful = sum(row.get("faithful", 0) for row in builder_cases)
@@ -415,27 +442,32 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
 
     reports = []
     builder_cases = []
-    for context, full_path in contexts(prepared, split, limit, keys, question_types):
+    entries = list(contexts(prepared, split, limit, keys, question_types))
+    bar = Progress(len(entries), label="longmemeval-eval")
+    for context, full_path in entries:
         key = context["key"]
-        print(f"longmemeval-eval {key} split={split} "
-              f"type_hint={context['question_type'] if env.cfg.hint_mode == 'target_type' else 'hidden'}",
-              flush=True)
-        full = env.memory_module.FullMemory.load(full_path)
+        state = context["question_type"] if env.cfg.hint_mode == "target_type" else "hidden"
         case_out = run_dir / key
         try:
+            full = env.memory_module.FullMemory.load(full_path)
             result = run_case(full, full_path, context, env, case_out,
                               mode="build", bank=[], builder_role=builder_role)
             metrics = _builder_case_metrics(case_out)
             reports.append({"key": key, **result})
             builder_cases.append({"key": key, "question_type": context["question_type"], **metrics})
         except Unknown as exc:
+            # 单个case的API/服务失败：丢弃该样本，继续后面的case。
             report = {"key": key, "status": "unknown", "error": str(exc)}
             reports.append(report)
             builder_cases.append({"key": key, "question_type": context["question_type"],
                                   "status": "unknown", "error": str(exc)})
+            _mark_failed(run_dir, key, "longmemeval-eval", exc)
             write(run_dir / "summary.json", reports)
-            raise
+            bar.update(suffix=f"{key} split={split} type_hint={state} FAILED")
+            continue
         write(run_dir / "summary.json", reports)
+        bar.update(suffix=f"{key} split={split} type_hint={state}")
+    bar.close()
 
     total_windows = sum(row.get("windows", 0) for row in builder_cases)
     total_legal = sum(row.get("json_valid", 0) for row in builder_cases)
@@ -573,11 +605,13 @@ def main(argv=None):
                                question_types=a.question_types))
         return
     reports = []
-    for context, full_path in contexts(a.prepared, a.split, a.limit, a.keys, a.question_types):
+    entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types))
+    bar = Progress(len(entries), label=a.command)
+    for context, full_path in entries:
         key = context["key"]
-        print(f"{a.command} {key} split={context['split']} type_hint={context['question_type'] if cfg.hint_mode == 'target_type' else 'hidden'}", flush=True)
-        full = legacy[0].FullMemory.load(full_path)
+        state = context["question_type"] if cfg.hint_mode == "target_type" else "hidden"
         try:
+            full = legacy[0].FullMemory.load(full_path)
             if a.command == "bootstrap":
                 if not a.bank or not a.collect or not a.run_dir:
                     p.error("bootstrap requires --bank, --collect and --run-dir")
@@ -595,10 +629,15 @@ def main(argv=None):
                     collect=Collector(a.collect) if a.collect else None)
             reports.append({"key": key, **result})
             write(Path(a.out) / "summary.json", reports)
+            bar.update(suffix=f"{key} split={context['split']} type_hint={state}")
         except Unknown as exc:
+            # 单个case的API/服务失败：记为unknown、丢弃该样本，继续后面的case。
             reports.append({"key": key, "status": "unknown", "error": str(exc)})
+            _mark_failed(Path(a.out), key, a.command, exc)
             write(Path(a.out) / "summary.json", reports)
-            raise  # API/TLS错误不继续烧后面案例预算。
+            bar.update(suffix=f"{key} split={context['split']} type_hint={state} FAILED")
+            continue
+    bar.close()
 
 
 if __name__ == "__main__":

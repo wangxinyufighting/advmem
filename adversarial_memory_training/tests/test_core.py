@@ -5,13 +5,13 @@ from types import SimpleNamespace as NS
 
 import pytest
 
-from admem.common import InvalidAction, Unknown, Config, digest, parse, read, rows
+from admem.common import InvalidAction, Progress, Unknown, Config, digest, parse, read, rows
 from admem.store import apply, augment, raw_chunks, question_key, text_size
 from admem.pipeline import builder_state, attacker_state, Collector, run_case, windows, generate_bank
 from admem.environment import boolean
 from admem.data import prepare, contexts, history_for_builder, policy_type, hint
 from admem.probes import make_suite
-from admem.cli import export_states
+from admem.cli import _mark_failed, export_states
 from admem.bootstrap import bootstrap
 from conftest import Full, Pack, CharBudget
 
@@ -361,6 +361,31 @@ def test_prepare_split_isolates_identical_histories(case,env,tmp_path):
         assert set(ctx)=={'key','question_type','question_date','full_hash','split'}
     assert all(len(s)==1 for s in by.values())
     assert len(list(rows(out/'private_eval.jsonl')))==12
+
+
+def test_progress_bar_non_tty_emits_one_line_per_update():
+    import io
+    stream=io.StringIO()
+    bar=Progress(2,label='bank',stream=stream)
+    bar.update(suffix='p0')
+    bar.update(suffix='p1')
+    bar.close()
+    lines=[line for line in stream.getvalue().splitlines() if line]
+    assert len(lines)==2
+    assert lines[0].startswith('bank [') and '1/2' in lines[0] and lines[0].endswith('p0')
+    assert '2/2' in lines[1] and lines[1].endswith('p1')
+
+
+def test_mark_failed_records_unknown_and_keeps_partial_bank(tmp_path):
+    folder=tmp_path/'c0000';folder.mkdir()
+    (folder/'bank.json').write_text('[]')
+    (folder/'bank_log.json').write_text('[]')
+    _mark_failed(tmp_path,'c0000','bank',Unknown('API down'))
+    marker=read(folder/'failed.json')
+    assert marker=={'key':'c0000','command':'bank','status':'unknown','error':'API down'}
+    # 半成品不再冒充完整case，但原文仍保留为*.partial.json。
+    assert not (folder/'bank.json').exists() and not (folder/'bank_log.json').exists()
+    assert (folder/'bank.partial.json').exists() and (folder/'bank_log.partial.json').exists()
 
 
 def test_history_for_builder_disambiguates_duplicate_session_ids(case):

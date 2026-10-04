@@ -71,7 +71,9 @@ run_bank() {  # $1=变体名 $2=代码目录
               --prepared "$(cd "$PREPARED" && pwd)" --split "$SPLIT" --limit "$LIMIT" --out "$dest")
   [[ -n "$TYPES" ]] && args+=(--question-types $TYPES)
   echo "== $name ($code) -> $dest"
-  (cd "$code" && "$PY" "${args[@]}") > "$OUT/$name.log" 2>&1 || { echo "!! $name 失败，见 $OUT/$name.log" >&2; return 1; }
+  # tee保留完整日志，同时把进度条实时显示在终端（进度条写stderr，非TTY时逐行输出）。
+  (cd "$code" && "$PY" "${args[@]}") 2>&1 | tee "$OUT/$name.log" \
+    || { echo "!! $name 失败，见 $OUT/$name.log" >&2; return 1; }
 }
 
 runs=()

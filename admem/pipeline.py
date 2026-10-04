@@ -5,7 +5,7 @@ from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
-from .common import InvalidAction, Unknown, digest, parse, read, write, write_rows
+from .common import InvalidAction, Progress, Unknown, digest, parse, read, write, write_rows
 from .data import hint, policy_type
 from .audit_prompts import feasible_types
 from .prompts import attacker_messages, builder_prompt, evidence_usage, source_view
@@ -314,12 +314,14 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
     out = Path(out)
     accepted, logs = [], []
     pool = make_pool(full, env)
+    bar = Progress(len(pool), label=f"{context['key']} bank")
     for pi, pack in enumerate(pool):
         # 日志只记中性sN，不记原始seed_id（可能是answer_*标签）。
         info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None}
         state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
         if state is None:
             logs.append({**info, "status": "type_infeasible"})
+            bar.update(suffix=f"p{pi} type_infeasible")
             continue
         pack = env.pack_module.Pack(**state["pack"])
         info.update(qtype=state["qtype"], prompt_tokens=env.counter.prompt_count(state["prompt"]),
@@ -331,6 +333,7 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
                 raise InvalidAction("Invalid items")
         except InvalidAction as exc:
             logs.append({**info, "status": "invalid", "reason": str(exc)})
+            bar.update(suffix=f"p{pi} invalid")
             continue
         if not data["items"]:
             logs.append({**info, "status": "empty"})
@@ -341,6 +344,8 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
                 accepted.append(q)
         write(out / "bank.json", accepted)
         write(out / "bank_log.json", logs)
+        bar.update(suffix=f"p{pi} qtype={info.get('qtype')} bank={len(accepted)}")
+    bar.close()
     write(out / "bank.json", accepted)
     write(out / "bank_log.json", logs)
     return len(accepted)

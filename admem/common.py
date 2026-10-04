@@ -45,6 +45,53 @@ def write_rows(path, values):
     tmp.replace(path)
 
 
+class Progress:
+    """Minimal dependency-free progress bar.
+
+    On a TTY the bar redraws in place; when output is redirected it emits one
+    line per update so that ``tail -f`` shows real-time progress without
+    carriage-return noise.  It never raises and never reads stdin.
+    """
+
+    def __init__(self, total, label="", stream=None, width=28):
+        self.total = max(0, int(total))
+        self.label = label
+        self.stream = stream if stream is not None else sys.stderr
+        self.width = width
+        self.done = 0
+        self._closed = False
+
+    def update(self, suffix="", step=1):
+        self.done = min(self.total, self.done + step)
+        self._render(suffix)
+
+    def _render(self, suffix):
+        total = self.total
+        frac = (self.done / total) if total else 1.0
+        filled = int(round(self.width * frac))
+        bar = "#" * filled + "-" * (self.width - filled)
+        line = f"{self.label} [{bar}] {self.done}/{total} {frac * 100:5.1f}%"
+        if suffix:
+            line += f" {suffix}"
+        try:
+            tty = self.stream.isatty()
+        except (AttributeError, ValueError):
+            tty = False
+        self.stream.write(("\r" + line + "\x1b[K") if tty else (line + "\n"))
+        self.stream.flush()
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self.stream.isatty():
+                self.stream.write("\n")
+                self.stream.flush()
+        except (AttributeError, ValueError):
+            pass
+
+
 class InvalidAction(ValueError):
     """模型输出无效：有明确负奖励。网络异常绝不能转换为此类型。"""
 
@@ -319,6 +366,12 @@ class Remote:
             response = self.client.post("/chat/completions", body, nonce=nonce)
             choice = response["choices"][0]
             value = choice["message"]["content"]
+            if value is None and choice.get("finish_reason") == "length":
+                # A reasoning model can spend the whole output budget before
+                # emitting any content. Treat that as (retryable) truncation
+                # instead of a fatal transport failure; json() then retries
+                # with a doubled budget.
+                value = ""
             if not isinstance(value, str):
                 raise ValueError("No text content")
             # 截断视作模型格式失败；不在奖励路径重试生成并偷选成功者。
