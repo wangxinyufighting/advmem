@@ -152,7 +152,7 @@ def prepare(data, out, core_memory, sizes=(300, 50, 150), seed=0):
     return split_report
 
 
-def contexts(prepared, split, limit=None, keys=None, question_types=None):
+def contexts(prepared, split, limit=None, keys=None, question_types=None, per_type=None):
     p = Path(prepared)
     manifest = read(p / "manifest.json")
     wanted_types = set(question_types or [])
@@ -160,6 +160,19 @@ def contexts(prepared, split, limit=None, keys=None, question_types=None):
                if r["split"] == split
                and (keys is None or r["key"] in keys)
                and (not wanted_types or r.get("question_type") in wanted_types)]
+    if per_type is not None:
+        if type(per_type) is not int or per_type < 1:
+            raise ValueError("--per-type 必须是正整数")
+        # 按 prepare 的 stratum 分组（7类：6个question_type + abstention），
+        # 每组取 manifest 顺序前 N 个；--question-types 先过滤再分组。
+        counts = defaultdict(int)
+        kept = []
+        for row in entries:
+            group = row.get("stratum") or row.get("question_type")
+            if counts[group] < per_type:
+                kept.append(row)
+                counts[group] += 1
+        entries = kept
     if limit:
         entries = entries[:limit]
     for row in entries:

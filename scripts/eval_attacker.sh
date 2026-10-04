@@ -10,6 +10,8 @@
 # 可选环境变量：
 #   PREPARED=data/prepared_longmemeval  不存在时用DATA自动prepare
 #   SPLIT=val LIMIT=10 TYPES="multi-session temporal-reasoning"   case选择（TYPES为空=全部题型）
+#   PER_TYPE=3                           每个stratum（6个question_type + abstention）各取3个case；
+#                                        设了PER_TYPE且未显式设LIMIT时不再套用LIMIT默认值10
 #   BASE_CONFIG=configs/type_aware.json  消融的基准配置（type_hidden.json 则测hidden设定）
 #   TOKENIZER=...                        覆盖配置里的tokenizer路径（本地/服务器路径不同时）
 #   VARIANTS="baseline compact filter neighbors4 all4b"   要跑的变体
@@ -22,8 +24,10 @@ cd "$(dirname "$0")/.."
 PY=${PY:-python}
 PREPARED=${PREPARED:-data/prepared_longmemeval}
 SPLIT=${SPLIT:-val}
-LIMIT=${LIMIT:-10}
 TYPES=${TYPES:-}
+PER_TYPE=${PER_TYPE:-}
+# 设了 PER_TYPE 时，LIMIT 默认为空（否则默认10会把均衡抽样又截断）。
+if [[ -n "$PER_TYPE" ]]; then LIMIT=${LIMIT:-}; else LIMIT=${LIMIT:-10}; fi
 BASE_CONFIG=${BASE_CONFIG:-configs/type_aware.json}
 VARIANTS=${VARIANTS:-baseline compact filter neighbors4 all4b}
 OUT=${OUT:-runs/attacker_eval_$(date +%Y%m%d_%H%M%S)}
@@ -68,7 +72,9 @@ run_bank() {  # $1=变体名 $2=代码目录
   local name=$1 code=${2:-.} dest
   dest=$(cd "$OUT" && pwd)/bank_$name
   local args=(-m admem.cli bank --config "$(cd "$OUT/configs" && pwd)/$name.json"
-              --prepared "$(cd "$PREPARED" && pwd)" --split "$SPLIT" --limit "$LIMIT" --out "$dest")
+              --prepared "$(cd "$PREPARED" && pwd)" --split "$SPLIT" --out "$dest")
+  [[ -n "$LIMIT" ]] && args+=(--limit "$LIMIT")
+  [[ -n "$PER_TYPE" ]] && args+=(--per-type "$PER_TYPE")
   [[ -n "$TYPES" ]] && args+=(--question-types $TYPES)
   echo "== $name ($code) -> $dest"
   # tee保留完整日志，同时把进度条实时显示在终端（进度条写stderr，非TTY时逐行输出）。

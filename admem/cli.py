@@ -88,11 +88,11 @@ def _mark_failed(out, key, command, exc):
 
 
 def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memory=False,
-             question_types=None):
+             question_types=None, per_type=None):
     # 只有此独立命令读取官方q/a；结果不能反馈给同一test case的memory编辑。
     golds = {q["key"]: q for q in rows(Path(prepared) / "private_eval.jsonl")}
     details = []
-    for context, full_path in contexts(prepared, split, limit, keys, question_types):
+    for context, full_path in contexts(prepared, split, limit, keys, question_types, per_type):
         key = context["key"]
         q = golds[key]
         try:
@@ -415,7 +415,7 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
 
 
 def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
-                     builder_role="BUILDER", all_memory=False, question_types=None):
+                     builder_role="BUILDER", all_memory=False, question_types=None, per_type=None):
     """Run the existing Builder over a prepared LongMemEval split, then score QA.
 
     The Builder phase only receives the prepared context/full history. Official
@@ -442,7 +442,7 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
 
     reports = []
     builder_cases = []
-    entries = list(contexts(prepared, split, limit, keys, question_types))
+    entries = list(contexts(prepared, split, limit, keys, question_types, per_type))
     bar = Progress(len(entries), label="longmemeval-eval")
     for context, full_path in entries:
         key = context["key"]
@@ -487,7 +487,7 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
     write(out / "builder_summary.json", builder_summary)
 
     qa_summary = evaluate(prepared, run_dir, split, snapshot, env, eval_dir, limit, keys,
-                          all_memory, question_types)
+                          all_memory, question_types, per_type)
     summary = {"split": split, "builder": builder_summary, "qa": qa_summary,
                "run_dir": str(run_dir), "eval_dir": str(eval_dir), "snapshot": snapshot,
                "all_memory": all_memory}
@@ -507,6 +507,8 @@ def main(argv=None):
     p.add_argument("--split", choices=["train", "val", "valid", "test"], default="train")
     p.add_argument("--sizes", nargs=3, type=int, default=[300, 50, 150])
     p.add_argument("--limit", type=int)
+    p.add_argument("--per-type", type=int,
+                   help="每个stratum（6个question_type + abstention）最多取N个case，做分类型均衡抽样")
     p.add_argument("--keys", nargs="+")
     p.add_argument("--question-types", nargs="+",
                    help="只评测指定 LongMemEval question_type，可与 --keys/--limit 组合")
@@ -597,15 +599,15 @@ def main(argv=None):
         p.error("This command requires --prepared")
     if a.command == "evaluate":
         print(evaluate(a.prepared, a.run_dir, a.split, a.snapshot, env, a.out, a.limit, a.keys,
-                       a.all_memory, a.question_types))
+                       a.all_memory, a.question_types, a.per_type))
         return
     if a.command == "longmemeval-eval":
         print(longmemeval_eval(a.prepared, a.split, a.snapshot, env, a.out, a.limit, a.keys,
                                builder_role=a.builder_role, all_memory=a.all_memory,
-                               question_types=a.question_types))
+                               question_types=a.question_types, per_type=a.per_type))
         return
     reports = []
-    entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types))
+    entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
     bar = Progress(len(entries), label=a.command)
     for context, full_path in entries:
         key = context["key"]

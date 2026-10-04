@@ -376,6 +376,20 @@ def test_progress_bar_non_tty_emits_one_line_per_update():
     assert '2/2' in lines[1] and lines[1].endswith('p1')
 
 
+def test_contexts_per_type_balances_strata(tmp_path):
+    rows=[("a","c1"),("b","c2"),("a","c3"),("b","c4"),("a","c5"),
+          ("abstention","c6"),("abstention","c7")]
+    cases=[]
+    for stype,key in rows:
+        cases.append({"key":key,"split":"val","question_type":stype,"stratum":stype})
+        folder=tmp_path/"cases"/key;folder.mkdir(parents=True)
+        (folder/"context.json").write_text(json.dumps({"key":key,"split":"val","question_type":stype}))
+    (tmp_path/"manifest.json").write_text(json.dumps({"cases":cases}))
+    got=[c["key"] for c,_ in contexts(tmp_path,"val",per_type=2)]
+    assert got==["c1","c2","c3","c4","c6","c7"]
+    assert [c["key"] for c,_ in contexts(tmp_path,"val",per_type=1)]==["c1","c2","c6"]
+
+
 def test_mark_failed_records_unknown_and_keeps_partial_bank(tmp_path):
     folder=tmp_path/'c0000';folder.mkdir()
     (folder/'bank.json').write_text('[]')
