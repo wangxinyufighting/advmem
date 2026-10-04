@@ -522,6 +522,8 @@ def main(argv=None):
     p.add_argument("--max-packs", type=int, help="attacker-probe：每个case取前N个pack")
     p.add_argument("--pack-sample", type=int, help="attacker-probe：每个case随机抽N个pack（比--max-packs更适合抽样测试）")
     p.add_argument("--pack-seed", type=int, default=0, help="attacker-probe随机抽pack的种子")
+    p.add_argument("--questions-per-pack", type=int,
+                   help="覆盖config里的questions_per_pack（每个pack让attacker出几道题）")
     p.add_argument("--variants", type=int, default=5)
     p.add_argument("--states", help="probe的状态JSONL或export的collector根目录")
     p.add_argument("--parquet", action="store_true")
@@ -536,6 +538,10 @@ def main(argv=None):
     if a.limit is not None and a.limit < 1 or a.variants < 1:
         p.error("limit/variants must be positive")
     cfg = Config.load(a.config)
+    if a.questions_per_pack is not None:
+        if a.questions_per_pack < 1:
+            p.error("--questions-per-pack must be positive")
+        cfg.questions_per_pack = a.questions_per_pack
     if a.command == "merge":
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
