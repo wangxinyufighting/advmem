@@ -85,7 +85,10 @@ class Client:
                 "User-Agent": "Mozilla/5.0"}) 
         
         last = None
-        for attempt in range(3):
+        # 服务端瞬时过载/断连时多给几次机会，退避可配：API_RETRIES / API_BACKOFF。
+        retries = max(1, int(os.getenv("API_RETRIES", "3")))
+        backoff = float(os.getenv("API_BACKOFF", "1.0"))
+        for attempt in range(retries):
             if self.calls >= self.max_calls:
                 raise ModelError(f"{self.model} 达到 API 调用预算 {self.max_calls}")
             self.calls += 1
@@ -95,8 +98,8 @@ class Client:
                 response_error = self._response_error(endpoint, result)
                 if response_error is not None:
                     last = response_error
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
+                    if attempt < retries - 1:
+                        time.sleep(backoff * 2 ** attempt)
                     continue
                 # 缓存含实验原文及响应，但绝不含 API key。
                 write_json(path, {"model": self.model, "base_url": self.base_url,
@@ -110,8 +113,8 @@ class Client:
             except (http.client.IncompleteRead, http.client.RemoteDisconnected,
                     urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
                 last = str(exc)
-            if attempt < 2:
-                time.sleep(2 ** attempt)
+            if attempt < retries - 1:
+                time.sleep(backoff * 2 ** attempt)
         raise ModelError(f"模型请求失败：{last}")
 
     def json(self, system: str, data: Any, *, temperature: float = 0, nonce: str = "") -> dict:

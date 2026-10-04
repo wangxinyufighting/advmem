@@ -36,7 +36,7 @@ def summarize(root: Path, prepared: Path) -> dict:
             packs.setdefault(row["pack"], row)
             t = row.get("qtype", "?")
             status = row["status"]
-            if status in {"type_infeasible", "invalid", "empty"}:
+            if status in {"type_infeasible", "invalid", "empty", "transport_error"}:
                 by_type[t][status] += 1
             else:
                 by_type[t]["accepted" if status == "accepted" else "rejected"] += 1
@@ -61,10 +61,12 @@ def summarize(root: Path, prepared: Path) -> dict:
     asked = accepted + sum(c["rejected"] for c in by_type.values())
     infeasible = sum(c["type_infeasible"] for c in by_type.values())
     invalid = sum(c["invalid"] for c in by_type.values())
+    transport_errors = sum(c["transport_error"] for c in by_type.values())
     bank = stats["bank"] or 1
     return {
         "cases": stats["cases"], "failed_cases": failed,
         "packs": stats["packs"], "type_infeasible_packs": infeasible,
+        "transport_error_packs": transport_errors,
         "invalid_output_rate": round(invalid / max(1, stats["packs"] - infeasible), 3),
         "bank_per_feasible_pack": round(stats["bank"] / max(1, stats["packs"] - infeasible), 3),
         "prompt_tokens_p50/p90/max": [pct(tokens, .5), pct(tokens, .9), max(tokens, default=None)],
@@ -88,7 +90,7 @@ def main():
     results = {run: summarize(Path(run), Path(a.prepared)) for run in a.runs}
     if a.json:
         Path(a.json).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    cols = ["cases", "failed_cases", "packs", "type_infeasible_packs", "prompt_tokens_p50/p90/max", "invalid_output_rate",
+    cols = ["cases", "failed_cases", "packs", "type_infeasible_packs", "transport_error_packs", "prompt_tokens_p50/p90/max", "invalid_output_rate",
             "gate_accept_rate", "bank_per_feasible_pack", "distinct_rounds_per_question",
             "same_E_repeat_rate", "top_session_share_mean", "impersonal_rate"]
     print("| metric | " + " | ".join(Path(r).name for r in a.runs) + " |")

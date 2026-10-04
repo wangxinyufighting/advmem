@@ -1,6 +1,8 @@
 """Build → Audit/Patch → Refine。纯模型提议与外部回退分开记录。"""
 from __future__ import annotations
 
+import os
+import time
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
@@ -310,6 +312,40 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
         raise
 
 
+def _bank_pack(full, full_path, context, pack, pi, accepted, env, role):
+    """Run one pack (attacker propose + gate). Raises Unknown on API/service failure.
+
+    Pure with respect to the caller's ``accepted``/``logs`` so a failed pack can
+    be retried without duplicating rows.  Returns ``(info, logs, new_items)``.
+    """
+    # 日志只记中性sN，不记原始seed_id（可能是answer_*标签）。
+    info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None}
+    state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
+    if state is None:
+        return info, [{**info, "status": "type_infeasible"}], []
+    pack = env.pack_module.Pack(**state["pack"])
+    info.update(qtype=state["qtype"], prompt_tokens=env.counter.prompt_count(state["prompt"]),
+                visible_rounds=len(pack.rids))
+    raw = propose(state, env, role, "bank:" + digest([state["prompt"], env.policy(role).tag]))
+    try:
+        data = parse(raw)
+        if set(data) != {"items"} or not isinstance(data["items"], list) or len(data["items"]) > env.cfg.questions_per_pack:
+            raise InvalidAction("Invalid items")
+    except InvalidAction as exc:
+        return info, [{**info, "status": "invalid", "reason": str(exc)}], []
+    logs = []
+    if not data["items"]:
+        logs.append({**info, "status": "empty"})
+    new_items, seen = [], {question_key(x) for x in accepted}
+    for q in data["items"]:
+        result = env.gate(full, pack, q, state["date"], state["qtype"])
+        logs.append({**info, **result})
+        if result["status"] == "accepted" and question_key(q) not in seen:
+            seen.add(question_key(q))
+            new_items.append(q)
+    return info, logs, new_items
+
+
 def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
     out = Path(out)
     accepted, logs = [], []
@@ -317,33 +353,35 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
     # <variant>/<case>：PARALLEL=1 多进程混排时能区分是哪条流水线。
     parent = Path(out).parent.name
     bar = Progress(len(pool), label=f"{parent}/{context['key']}")
+    # 瞬时API失败只重试这条pack（attacker响应走缓存，重试便宜）；连续失败到上限才中止整个case。
+    retries = max(1, int(os.getenv("PACK_RETRIES", "2")))
+    backoff = float(os.getenv("PACK_BACKOFF", "1.0"))
+    fail_limit = max(1, int(os.getenv("PACK_FAIL_LIMIT", "5")))
+    consecutive_errors = 0
     for pi, pack in enumerate(pool):
-        # 日志只记中性sN，不记原始seed_id（可能是answer_*标签）。
-        info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None}
-        state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
-        if state is None:
-            logs.append({**info, "status": "type_infeasible"})
-            bar.update(suffix=f"p{pi} type_infeasible")
+        info, pack_logs, new_items = {"pack": pi}, None, None
+        for attempt in range(retries):
+            try:
+                info, pack_logs, new_items = _bank_pack(
+                    full, full_path, context, pack, pi, accepted, env, role)
+                break
+            except Unknown as exc:
+                if attempt + 1 >= retries:
+                    logs.append({"pack": pi, "status": "transport_error", "reason": str(exc)})
+                    bar.update(suffix=f"p{pi} transport_error")
+                    pack_logs = None
+                    break
+                time.sleep(backoff * 2 ** attempt)
+        if pack_logs is None:
+            consecutive_errors += 1
+            write(out / "bank.json", accepted)
+            write(out / "bank_log.json", logs)
+            if consecutive_errors >= fail_limit:
+                raise Unknown(f"连续 {consecutive_errors} 个 pack API失败，放弃case {context['key']}")
             continue
-        pack = env.pack_module.Pack(**state["pack"])
-        info.update(qtype=state["qtype"], prompt_tokens=env.counter.prompt_count(state["prompt"]),
-                    visible_rounds=len(pack.rids))
-        raw = propose(state, env, role, "bank:" + digest([state["prompt"], env.policy(role).tag]))
-        try:
-            data = parse(raw)
-            if set(data) != {"items"} or not isinstance(data["items"], list) or len(data["items"]) > env.cfg.questions_per_pack:
-                raise InvalidAction("Invalid items")
-        except InvalidAction as exc:
-            logs.append({**info, "status": "invalid", "reason": str(exc)})
-            bar.update(suffix=f"p{pi} invalid")
-            continue
-        if not data["items"]:
-            logs.append({**info, "status": "empty"})
-        for q in data["items"]:
-            result = env.gate(full, pack, q, state["date"], state["qtype"])
-            logs.append({**info, **result})
-            if result["status"] == "accepted" and question_key(q) not in {question_key(x) for x in accepted}:
-                accepted.append(q)
+        consecutive_errors = 0
+        logs.extend(pack_logs)
+        accepted.extend(new_items)
         write(out / "bank.json", accepted)
         write(out / "bank_log.json", logs)
         bar.update(suffix=f"p{pi} qtype={info.get('qtype')} bank={len(accepted)}")

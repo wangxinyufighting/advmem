@@ -445,6 +445,22 @@ def test_empty_q_skips_refine(setup_case,env,tmp_path):
     assert all(p.get('mode')!='refine' for p in payloads)
 
 
+def test_bank_retries_transient_api_failure_without_dropping_case(setup_case,env,tmp_path,monkeypatch):
+    full,path,ctx=setup_case
+    remote=env.policy('ATTACKER');original=remote.complete;calls={'n':0}
+    def flaky(prompt,nonce,temperature=0,max_tokens=4096):
+        calls['n']+=1
+        if calls['n']==1:
+            raise Unknown('synthetic connection reset')
+        return original(prompt,nonce,temperature=temperature,max_tokens=max_tokens)
+    monkeypatch.setattr(remote,'complete',flaky)
+    monkeypatch.setenv('PACK_RETRIES','2')
+    monkeypatch.setenv('PACK_BACKOFF','0')
+    assert generate_bank(full,path,ctx,env,tmp_path/'bank')==1
+    assert calls['n']>=2
+    assert all(row['status']!='transport_error' for row in read(tmp_path/'bank'/'bank_log.json'))
+
+
 def test_bank_generation_and_export(setup_case,env,tmp_path):
     full,path,ctx=setup_case
     assert generate_bank(full,path,ctx,env,tmp_path/'bank')==1

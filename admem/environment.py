@@ -32,9 +32,10 @@ class Environment:
 
     def judge(self, system, payload, key):
         prompt = messages(system, payload)
-        if self.counter.prompt_count(prompt) > self.cfg.judge_input_tokens:
-            raise Unknown("Judge context exceeds configured token budget")
-        return self.policy("JUDGE").json(prompt, "judge:" + key)
+        count = self.counter.prompt_count(prompt)
+        if count > self.cfg.judge_input_tokens:
+            raise Unknown(f"Judge context exceeds configured token budget ({count}>{self.cfg.judge_input_tokens})")
+        return self.policy("JUDGE").json(prompt, "judge:" + key, prompt_tokens=count)
 
     def index(self, documents):
         if not documents:
@@ -66,9 +67,10 @@ class Environment:
         if task_type is not None:
             payload["task_type"] = task_type
         prompt = messages(prompts.READ, payload)
-        if self.counter.prompt_count(prompt) > self.cfg.reader_tokens + 1500:
-            raise Unknown("Reader prompt exceeds budget")
-        value = self.policy("DEFENDER").json(prompt, "reader:" + key)
+        count = self.counter.prompt_count(prompt)
+        if count > self.cfg.reader_tokens + 1500:
+            raise Unknown(f"Reader prompt exceeds budget ({count}>{self.cfg.reader_tokens + 1500})")
+        value = self.policy("DEFENDER").json(prompt, "reader:" + key, prompt_tokens=count)
         if not isinstance(value.get("answer"), str):
             raise Unknown("Reader response has no answer string")
         return value["answer"]

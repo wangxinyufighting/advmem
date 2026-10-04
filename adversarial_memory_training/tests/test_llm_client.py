@@ -43,6 +43,27 @@ def test_post_ignores_cached_provider_error(tmp_path, monkeypatch):
     assert read_json(path)["response"]["choices"]
 
 
+def test_post_retries_connection_reset_with_configured_retries(tmp_path, monkeypatch):
+    client = Client("fake", "http://fake/v1", "EMPTY", tmp_path)
+    monkeypatch.setenv("API_RETRIES", "4")
+    monkeypatch.setenv("API_BACKOFF", "0")
+    attempts = {"n": 0}
+
+    def flaky(req, timeout):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise ConnectionResetError("reset by peer")
+        return _Response({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    monkeypatch.setattr("llm.time.sleep", lambda seconds: None)
+
+    result = client.post("/chat/completions", {"model": "fake", "messages": [], "max_tokens": 8}, "case")
+
+    assert result["choices"][0]["message"]["content"] == "ok"
+    assert client.calls == 3
+
+
 def test_post_retries_http_200_provider_error_without_caching(tmp_path, monkeypatch):
     client = Client("fake", "http://fake/v1", "EMPTY", tmp_path)
     payload = {"model": "fake", "messages": [], "max_tokens": 8}

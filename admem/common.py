@@ -309,7 +309,7 @@ class Remote:
         self.retry_dir = Path(cache) / "judge_retries"
 
     def complete(self, prompt, nonce, temperature=0.0, max_tokens=None,
-                 output_tokens=None):
+                 output_tokens=None, prompt_tokens=None):
         """Complete one request, optionally overriding its output-token budget.
 
         ``output_tokens`` is used only by the JSON parser's bounded retry.  It
@@ -377,9 +377,11 @@ class Remote:
             # 截断视作模型格式失败；不在奖励路径重试生成并偷选成功者。
             return value if choice.get("finish_reason") != "length" else value + "\n[TRUNCATED_OUTPUT]"
         except Exception as exc:
-            raise Unknown(f"{self.role} transport/service failure: {exc}") from exc
+            # prompt_tokens 让超长(输入+输出>服务max_model_len)能与真正的传输故障区分开。
+            raise Unknown(f"{self.role} transport/service failure "
+                          f"[prompt_tokens={prompt_tokens}, max_tokens={body.get('max_tokens')}]: {exc}") from exc
 
-    def json(self, prompt, nonce):
+    def json(self, prompt, nonce, prompt_tokens=None):
         # 判官格式错误属于环境未知，不能变成被训练策略的负奖励。
         path = self.retry_dir / (digest([self.tag, prompt, nonce]) + ".json")
         previous = read(path) if path.exists() else {}
@@ -396,10 +398,10 @@ class Remote:
                     # Preserve the original call shape for the initial
                     # request, including compatibility with lightweight test
                     # doubles that only accept ``prompt, nonce``.
-                    raw = self.complete(prompt, request_nonce)
+                    raw = self.complete(prompt, request_nonce, prompt_tokens=prompt_tokens)
                 else:
                     raw = self.complete(prompt, request_nonce,
-                                        output_tokens=retry_budget)
+                                        output_tokens=retry_budget, prompt_tokens=prompt_tokens)
                 return parse_json_object(raw)
             except InvalidAction as exc:
                 attempt += 1

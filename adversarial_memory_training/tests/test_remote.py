@@ -1,6 +1,8 @@
 import json
 
-from admem.common import Remote
+import pytest
+
+from admem.common import Remote, Unknown
 
 
 class _FakeClient:
@@ -50,6 +52,19 @@ def test_json_retry_expands_truncated_judge_budget(tmp_path, monkeypatch):
     assert result == {"correct": True}
     assert client.requests[0][1]["max_tokens"] == 4096
     assert client.requests[1][1]["max_tokens"] == 8192
+
+
+def test_complete_failure_reports_prompt_tokens(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    client = _FakeClient([{"choices": []}])
+    _FakeCore.client = client
+
+    with pytest.raises(Unknown) as exc:
+        Remote("JUDGE", _FakeCore, tmp_path / "api").complete(
+            [{"role": "user", "content": "judge"}], "case", prompt_tokens=12345)
+
+    message = str(exc.value)
+    assert "prompt_tokens=12345" in message and "max_tokens=4096" in message
 
 
 def test_json_retry_when_reasoning_returns_null_content(tmp_path, monkeypatch):

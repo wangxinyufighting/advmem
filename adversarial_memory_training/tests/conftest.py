@@ -115,7 +115,7 @@ class FakeRemote:
         self.role,self.control=role,control
         self.tag=role+'_OFFLINE_STUB'
         self.client=NS(model='OFFLINE_STUB',base_url='http://not-used')
-    def complete(self,prompt,nonce,temperature=0,max_tokens=4096):
+    def complete(self,prompt,nonce,temperature=0,max_tokens=4096,prompt_tokens=None):
         self.control['prompts'].append((self.role,prompt,nonce))
         payload=json.loads(prompt[1]['content'])
         if 'mode' in payload:
@@ -126,7 +126,7 @@ class FakeRemote:
             return json.dumps({'ops':[{'op':'ADD','text':x['text'],'prov':[x['rid']]} for x in payload['x']]})
         return json.dumps({'items':[{'q':"What is my cat's name?",'a':'Milo','type':payload['type'],
                                      'question_date':payload['question_date'],'E':['s1:r1']}]})
-    def json(self,prompt,nonce):
+    def json(self,prompt,nonce,prompt_tokens=None):
         from admem import prompts
         from admem.audit_prompts import GATE_ORACLE_SYSTEM,GATE_SUPPORT_SYSTEM
         from admem.common import Unknown
