@@ -608,7 +608,8 @@ def main(argv=None):
         return
     reports = []
     entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
-    bar = Progress(len(entries), label=a.command)
+    # 带输出目录名，PARALLEL=1 时各进程的进度条才能区分。
+    bar = Progress(len(entries), label=f"{a.command} {Path(a.out).name}")
     for context, full_path in entries:
         key = context["key"]
         state = context["question_type"] if cfg.hint_mode == "target_type" else "hidden"

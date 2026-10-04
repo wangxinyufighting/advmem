@@ -314,7 +314,9 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
     out = Path(out)
     accepted, logs = [], []
     pool = make_pool(full, env)
-    bar = Progress(len(pool), label=f"{context['key']} bank")
+    # <variant>/<case>：PARALLEL=1 多进程混排时能区分是哪条流水线。
+    parent = Path(out).parent.name
+    bar = Progress(len(pool), label=f"{parent}/{context['key']}")
     for pi, pack in enumerate(pool):
         # 日志只记中性sN，不记原始seed_id（可能是answer_*标签）。
         info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None}

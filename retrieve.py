@@ -31,8 +31,10 @@ class Embedder:
         if backend == "local":
             from sentence_transformers import SentenceTransformer
             self.model_name = model or os.getenv("EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-            self.encoder = SentenceTransformer(self.model_name)
-            self.signature = [backend, self.model_name, self.query_prefix, self.document_prefix]
+            # 设 EMBED_DEVICE=cpu 可避免与同卡 vLLM 争显存（多进程时尤其容易 CUDA OOM）。
+            self.encoder = SentenceTransformer(self.model_name, device=os.getenv("EMBED_DEVICE") or None)
+            self.signature = [backend, self.model_name, self.query_prefix, self.document_prefix,
+                              os.getenv("EMBED_DEVICE", "")]
         elif backend == "api":
             name = model or os.getenv("EMBED_MODEL", "")
             if not name:
