@@ -315,22 +315,28 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
     accepted, logs = [], []
     pool = make_pool(full, env)
     for pi, pack in enumerate(pool):
+        # 日志只记中性sN，不记原始seed_id（可能是answer_*标签）。
+        info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None}
         state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
         if state is None:
-            logs.append({"pack": pi, "status": "type_infeasible"})
+            logs.append({**info, "status": "type_infeasible"})
             continue
         pack = env.pack_module.Pack(**state["pack"])
+        info.update(qtype=state["qtype"], prompt_tokens=env.counter.prompt_count(state["prompt"]),
+                    visible_rounds=len(pack.rids))
         raw = propose(state, env, role, "bank:" + digest([state["prompt"], env.policy(role).tag]))
         try:
             data = parse(raw)
             if set(data) != {"items"} or not isinstance(data["items"], list) or len(data["items"]) > env.cfg.questions_per_pack:
                 raise InvalidAction("Invalid items")
         except InvalidAction as exc:
-            logs.append({"pack": pi, "status": "invalid", "reason": str(exc)})
+            logs.append({**info, "status": "invalid", "reason": str(exc)})
             continue
+        if not data["items"]:
+            logs.append({**info, "status": "empty"})
         for q in data["items"]:
             result = env.gate(full, pack, q, state["date"], state["qtype"])
-            logs.append({"pack": pi, **result})
+            logs.append({**info, **result})
             if result["status"] == "accepted" and question_key(q) not in {question_key(x) for x in accepted}:
                 accepted.append(q)
         write(out / "bank.json", accepted)
