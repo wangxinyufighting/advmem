@@ -194,6 +194,8 @@ class Config:
     old_entries: int = 20
     entry_tokens: int = 300
     timeline_tokens: int = 300
+    catalog_entry_tokens: int = 32
+    catalog_tokens: int = 1200
     max_ops: int = 16
     neighbors: int = 8
     pack_chars: int = 48000
@@ -230,7 +232,8 @@ class Config:
             raise ValueError("Invalid attacker settings")
         numeric = [c.reader_k, c.reader_tokens, c.window_tokens, c.old_entries, c.max_ops,
                    c.builder_input_tokens, c.attacker_input_tokens, c.judge_input_tokens,
-                   c.entry_tokens, c.timeline_tokens, c.questions_per_pack, c.sweeps]
+                   c.entry_tokens, c.timeline_tokens, c.catalog_entry_tokens, c.catalog_tokens,
+                   c.questions_per_pack, c.sweeps]
         if min(numeric) < 1 or c.refine_rounds < 0 or not 0 <= c.size_weight <= 1:
             raise ValueError("Invalid budgets")
         return c

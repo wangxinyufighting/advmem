@@ -452,6 +452,9 @@ def test_attacker_probe_reports_learning_signal(setup_case,env,tmp_path):
     summary=run_attacker_probe([(ctx,path)],env,out,samples=3)
     assert summary['groups']>=1 and summary['samples_per_group']==3
     assert len(summary['per_group'])==summary['groups']
+    assert all(g['diagnosis'] in {'signal','all_fail','same_reward_collapse','deterministic'}
+               for g in summary['per_group'])
+    assert set(summary['diagnosis_rates']) <= {'signal','all_fail','same_reward_collapse','deterministic'}
     assert (out/'samples.jsonl').exists() and (out/'summary.json').exists()
     assert all('reward' in row for row in rows(out/'samples.jsonl'))
     assert all('raw_text' in row for row in rows(out/'raw_samples.jsonl'))

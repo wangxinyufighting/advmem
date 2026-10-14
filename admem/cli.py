@@ -522,6 +522,7 @@ def main(argv=None):
     p.add_argument("--max-packs", type=int, help="attacker-probe：每个case取前N个pack")
     p.add_argument("--pack-sample", type=int, help="attacker-probe：每个case随机抽N个pack（比--max-packs更适合抽样测试）")
     p.add_argument("--pack-seed", type=int, default=0, help="attacker-probe随机抽pack的种子")
+    p.add_argument("--temperature", type=float, default=0.7, help="attacker-probe采样温度（默认0.7）")
     p.add_argument("--questions-per-pack", type=int,
                    help="覆盖config里的questions_per_pack（每个pack让attacker出几道题）")
     p.add_argument("--variants", type=int, default=5)
@@ -596,9 +597,11 @@ def main(argv=None):
         entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
         summary = run_attacker_probe(entries, env, a.out, samples=a.samples,
                                      role=a.attacker_role, max_packs=a.max_packs,
+                                     temperature=a.temperature,
                                      pack_sample=a.pack_sample, pack_seed=a.pack_seed)
-        print({k: summary[k] for k in ("groups", "signal_group_rate", "reward_std_mean",
-                                       "reward_overall_mean", "reward_min", "reward_max")})
+        print({k: summary[k] for k in ("groups", "signal_group_rate", "diagnosis_rates",
+                                       "reward_std_mean", "reward_overall_mean",
+                                       "reward_min", "reward_max")})
         return
     if a.command == "longmemeval-eval" and a.cases:
         if a.prepared:

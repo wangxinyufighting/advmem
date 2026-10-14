@@ -22,20 +22,25 @@ def make_pool(full, env):
 
 
 def windows(full, counter, limit):
-    """完整遍历原文；长round按span切窗口但不删字符，rid仍指向同一原文。"""
-    current, size = [], 0
-    for rid in full.ordered(full.rounds):
-        source = neutral_round(full, rid)
-        for start, end, text in counter.split(source["text"], limit):
-            chunk = {**source, "text": text, "span": [start, end]}
-            n = counter.count(text)
-            if current and size + n > limit:
-                yield current
-                current, size = [], 0
-            current.append(chunk)
-            size += n
-    if current:
-        yield current
+    """按 session 对齐切窗口：每个窗口只含一个 session 的 round，不跨 session。
+
+    session 内按 round 打包到 token 预算；只有单个 round 超过预算才按 token
+    切 span。所有原文字符都保留，不删不丢。"""
+    for sid in full.chronological_ids:
+        session = full.sessions[sid]
+        current, size = [], 0
+        for rid in session.rids:
+            source = neutral_round(full, rid)
+            for start, end, text in counter.split(source["text"], limit):
+                chunk = {**source, "text": text, "span": [start, end]}
+                n = counter.count(text)
+                if current and size + n > limit:
+                    yield current
+                    current, size = [], 0
+                current.append(chunk)
+                size += n
+        if current:
+            yield current
 
 
 def related(memory, x, env):

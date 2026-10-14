@@ -1,4 +1,6 @@
 """策略提示词全部英文；中文只用于源码注释。"""
+import json
+
 from .common import messages, Unknown
 from .audit_prompts import attacker_prompt, attacker_rids, build_payload
 from .store import neutral_round
@@ -80,6 +82,15 @@ COMMON TRAPS
 - "It arrived" does not mean the user purchased it.
 - A report timestamp does not replace an event date.
 - Liking an entity and being unable to use/own it are compatible facts, not automatic contradictions.
+
+STORED CATALOG
+- The user payload contains stored_catalog: a compact one-line summary of every entry already
+  in memory, with model-written cards listed before raw fallback chunks. Consult it before ADD:
+  if a fact from x is already covered by the catalog, use NOOP or UPDATE the existing card
+  instead of re-adding it.
+- Summaries are truncated for brevity; M_old (when present) carries the full text of the
+  editable entries. Catalog ids are recognition aids only, never provenance or UPDATE targets;
+  UPDATE/DELETE ids must still come from editable_entry_ids.
 
 IDENTIFIERS AND BUDGETS
 - The user payload contains editable_entry_ids and allowed_source_rids. Copy identifiers exactly from those
@@ -228,12 +239,38 @@ def source_view(full, rids):
     return [neutral_round(full, r) for r in full.ordered(rids)]
 
 
+def _truncate(text, counter, limit):
+    """截断到 limit 个 token，超出时加省略号标记。"""
+    if counter.count(text) <= limit:
+        return text
+    for _, _, head in counter.split(text, max(1, limit - 2)):
+        return head.rstrip() + " …"
+    return text
+
+
+def _stored_catalog(memory, counter, entry_tokens, budget):
+    """紧凑已存目录：模型卡片优先，raw 回退块其次；每项一行摘要，供去重判断。"""
+    cards = [e for e in memory if e.get("kind") != "raw"]
+    raws = [e for e in memory if e.get("kind") == "raw"]
+    items, used = [], 0
+    for e in cards + raws:
+        item = {"id": e["id"], "kind": e.get("kind", "card"),
+                "summary": _truncate(e["text"], counter, entry_tokens)}
+        n = counter.count(json.dumps(item, ensure_ascii=False))
+        if items and used + n > budget:
+            break
+        items.append(item)
+        used += n
+    return items
+
+
 def builder_prompt(full, memory, old_ids, x, mode, hint, cfg, counter,
                    extra_system=""):
     lookup = {e["id"]: e for e in memory}
     selected = list(old_ids)
     # hint可见/不可见必须用相同卡片预算，避免预算本身泄露类型或混淆对照。
     limit = cfg.entry_tokens
+    catalog = _stored_catalog(memory, counter, cfg.catalog_entry_tokens, cfg.catalog_tokens)
     system = BUILDER
     if hint is not None:
         # Include type instructions before counting the final prompt, and keep
@@ -257,6 +294,7 @@ def builder_prompt(full, memory, old_ids, x, mode, hint, cfg, counter,
             "mode": mode,
             "x": x,
             "M_old": old_entries,
+            "stored_catalog": catalog,
             "editable_entry_ids": selected,
             "allowed_source_rids": sorted(source_provenance),
             "write_required": mode == "stream" and not memory and bool(x),

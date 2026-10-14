@@ -25,6 +25,7 @@ class Full:
     def __init__(self, sessions, rounds):
         self.sessions = {s.session_id: s for s in sessions}
         self.rounds = {r.rid: r for r in rounds}
+        self.chronological_ids = [s.session_id for s in sorted(sessions, key=lambda s: s.original_index)]
         self.fingerprint = digest(self.export_history())
 
     @classmethod

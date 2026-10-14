@@ -1,7 +1,7 @@
 """Builder基础能力诊断：独立合成情境，不使用LongMemEval官方问题作为训练奖励。"""
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 import hashlib
 import json
 import random
@@ -143,6 +143,17 @@ def make_suite(env, out, variants=5):
     return suite
 
 
+def _item_summary(scored):
+    """Compact per-question verdicts so identical rewards with different outputs are debuggable."""
+    summary = []
+    for d in scored.get("items", []) or []:
+        defect = d.get("defect")
+        summary.append({"status": d.get("status"),
+                        "defect": defect.get("kind") if isinstance(defect, dict) else None,
+                        "weight": d.get("weight")})
+    return summary
+
+
 def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_packs=None,
                        temperature=0.7, pack_sample=None, pack_seed=0):
     """诊断 attacker reward 是否有组内学习信号（GRPO 要求每个 prompt 内 reward 有方差）。
@@ -196,6 +207,7 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
                     "reward": scored.get("reward"),
                     "effective_reward": scored.get("effective_reward"),
                     "legal": scored.get("legal"), "reason": scored.get("reason"),
+                    "items": _item_summary(scored),
                 }
                 records.append(record)
                 group.append(record)
@@ -215,21 +227,37 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
         rewards = [float(r["reward"]) for r in group if r.get("reward") is not None]
         if len(rewards) < 2:
             continue
+        unique_raw = len({r["raw_hash"] for r in group})
+        if pstdev(rewards) > 1e-8:
+            diagnosis = "signal"              # 组内有方差，能提供GRPO梯度
+        elif all(r < 0 for r in rewards):
+            diagnosis = "all_fail"            # 全部被拒/非法：模型能力问题
+        elif unique_raw > 1:
+            diagnosis = "same_reward_collapse"  # 输出不同但同分：奖励区分度问题
+        else:
+            diagnosis = "deterministic"       # 输出几乎不变：采样多样性问题
         per_group.append({
             "case_key": case_key, "pack": pack, "pack_id": group[0].get("pack_id"),
             "seed": group[0].get("seed"), "qtype": group[0].get("qtype"),
             "samples": len(rewards), "mean": mean(rewards), "std": pstdev(rewards),
             "min": min(rewards), "max": max(rewards),
-            "unique_rewards": len(set(rewards)), "unique_raw": len({r["raw_hash"] for r in group}),
+            "unique_rewards": len(set(rewards)), "unique_raw": unique_raw,
+            "diagnosis": diagnosis,
         })
     all_rewards = [float(r["reward"]) for r in records if r.get("reward") is not None]
     signal = [g for g in per_group if g["std"] > 1e-8]
+    diagnoses = Counter(g["diagnosis"] for g in per_group)
+    total_groups = len(per_group)
     summary = {
         "role": role, "model": env.policy(role).client.model, "temperature": temperature,
-        "groups": len(per_group), "samples_per_group": samples,
+        "groups": total_groups, "samples_per_group": samples,
         "groups_with_signal": len(signal),
-        "signal_group_rate": len(signal) / len(per_group) if per_group else None,
-        "reward_std_mean": mean([g["std"] for g in per_group]) if per_group else None,
+        "signal_group_rate": len(signal) / total_groups if total_groups else None,
+        "diagnosis_counts": dict(diagnoses),
+        "diagnosis_rates": ({k: v / total_groups for k, v in diagnoses.items()} if total_groups else {}),
+        "note": "diagnosis per zero-variance group: all_fail=模型能力, "
+                "same_reward_collapse=奖励区分度(可能只是等价质量), deterministic=采样多样性",
+        "reward_std_mean": mean([g["std"] for g in per_group]) if total_groups else None,
         "reward_overall_mean": mean(all_rewards) if all_rewards else None,
         "reward_overall_std": pstdev(all_rewards) if len(all_rewards) > 1 else None,
         "reward_min": min(all_rewards) if all_rewards else None,
