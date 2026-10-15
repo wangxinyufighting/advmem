@@ -207,6 +207,7 @@ class Config:
     gate_mode: str = "full"
     defect_mode: str = "strict"  # strict 是v1；direct另作诊断性扩展。
     fallback: bool = True
+    faith_gate: bool = True  # false=诊断模式：faith仍记录但不拒绝edit，直接应用后再评QA。
     seed: int = 0
     # attacker：compact只给非种子round的user消息；type_filter按种子内容预筛可出题型。
     attacker_view: str = "full"
@@ -278,7 +279,13 @@ class TokenBudget:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
     def prompt_count(self, messages):
-        return len(self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True))
+        result = self.tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True)
+        # transformers >= 4.35 returns a BatchEncoding here; len() then counts
+        # the encoding keys (input_ids/attention_mask), not tokens.  Older
+        # versions return a plain list[int].  Handle both.
+        if hasattr(result, "get"):
+            result = result.get("input_ids", result)
+        return len(result)
 
     def split(self, text, limit):
         """按字符边界切成token受限块，拼回去逐字相同；不decode token造成原文变化。"""

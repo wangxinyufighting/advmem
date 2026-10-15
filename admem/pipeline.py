@@ -140,7 +140,8 @@ def edit(full, state, raw, env):
     except InvalidAction as exc:
         return None, {"legal": False, "reason": str(exc)}
     faith = env.faith(full, changed)
-    return (proposal if faith["faithful"] else None), {"legal": True, "faith": faith}
+    accept = faith["faithful"] if env.cfg.faith_gate else True
+    return (proposal if accept else None), {"legal": True, "faith": faith, "faith_gated": env.cfg.faith_gate}
 
 
 def raw_from_window(x, env):
