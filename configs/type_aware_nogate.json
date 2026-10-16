@@ -1,11 +1,11 @@
 {
   "project": ".",
   "cache": ".cache/admem",
-  "tokenizer": "/root/autodl-tmp/model/Qwen3-4B-Instruct-2507",
+  "tokenizer": "/mnt/local2/wxy/models/Qwen3-4B-Instruct-2507",
   "tokenizer_revision": null,
   "hint_mode": "target_type",
   "embedding": "local",
-  "embed_model": null,
+  "embed_model": "/mnt/local2/wxy/models/bge-m3",
   "reranker": null,
   "reader_k": 10,
   "reader_tokens": 12000,
