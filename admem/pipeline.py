@@ -139,9 +139,11 @@ def edit(full, state, raw, env):
             counter=env.counter, limit=state["entry_limit"], max_ops=env.cfg.max_ops)
     except InvalidAction as exc:
         return None, {"legal": False, "reason": str(exc)}
-    faith = env.faith(full, changed)
-    accept = faith["faithful"] if env.cfg.faith_gate else True
-    return (proposal if accept else None), {"legal": True, "faith": faith, "faith_gated": env.cfg.faith_gate}
+    if env.cfg.faith_gate:
+        faith = env.faith(full, changed)
+        return (proposal if faith["faithful"] else None), {"legal": True, "faith": faith, "faith_gated": True}
+    # 诊断模式：不调用faith judge，直接应用合法edit（非法schema仍拒绝→fallback）。
+    return proposal, {"legal": True, "faith": None, "faith_gated": False}
 
 
 def raw_from_window(x, env):
