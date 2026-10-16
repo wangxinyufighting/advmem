@@ -34,6 +34,11 @@ SOURCE DISCIPLINE
 
 OPERATION DECISION RULES
 - ADD only genuinely new supported information; use it only in stream/patch mode.
+- x is a window of source, not one fact. Check EVERY user sentence in x against the catalog and
+  M_old one by one. Whenever you find an explicit new fact (a degree, a graduation, a name, a
+  purchase, a date, a status change, a preference, a plan), ADD it even if the message's main
+  request is about a topic that is already covered. Never NOOP the whole window merely because its
+  dominant topic is represented; NOOP only when x contains no new fact at all.
 - In stream mode, if M_old is empty and x contains any explicit storable user or assistant fact,
   you MUST emit at least one ADD; do not use NOOP merely because the hidden question is unknown.
   Use NOOP only when x contains no storable fact at all (for example, empty or pure boilerplate text).

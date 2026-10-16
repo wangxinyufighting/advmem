@@ -207,7 +207,7 @@ class Config:
     gate_mode: str = "full"
     defect_mode: str = "strict"  # strict 是v1；direct另作诊断性扩展。
     fallback: bool = True
-    faith_gate: bool = True  # false=诊断模式：faith仍记录但不拒绝edit，直接应用后再评QA。
+    faith_gate: bool = True  # false=诊断模式：跳过faith judge，直接应用合法edit。
     seed: int = 0
     # attacker：compact只给非种子round的user消息；type_filter按种子内容预筛可出题型。
     attacker_view: str = "full"
