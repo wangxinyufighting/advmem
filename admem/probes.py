@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections import Counter, defaultdict
 import hashlib
 import json
+import os
 import random
 from pathlib import Path
 from statistics import mean, pstdev
@@ -298,6 +299,9 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
 
     aggregates = defaultdict(list)
     temperature = 0.7
+    # 瞬时云端失败不应中止整轮诊断：单样本记unknown继续，连续失败到上限才中止。
+    fail_limit = max(1, int(os.getenv("PROBE_FAIL_LIMIT", "10")))
+    consecutive_errors = 0
 
     for row in records:
         full = env.memory_module.FullMemory.load(row["state"]["full_path"])
@@ -307,15 +311,15 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
         for i in range(samples):
             # 禁用逐字回退；所有结果完全来自该模型本次提议。
             nonce = "probe:" + digest([row["id"], i, env.policy(role).tag])
-            raw = env.policy(role).complete(
-                row["prompt"], nonce, temperature=temperature
-            )
-            raw_text = _json_text(raw)
-            raw_hash = hashlib.sha256(
-                raw_text.encode("utf-8")
-            ).hexdigest()[:16]
-
+            raw_text, raw_hash, record = None, None, None
             try:
+                raw = env.policy(role).complete(
+                    row["prompt"], nonce, temperature=temperature
+                )
+                raw_text = _json_text(raw)
+                raw_hash = hashlib.sha256(
+                    raw_text.encode("utf-8")
+                ).hexdigest()[:16]
                 result = dict(env.builder_score(full, row["state"], raw, family=family))
                 result.pop("proposed", None)
 
@@ -339,13 +343,41 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
                     "success": success,
                     "status": "ok",
                 })
+                consecutive_errors = 0
             except Unknown as exc:
-                # Unknown 是环境/Judge 未知，不应伪装成模型负样本。
-                write(
-                    out / "interrupted.json",
-                    {"case": row["id"], "sample": i, "error": str(exc)},
-                )
-                raise
+                # 瞬时/服务端失败记unknown（不计入reward统计）；连续失败到上限才中止。
+                consecutive_errors += 1
+                record = {
+                    "state_id": row["id"],
+                    "family": family,
+                    "sample_idx": i,
+                    "temperature": temperature,
+                    "nonce": nonce,
+                    "raw_hash": raw_hash,
+                    "raw_text": raw_text,
+                    "status": "unknown",
+                    "error": str(exc),
+                    "reward": None,
+                    "effective_reward": None,
+                }
+                _append_jsonl(samples_path, record)
+                _append_jsonl(raw_path, {
+                    "state_id": row["id"],
+                    "family": family,
+                    "sample_idx": i,
+                    "temperature": temperature,
+                    "raw_hash": raw_hash,
+                    "raw_text": raw_text,
+                })
+                values.append(record)
+                if consecutive_errors >= fail_limit:
+                    write(
+                        out / "interrupted.json",
+                        {"case": row["id"], "sample": i, "error": str(exc),
+                         "consecutive_errors": consecutive_errors},
+                    )
+                    raise
+                continue
 
             record = {
                 "state_id": row["id"],
@@ -407,7 +439,11 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
             "answer_correct_rate": rate(values, "answer_correct"),
             "family_constraint_rate": rate(values, "family_constraint_pass"),
             "success_rate_all_samples": rate(values, "success"),
-            "first_sample_success_rate": mean(float(group[0]["success"]) for group in groups),
+            "first_sample_success_rate": (
+                mean([float(group[0]["success"]) for group in groups
+                      if group and group[0].get("success") is not None])
+                if any(group and group[0].get("success") is not None for group in groups) else None
+            ),
             "empirical_at_least_one_success": mean(
                 float(any(x["success"] for x in group)) for group in groups
             ),
