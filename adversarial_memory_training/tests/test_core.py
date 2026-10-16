@@ -228,7 +228,7 @@ def test_builder_reward_uses_raw_action_no_fallback(setup_case,env):
     noop=env.builder_score(full,state,'{"ops":[]}')
     assert noop['accuracy']==0 and noop['reward']==0
     good=env.builder_score(full,state,json.dumps({'ops':[{'op':'ADD','text':'Milo','prov':['s1:r1']}]}))
-    assert good['accuracy']==1 and good['faith'] and good['reward']>1
+    assert good['accuracy']==1 and good['faith'] and 0 < good['reward'] <= 1
 
 
 def test_refine_noop_keeps_raw_answer_reward_but_zeroes_effective_reward(setup_case,env):

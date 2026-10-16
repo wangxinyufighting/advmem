@@ -120,6 +120,13 @@ class Environment:
                 return value
         return {"faithful": True, "reason": "All written entries supported"}
 
+    def faith_scores(self, full, changed):
+        """逐条faithful判定（不提前返回），供builder_score做连续折扣；无改动返回[]。"""
+        return [boolean(self.judge(prompts.FAITH, {"entries": [entry],
+                        "history": prompts.source_view(full, entry["prov"])},
+                        digest([full.fingerprint, entry])), "faithful")
+                for entry in changed]
+
     def validate_question(self, q, pack, date, qtype):
         if not isinstance(q, dict) or set(q) != {"q", "a", "type", "question_date", "E"}:
             raise InvalidAction("Question schema mismatch")
@@ -209,13 +216,15 @@ class Environment:
             return {"reward": -1.0, "effective_reward": -1.0,
                     "legal": False, "family_constraint_pass": None,
                     "reason": str(exc)}
-        faith = self.faith(full, changed)
-        if not faith["faithful"]:
+        faith_scores = self.faith_scores(full, changed)
+        if faith_scores and not any(faith_scores):
+            # 全部改动条目不忠实：整单判0（保留原二值语义，不给部分分）。
             return {"reward": 0.0, "effective_reward": 0.0,
                     "legal": True, "faith": False,
                     "family_constraint_pass": None,
-                    "faith_reason": faith.get("reason"),
-                    "reason": faith.get("reason")}
+                    "faith_reason": "No changed entry is faithful",
+                    "reason": "No changed entry is faithful"}
+        faith_ratio = (sum(faith_scores) / len(faith_scores)) if faith_scores else 1.0
         tests = state["tests"]
         if not tests:
             raise Unknown("Empty test set: no answer-retention reward is defined")
@@ -224,12 +233,12 @@ class Environment:
         before = text_size(state["M"], self.counter)
         source_size = sum(self.counter.count(x["text"]) for x in state["x"])
         after = text_size(proposed, self.counter)
-        saving = max(0.0, 1 - after / max(1, before + source_size))
-        bonus = self.cfg.size_weight * saving if all(scores) else 0.0
+        # 软压缩惩罚：只惩罚相对本次source的增长，始终生效、无悬崖。
+        growth_ratio = max(0.0, (after - before) / max(1, source_size))
+        size_penalty = self.cfg.size_weight * growth_ratio
         constraint_ok = True
         constraint_reason = None
         if state["mode"] == "refine" and after >= before:
-            bonus = 0.0
             constraint_ok = False
             constraint_reason = "memory was not shortened"
         if family == "noop_repeat":
@@ -237,14 +246,16 @@ class Environment:
                 constraint_ok = False
                 constraint_reason = "NOOP must contain an empty ops list"
 
-        base_reward = acc + bonus
+        base_reward = acc * faith_ratio - size_penalty
         effective_reward = base_reward if constraint_ok else 0.0
         return {"reward": base_reward, "effective_reward": effective_reward,
                 "family_constraint_pass": constraint_ok,
                 "family_constraint_reason": constraint_reason,
-                "legal": True, "faith": True, "accuracy": acc,
+                "legal": True, "faith": True, "faith_ratio": faith_ratio,
+                "faith_scores": faith_scores, "accuracy": acc,
                 "test_scores": scores, "before_tokens": before, "after_tokens": after,
-                "compression_bonus": bonus, "proposed": proposed}
+                "growth_ratio": growth_ratio, "size_penalty": size_penalty,
+                "proposed": proposed}
 
     def attacker_score(self, full, state, completion):
         try:

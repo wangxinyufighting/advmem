@@ -281,6 +281,13 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
         records = records[:limit]
     if not records:
         raise ValueError("No probe states")
+    empty_test = sum(1 for r in records if not r["state"].get("tests"))
+    records = [r for r in records if r["state"].get("tests")]
+    if not records:
+        raise ValueError(
+            "No probe states with non-empty tests; the answer-retention reward "
+            "requires test questions (check that `bank` produced accepted questions)"
+        )
 
     # 每次 probe 使用新的输出目录；若目录已存在，避免旧样本混入本次汇总。
     samples_path = out / "samples.jsonl"
@@ -417,5 +424,6 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
         "role": role,
         "model": env.policy(role).client.model,
         "temperature": temperature,
+        "skipped_empty_test_states": empty_test,
     })
     return report

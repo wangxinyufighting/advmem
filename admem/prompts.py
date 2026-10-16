@@ -90,9 +90,11 @@ IDENTIFIERS AND BUDGETS
   automatically. Never use [] to hide a source fact that was copied into the new text.
 - If a required id or provenance is not in the payload, use {"ops":[]} instead of guessing.
 - Never exceed max_ops or max_entry_tokens. Each operation may touch an old id at most once.
-- Treat max_entry_tokens as a hard validator, not a suggestion: keep each written text to one atomic
-  claim and target at most 120 tokens. The assistant-artifact exception above permits a contiguous
-  list/table range, but never a whole unrelated source round or a lossy summary.
+- Treat max_entry_tokens as a hard validator, not a suggestion: one card covers one entity or
+  topic and may contain several closely related facts about it (for example, one user's degree,
+  graduation date, and later move in a single card). Do not split a single entity's related facts
+  across many tiny cards; do not merge unrelated entities. The assistant-artifact exception above
+  permits a contiguous list/table range, but never a whole unrelated source round or a lossy summary.
 - Each text must be a nonempty string within max_entry_tokens; long raw parents are not permission
   to write an overlong card. Use concise supported cards rather than copying a long conversation.
 
