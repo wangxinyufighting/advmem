@@ -201,11 +201,11 @@ class Environment:
         return result
 
     def builder_score(self, full, state, completion, family=None):
-        """评估一次 Builder 提议，同时返回原始和约束后的奖励。
+        """评估一次 Builder 提议，返回原始与约束后的奖励。
 
-        ``reward`` 保留答案/压缩的基础奖励，``effective_reward`` 才是
-        probe 或训练器可选择使用的任务奖励。这样不会把“答案答对但
-        没有压缩”误记为 refine 成功。
+        reward = Δ可答性×忠实度 + 尺寸项。Δ = 编辑前后的可答性变化：
+        存对 +1、误删 −1、错过 0。尺寸项 = 无损缩短奖励 − 增长惩罚。
+        effective_reward 在违反 family/refine 约束时置 0。
         """
         try:
             action = parse(completion)
@@ -228,17 +228,23 @@ class Environment:
         tests = state["tests"]
         if not tests:
             raise Unknown("Empty test set: no answer-retention reward is defined")
-        scores = [self.answer(proposed, q)["correct"] for q in tests]
-        acc = sum(scores) / len(scores)
-        before = text_size(state["M"], self.counter)
+
+        # Δ：编辑前后的可答性变化（不对称：摧毁为负、错过为0、改善为正）。
+        before_scores = [self.answer(state["M"], q)["correct"] for q in tests]
+        after_scores = [self.answer(proposed, q)["correct"] for q in tests]
+        before_acc = sum(before_scores) / len(tests)
+        after_acc = sum(after_scores) / len(tests)
+        delta = after_acc - before_acc
+
+        before_size = text_size(state["M"], self.counter)
+        after_size = text_size(proposed, self.counter)
         source_size = sum(self.counter.count(x["text"]) for x in state["x"])
-        after = text_size(proposed, self.counter)
-        # 软压缩惩罚：只惩罚相对本次source的增长，始终生效、无悬崖。
-        growth_ratio = max(0.0, (after - before) / max(1, source_size))
-        size_penalty = self.cfg.size_weight * growth_ratio
-        constraint_ok = True
-        constraint_reason = None
-        if state["mode"] == "refine" and after >= before:
+        # 尺寸项：增长惩罚（相对本次source）；无损缩短才奖励（相对既有M）。
+        growth_ratio = max(0.0, (after_size - before_size) / max(1, source_size))
+        shrink_ratio = max(0.0, (before_size - after_size) / max(1, before_size)) if delta >= 0 else 0.0
+
+        constraint_ok, constraint_reason = True, None
+        if state["mode"] == "refine" and after_size >= before_size:
             constraint_ok = False
             constraint_reason = "memory was not shortened"
         if family == "noop_repeat":
@@ -246,15 +252,17 @@ class Environment:
                 constraint_ok = False
                 constraint_reason = "NOOP must contain an empty ops list"
 
-        base_reward = acc * faith_ratio - size_penalty
+        base_reward = delta * faith_ratio + self.cfg.size_weight * (shrink_ratio - growth_ratio)
         effective_reward = base_reward if constraint_ok else 0.0
         return {"reward": base_reward, "effective_reward": effective_reward,
                 "family_constraint_pass": constraint_ok,
                 "family_constraint_reason": constraint_reason,
                 "legal": True, "faith": True, "faith_ratio": faith_ratio,
-                "faith_scores": faith_scores, "accuracy": acc,
-                "test_scores": scores, "before_tokens": before, "after_tokens": after,
-                "growth_ratio": growth_ratio, "size_penalty": size_penalty,
+                "faith_scores": faith_scores, "accuracy": after_acc,
+                "delta": delta, "before_accuracy": before_acc,
+                "test_scores": after_scores, "before_scores": before_scores,
+                "before_tokens": before_size, "after_tokens": after_size,
+                "growth_ratio": growth_ratio, "shrink_ratio": shrink_ratio,
                 "proposed": proposed}
 
     def attacker_score(self, full, state, completion):
