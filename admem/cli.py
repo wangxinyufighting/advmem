@@ -527,6 +527,8 @@ def main(argv=None):
                    help="覆盖config里的questions_per_pack（每个pack让attacker出几道题）")
     p.add_argument("--attacker-view", choices=["full", "compact"],
                    help="覆盖config里的attacker_view（bank/audit时给attacker的视图）")
+    p.add_argument("--neighbors", type=int,
+                   help="覆盖config里的neighbors（每个pack检索的邻居round数）")
     p.add_argument("--variants", type=int, default=5)
     p.add_argument("--states", help="probe的状态JSONL或export的collector根目录")
     p.add_argument("--parquet", action="store_true")
@@ -547,6 +549,10 @@ def main(argv=None):
         cfg.questions_per_pack = a.questions_per_pack
     if a.attacker_view:
         cfg.attacker_view = a.attacker_view
+    if a.neighbors is not None:
+        if a.neighbors < 0:
+            p.error("--neighbors must be non-negative")
+        cfg.neighbors = a.neighbors
     if a.command == "merge":
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
