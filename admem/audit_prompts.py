@@ -126,7 +126,11 @@ exclusivity, or dislike of alternatives. Do not require unverifiable current pri
 hours, events, or external recommendations as the historical gold answer.
 """,
     "multi-session": """TYPE: multi-session
-Require information from at least two distinct sessions, not merely two citations. The most
+Require information from at least two distinct sessions, not merely two citations. A round id is
+"S:r": S is the session prefix and r is the round number. Rounds S1:r1 and S1:r2 belong to the
+SAME session; S2:r1 is a different session. Counting sessions means counting distinct prefixes,
+never counting rounds. E MUST contain rids from at least two distinct session prefixes: citing
+S1:r1 and S1:r2 is one session (invalid), citing S1:r1 and S2:r3 is two sessions (valid). The most
 natural form aggregates one attribute of one kind of personal item or event across sessions
 ("How many ... have I ...?", "How much did I spend on ... in total?"). Useful
 operations include counting distinct events/items, summing amounts or durations, differences,

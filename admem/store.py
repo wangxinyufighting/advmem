@@ -61,6 +61,8 @@ def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, l
     visible_ids, source_ids, full_ids = set(visible_ids), set(source_ids), set(full_ids)
     if not visible_ids <= index.keys() or not source_ids <= full_ids:
         raise ValueError("Corrupt edit context")
+    # 允许 ADD 引用 M_old 里可见条目的既有来源：补存早期窗口漏掉的事实。
+    visible_prov = {r for i in visible_ids for r in index[i]["prov"]}
     # A first stream window must not silently turn the entire memory into a
     # vacuous no-op.  The caller can fall back to the raw window instead.
     if mode == "stream" and not memory and source_ids and not action["ops"]:
@@ -106,8 +108,8 @@ def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, l
         if not isinstance(prov, list) or any(not isinstance(r, str) for r in prov) or len(set(prov)) != len(prov):
             raise InvalidAction("Invalid provenance list")
         parent_prov = {r for i in ids for r in index[i]["prov"]}
-        # 新增来源必须实际在x中可见；继承来源由执行器自动合并。
-        if not set(prov) <= source_ids | parent_prov:
+        # 新增来源必须在当前窗口或可见旧条目中可见；继承来源由执行器自动合并。
+        if not set(prov) <= source_ids | visible_prov:
             raise InvalidAction("Provenance cites an unseen source")
         merged_prov = set(prov) | parent_prov
         if not merged_prov or not merged_prov <= full_ids:
