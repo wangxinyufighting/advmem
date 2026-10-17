@@ -189,8 +189,9 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
             visible = set(s["rid"] for s in x)
             ids = related(memory, x, env)
             old = {r for e in memory if e["id"] in ids for r in e["prov"]}
-            tests = [q for q in bank or [] if set(q["E"]) <= visited and set(q["E"]) <= visible | old
-                     and set(q["E"]) & visible]
+            # Δ可答性测试：证据已读全、落在当前窗口或待编辑条目prov的题；新题优先，历史题防遗忘。
+            tests = [q for q in bank or [] if set(q["E"]) <= visited and set(q["E"]) <= visible | old]
+            tests = sorted(tests, key=lambda q: bool(set(q["E"]) & visible), reverse=True)
             tests = tests[:env.cfg.replay_questions]
             state = builder_state(full, full_path, context, memory, x, "stream", tests, env, ids)
             raw = propose(state, env, builder_role, f"{namespace}:build:{wi}")
