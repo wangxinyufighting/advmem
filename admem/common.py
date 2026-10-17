@@ -179,7 +179,7 @@ def implementation_hash(project):
 class Config:
     project: str = "/root/autodl-tmp/advmem"
     cache: str = ".cache/admem"
-    tokenizer: str = "/root/autodl-tmp/model/Qwen3-4B-Instruct-2507"
+    tokenizer: str = "/mnt/local2/wxy/models/Qwen3-4B-Instruct-2507"
     tokenizer_revision: str | None = None
     hint_mode: str = "target_type"  # 用户要求的基线；另有 hidden 对照。
     embedding: str = "local"
