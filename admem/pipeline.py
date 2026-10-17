@@ -18,6 +18,9 @@ def make_pool(full, env):
     idx = env.index(full.documents())
     sampler = env.pack_module.Sampler(full, idx, seed=env.cfg.seed, neighbors=env.cfg.neighbors,
                                        max_chars=env.cfg.pack_chars)
+    # 跳过 seed 原文超出 pack 预算的 session（不截断原文）；测试替身无 fit_seeds 时保持原行为。
+    if hasattr(sampler, "fit_seeds"):
+        sampler.fit_seeds()
     return sampler.sample(len(sampler.seeds))
 
 
