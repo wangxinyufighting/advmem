@@ -127,6 +127,17 @@ class Sampler:
         return result
 
 
+    def fit_seeds(self) -> None:
+        """跳过 seed 原文超出 pack 字符预算的 session；不截断原文，只整 session 跳过并记录。"""
+        keep = []
+        for sid, kind, seed_rids in self.seeds:
+            if self.max_chars and len(self.full.render(seed_rids, self.marks)) > self.max_chars:
+                self.ledger[sid]["status"] = "seed_over_budget"
+                continue
+            keep.append((sid, kind, seed_rids))
+        self.seeds = keep
+
+
 def choose_type(pack: Pack, full: FullMemory, rng: random.Random,
                 weights: dict[str, float] | None = None) -> str:
     values = {ALIASES.get(k, k): float(v) for k, v in (weights or {t: 1 for t in TYPES}).items()}
