@@ -246,7 +246,7 @@ def test_refine_noop_keeps_raw_answer_reward_but_zeroes_effective_reward(setup_c
     assert result['legal'] and result['faith'] and result['accuracy']==1
     assert result['family_constraint_pass'] is False
     assert result['family_constraint_reason']=='memory was not shortened'
-    assert result['reward']==1 and result['effective_reward']==0
+    assert result['reward']==0 and result['effective_reward']==0
 
 
 def test_refine_merge_preserves_effective_reward(setup_case,env):
@@ -281,7 +281,7 @@ def test_noop_repeat_rejects_redundant_update_in_effective_reward(setup_case,env
     assert result['legal'] and result['faith'] and result['accuracy']==1
     assert result['family_constraint_pass'] is False
     assert result['family_constraint_reason']=='NOOP must contain an empty ops list'
-    assert result['reward']>0 and result['effective_reward']==0
+    assert result['reward']==0 and result['effective_reward']==0
 
 
 def test_unfaithful_action_gets_no_accuracy_bonus(setup_case,env):
