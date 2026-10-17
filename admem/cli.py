@@ -525,6 +525,8 @@ def main(argv=None):
     p.add_argument("--temperature", type=float, default=0.7, help="attacker-probe采样温度（默认0.7）")
     p.add_argument("--questions-per-pack", type=int,
                    help="覆盖config里的questions_per_pack（每个pack让attacker出几道题）")
+    p.add_argument("--attacker-view", choices=["full", "compact"],
+                   help="覆盖config里的attacker_view（bank/audit时给attacker的视图）")
     p.add_argument("--variants", type=int, default=5)
     p.add_argument("--states", help="probe的状态JSONL或export的collector根目录")
     p.add_argument("--parquet", action="store_true")
@@ -543,6 +545,8 @@ def main(argv=None):
         if a.questions_per_pack < 1:
             p.error("--questions-per-pack must be positive")
         cfg.questions_per_pack = a.questions_per_pack
+    if a.attacker_view:
+        cfg.attacker_view = a.attacker_view
     if a.command == "merge":
         from transformers import AutoModelForCausalLM, AutoTokenizer
         from peft import PeftModel
