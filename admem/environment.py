@@ -16,6 +16,32 @@ def boolean(value, field):
     return value[field]
 
 
+def rejection_reward(gate):
+    """把 gate 的拒绝原因映射成「离 accepted 还有多远」的梯度分。
+
+    阶梯严格单调（越晚失败 = 越接近合格）且全部低于 accepted 下限 0.5：
+      schema 非法 -0.1 → 形状错 0.0 → 内容空 0.15 → 答案错 0.25
+      → 太简单 0.35 → scope 偏 0.45 → accepted 0.5~1.0
+    """
+    reason = gate.get("reason")
+    if reason == "scope_or_completeness":
+        return 0.45
+    if reason == "closed_book":
+        return 0.35
+    if reason == "unsupported_answer":
+        return 0.25
+    if reason == "oracle_or_type":
+        oracle = gate.get("oracle") or {}
+        if not oracle.get("type_valid", True):
+            return 0.0   # 单 session 冒充 / 类型错
+        if not oracle.get("user_relevant", True) or not oracle.get("no_answer_leak", True):
+            return 0.0   # 无关 / 答案泄漏
+        if not oracle.get("answerable", True):
+            return 0.15  # 形状对，但答案不在引用证据里
+        return 0.0       # multi-session 的 E<2 sessions 硬检查（等同单 session）
+    return -0.1          # schema/evidence 非法（validate_question 抛出的各类错）
+
+
 class Environment:
     def __init__(self, cfg, counter, legacy):
         self.cfg, self.counter = cfg, counter
@@ -298,8 +324,9 @@ class Environment:
         for q in value["items"]:
             gate = self.gate(full, pack, q, state["date"], state["qtype"])
             if gate["status"] != "accepted":
-                rewards.append(-0.1)
-                details.append(gate)
+                r = rejection_reward(gate)
+                rewards.append(r)
+                details.append({**gate, "reward": r})
                 continue
             key = question_key(q)
             if key in seen:
