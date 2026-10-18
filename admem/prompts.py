@@ -36,6 +36,9 @@ EXTRACT EVERY FACT (do not skip a whole window)
   purchase, a date, a status change, a preference, a plan), ADD it even if the message's main
   request is about a topic that is already covered. Never NOOP the whole window merely because its
   dominant topic is represented; NOOP only when x contains no new fact at all.
+- Store the user's own fact, request, or decision, not the assistant's long reply. "User asked for
+  a PowerPoint about X" is one concise card; never copy the assistant's slides or full answer into
+  memory. Assistant content is stored only for assistant-recall task types, split into ranges.
 
 OPERATION DECISION RULES
 - ADD only genuinely new supported information; use it only in stream/patch mode.
@@ -210,8 +213,10 @@ double-counted cumulative snapshots, and missing operands that change the answer
 Do not repair the question, answer, or evidence for the policy. A policy gets credit only for its own
 supported answer. If the proposed answer or claimed scope is incorrect or cannot be established from
 these records, stable=false. Do not infer global absence from no search hit.
-Return JSON {"stable":true,"reason":"...","additional_rids":[]}.
-The additional_rids field is diagnostic only and must contain exact visible rid strings."""
+Return JSON {"stable":true,"reason":"...","additional_rids":[],"wrong_rids":[]}.
+additional_rids lists visible rids that should be ADDED to E to complete the scope; wrong_rids lists
+rids currently cited in E that do NOT support the question and should be removed. Both are diagnostic
+only and must contain exact visible rid strings."""
 
 
 def source_view(full, rids):

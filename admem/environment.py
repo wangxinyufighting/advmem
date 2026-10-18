@@ -142,6 +142,23 @@ class Environment:
             raise InvalidAction("Unknown/empty/repeated/overbudget evidence")
 
     def gate(self, full, pack, q, date, qtype):
+        result = self._gate_once(full, pack, q, date, qtype)
+        if result["status"] != "rejected" or result.get("reason") != "scope_or_completeness":
+            return result
+        # 一次修复尝试：screen 指出 wrong_rids / additional_rids，修 E 后重跑整条校验链。
+        screen = result.get("screen") or {}
+        wrong, extra = screen.get("wrong_rids", []), screen.get("additional_rids", [])
+        if not (isinstance(wrong, list) and isinstance(extra, list) and (wrong or extra)):
+            return result
+        if not set(wrong) <= set(q["E"]) or not set(extra) <= set(pack.rids):
+            return result
+        repaired = {**q, "E": sorted(set(q["E"]) - set(wrong) | set(extra))}
+        if not repaired["E"]:
+            return result
+        fixed = self._gate_once(full, pack, repaired, date, qtype)
+        return dict(fixed, repaired=True) if fixed["status"] == "accepted" else result
+
+    def _gate_once(self, full, pack, q, date, qtype):
         try:
             self.validate_question(q, pack, date, qtype)
         except InvalidAction as exc:
@@ -168,9 +185,10 @@ class Environment:
             rids = set(q["E"]) | {h.id for h in index.search(q["q"], 30, expand=0)}
             screen = self.judge(prompts.SCREEN, {"candidate": q, "history": prompts.source_view(full, rids)},
                                 "screen:" + key)
-            extra = screen.get("additional_rids", [])
-            if not isinstance(extra, list) or any(not isinstance(r, str) for r in extra) or not set(extra) <= rids:
-                raise Unknown("Screen returned invalid additional_rids")
+            for field in ("additional_rids", "wrong_rids"):
+                value = screen.get(field, [])
+                if not isinstance(value, list) or any(not isinstance(r, str) for r in value) or not set(value) <= rids:
+                    raise Unknown(f"Screen returned invalid {field}")
             result["screen"] = screen
             if not boolean(screen, "stable"):
                 return dict(result, status="rejected", reason="scope_or_completeness")

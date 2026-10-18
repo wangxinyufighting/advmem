@@ -192,11 +192,11 @@ class Config:
     judge_input_tokens: int = 30000
     window_tokens: int = 1800
     old_entries: int = 40
-    entry_tokens: int = 300
+    entry_tokens: int = 600
     timeline_tokens: int = 300
     catalog_entry_tokens: int = 96
     catalog_tokens: int = 3200
-    max_ops: int = 16
+    max_ops: int = 32
     neighbors: int = 8
     pack_chars: int = 48000
     questions_per_pack: int = 4
