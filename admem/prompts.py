@@ -56,9 +56,11 @@ OPERATION DECISION RULES
   change, MUST return {"ops":[]} rather than UPDATE merely to add duplicate provenance.
 - In refine mode, treat M_old as the complete candidate set. This rule overrides the generic NOOP rule:
   when a safe merge or deduplication would shorten it without losing facts, you MUST emit that
-  DELETE/UPDATE. Use NOOP only when no safe shortening exists (for example, there is no redundancy or
+  DELETE/UPDATE/MERGE. Use NOOP only when no safe shortening exists (for example, there is no redundancy or
   lossless consolidation). In refine mode, two identical cards are redundant: use DELETE the redundant
-  card, not NOOP; the resulting memory must be shorter. In refine mode ADD is forbidden: remove
+  card, not NOOP; the resulting memory must be shorter. When two cards cover the same entity, topic, or
+  timeline and one combined card can retain both without losing facts, use MERGE with ids = both cards;
+  this collapses two cards into one and shortens memory. In refine mode ADD is forbidden: remove
   redundancy only, and preserve all retained facts.
 - In stream/patch mode, use an empty ops list when the fact is already represented, irrelevant, or
   not safely supported.
@@ -84,13 +86,13 @@ STORED CATALOG
 IDENTIFIERS AND BUDGETS
 - The user payload contains editable_entry_ids and allowed_source_rids. Copy identifiers exactly from those
   fields; never invent, normalize, or copy illustrative identifiers from this instruction.
-- UPDATE/DELETE ids must be in editable_entry_ids.
+- UPDATE/DELETE/MERGE ids must be in editable_entry_ids.
 - ADD prov must be a nonempty list of distinct rids from allowed_source_rids.
-- UPDATE prov may contain rids from allowed_source_rids or the actual edited parents' prov, not another
-  old entry's prov. If the written text contains any new, changed, or otherwise supported detail taken
-  from x, prov MUST include the corresponding rid(s) from allowed_source_rids.
-  Use [] only when the replacement text relies entirely on the edited parents; the host retains their prov
-  automatically. Never use [] to hide a source fact that was copied into the new text.
+- UPDATE/MERGE prov may contain rids from allowed_source_rids or the actual edited/merged parents' prov,
+  not another old entry's prov. If the written text contains any new, changed, or otherwise supported
+  detail taken from x, prov MUST include the corresponding rid(s) from allowed_source_rids.
+  Use [] only when the replacement text relies entirely on the edited/merged parents; the host retains
+  their prov automatically. Never use [] to hide a source fact that was copied into the new text.
 - If a required id or provenance is not in the payload, use {"ops":[]} instead of guessing.
 - Never exceed max_ops or max_entry_tokens. Each operation may touch an old id at most once.
 - Treat max_entry_tokens as a hard validator, not a suggestion: one card covers one entity or
@@ -105,12 +107,13 @@ JSON SHAPES (replace every angle-bracket item; never output the placeholders)
 - New fact: {"ops":[{"op":"ADD","text":"<concise supported claim>","prov":["<rid from allowed_source_rids>"]}]}
 - Existing fact: {"ops":[{"op":"UPDATE","id":"<editable_entry_id>","text":"<supported replacement>","prov":[]}]}
 - Remove: {"ops":[{"op":"DELETE","id":"<editable_entry_id>"}]}
+- Merge two entries into one: {"ops":[{"op":"MERGE","ids":["<editable_entry_id>","<editable_entry_id>"],"text":"<combined supported text>","prov":[]}]}
 - No edit: {"ops":[]}
 
 OUTPUT CONTRACT (highest priority)
 Return exactly one JSON object with exactly one top-level key: ops.
 Each operation must use only its required fields:
-ADD: op, text, prov; UPDATE: op, id, text, prov; DELETE: op, id.
+ADD: op, text, prov; UPDATE: op, id, text, prov; MERGE: op, ids, text, prov; DELETE: op, id.
 The host assigns IDs for ADD. Do not output IDs for new entries.
 NOOP means {"ops":[]}; it is not an operation name. Do not output Markdown fences, <think> blocks,
 prose, unchanged entries, or a second object.
