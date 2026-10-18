@@ -447,9 +447,9 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
                 if any(group and group[0].get("success") is not None for group in groups) else None
             ),
             "empirical_at_least_one_success": mean(
-                float(any(x["success"] for x in group)) for group in groups
+                float(any(x.get("success") for x in group)) for group in groups
             ),
-            "unique_raw_mean": mean(len({x["raw_hash"] for x in group}) for group in groups),
+            "unique_raw_mean": mean(len({x["raw_hash"] for x in group if x.get("raw_hash")}) for group in groups),
             "nonzero_reward_variance_groups": sum(std > 1e-8 for std in reward_stds),
             "reward_std_mean": mean(reward_stds) if reward_stds else 0.0,
             "nonzero_effective_reward_variance_groups": sum(std > 1e-8 for std in effective_stds),
