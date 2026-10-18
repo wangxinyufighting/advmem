@@ -156,7 +156,7 @@ def _item_summary(scored):
 
 
 def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_packs=None,
-                       temperature=0.7, pack_sample=None, pack_seed=0):
+                       temperature=1.0, pack_sample=None, pack_seed=0):
     """诊断 attacker reward 是否有组内学习信号（GRPO 要求每个 prompt 内 reward 有方差）。
 
     对每个 pack 构造一个 attacker state（honor ``cfg.attacker_type_filter`` 等开关），
@@ -271,8 +271,11 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
     return summary
 
 
-def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
-    """运行 Builder probe，并保存逐样本、可审计的评估记录。"""
+def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperature=1.0):
+    """运行 Builder probe，并保存逐样本、可审计的评估记录。
+
+    采样温度默认 1.0，对齐 VERL GRPO 的 rollout.temperature，否则诊断比训练保守。
+    """
     from .common import rows
 
     out = Path(out)
@@ -298,7 +301,6 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None):
             path.unlink()
 
     aggregates = defaultdict(list)
-    temperature = 0.7
     # 瞬时云端失败不应中止整轮诊断：单样本记unknown继续，连续失败到上限才中止。
     fail_limit = max(1, int(os.getenv("PROBE_FAIL_LIMIT", "10")))
     consecutive_errors = 0

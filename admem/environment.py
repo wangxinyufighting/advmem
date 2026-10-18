@@ -297,7 +297,9 @@ class Environment:
                 constraint_reason = "NOOP must contain an empty ops list"
 
         base_reward = delta * faith_ratio + self.cfg.size_weight * (shrink_ratio - growth_ratio)
-        effective_reward = base_reward if constraint_ok else 0.0
+        # 违反 family/refine 约束罚负分而不是清零：清零会让「正确的NOOP(reward=0)」和
+        # 「违规的冗余编辑」同为0，GRPO优化effective_reward时无梯度可爬（noop_repeat病灶）。
+        effective_reward = base_reward if constraint_ok else -1.0
         return {"reward": base_reward, "effective_reward": effective_reward,
                 "family_constraint_pass": constraint_ok,
                 "family_constraint_reason": constraint_reason,

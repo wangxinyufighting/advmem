@@ -231,8 +231,8 @@ def test_builder_reward_uses_raw_action_no_fallback(setup_case,env):
     assert good['accuracy']==1 and good['faith'] and 0 < good['reward'] <= 1
 
 
-def test_refine_noop_keeps_raw_answer_reward_but_zeroes_effective_reward(setup_case,env):
-    """A correct-but-uncompressed refine proposal must not train as a success."""
+def test_refine_noop_penalizes_effective_reward(setup_case,env):
+    """A correct-but-uncompressed refine proposal must train as a failure."""
     full,_,_=setup_case
     state=state_for(env,setup_case)
     state['mode']='refine'
@@ -246,7 +246,7 @@ def test_refine_noop_keeps_raw_answer_reward_but_zeroes_effective_reward(setup_c
     assert result['legal'] and result['faith'] and result['accuracy']==1
     assert result['family_constraint_pass'] is False
     assert result['family_constraint_reason']=='memory was not shortened'
-    assert result['reward']==0 and result['effective_reward']==0
+    assert result['reward']==0 and result['effective_reward']==-1.0
 
 
 def test_refine_merge_preserves_effective_reward(setup_case,env):
@@ -270,7 +270,7 @@ def test_refine_merge_preserves_effective_reward(setup_case,env):
 
 
 def test_noop_repeat_rejects_redundant_update_in_effective_reward(setup_case,env):
-    """NOOP family must score an unnecessary update as zero effective reward."""
+    """NOOP family must score an unnecessary update as negative effective reward."""
     full,_,_=setup_case
     state=state_for(env,setup_case)
     state['M']=[{'id':'m1','text':"The user's cat is named Milo.",'prov':['s1:r1'],'kind':'card'}]
@@ -281,7 +281,7 @@ def test_noop_repeat_rejects_redundant_update_in_effective_reward(setup_case,env
     assert result['legal'] and result['faith'] and result['accuracy']==1
     assert result['family_constraint_pass'] is False
     assert result['family_constraint_reason']=='NOOP must contain an empty ops list'
-    assert result['reward']==0 and result['effective_reward']==0
+    assert result['reward']==0 and result['effective_reward']==-1.0
 
 
 def test_unfaithful_action_gets_no_accuracy_bonus(setup_case,env):

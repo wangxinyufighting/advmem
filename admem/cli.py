@@ -522,7 +522,7 @@ def main(argv=None):
     p.add_argument("--max-packs", type=int, help="attacker-probe：每个case取前N个pack")
     p.add_argument("--pack-sample", type=int, help="attacker-probe：每个case随机抽N个pack（比--max-packs更适合抽样测试）")
     p.add_argument("--pack-seed", type=int, default=0, help="attacker-probe随机抽pack的种子")
-    p.add_argument("--temperature", type=float, default=0.7, help="attacker-probe采样温度（默认0.7）")
+    p.add_argument("--temperature", type=float, default=1.0, help="probe/attacker-probe采样温度（对齐VERL rollout，默认1.0）")
     p.add_argument("--questions-per-pack", type=int,
                    help="覆盖config里的questions_per_pack（每个pack让attacker出几道题）")
     p.add_argument("--attacker-view", choices=["full", "compact"],
@@ -597,7 +597,7 @@ def main(argv=None):
     if a.command == "probe":
         if not a.states or a.samples < 1:
             p.error("probe requires --states and positive --samples")
-        print(run_probe(a.states, env, a.out, a.samples, a.builder_role, a.limit))
+        print(run_probe(a.states, env, a.out, a.samples, a.builder_role, a.limit, temperature=a.temperature))
         return
     if a.command == "attacker-probe":
         if not a.prepared:
