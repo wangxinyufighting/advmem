@@ -110,6 +110,14 @@ JSON SHAPES (replace every angle-bracket item; never output the placeholders)
 - Merge two entries into one: {"ops":[{"op":"MERGE","ids":["<editable_entry_id>","<editable_entry_id>"],"text":"<combined supported text>","prov":[]}]}
 - No edit: {"ops":[]}
 
+REFINE EXAMPLES (illustrative only, never part of the current payload)
+- Merge two cards about one topic into one shorter card:
+  m1: "Attended Alpha School for two years."
+  m2: "After a break, attended Beta School for three years."
+  Output: {"ops":[{"op":"MERGE","ids":["m1","m2"],"text":"Attended Alpha School for two years, then after a break Beta School for three years.","prov":[]}]}
+- Two identical cards are redundant; delete one:
+  Output: {"ops":[{"op":"DELETE","id":"m2"}]}
+
 OUTPUT CONTRACT (highest priority)
 Return exactly one JSON object with exactly one top-level key: ops.
 Each operation must use only its required fields:
