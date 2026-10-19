@@ -137,7 +137,7 @@ def test_builder_prompt_separates_new_entities_and_source_provenance(setup_case,
     assert 'one card can retain the old and new details without conflating them' in system
     assert 'adopted Buddy' in system and 'adopted Scout' in system
     assert 'prov MUST include the corresponding rid(s) from allowed_source_rids' in system
-    assert 'Use [] only when the replacement text relies entirely on the edited parents' in system
+    assert 'Use [] only when the replacement text relies entirely on the edited/merged parents' in system
 
 
 def test_assistant_task_prompt_preserves_assistant_attribution(setup_case,env):
