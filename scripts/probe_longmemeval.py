@@ -8,6 +8,7 @@ the existing CLI; it does not create synthetic probes or bootstrap mutations.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 import os
@@ -21,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from admem.audit_prompts import TYPES
 from admem.common import Config, read, rows, write, write_rows
 from admem.data import contexts
 
@@ -38,20 +40,30 @@ def parser():
     p.add_argument("--sizes", nargs=3, type=int, default=[300, 50, 150])
     p.add_argument("--out", required=True)
     p.add_argument("--split", choices=["train", "val"], default="val")
-    p.add_argument("--case-limit", type=int, default=1)
-    p.add_argument("--state-limit", type=int, default=16)
+    cases = p.add_mutually_exclusive_group()
+    cases.add_argument("--per-type", type=int, help="Cases per question type (default: 2 unless --keys/--case-limit is set)")
+    cases.add_argument("--case-limit", type=int, help="Total cases; disables the default per-type quota")
+    states = p.add_mutually_exclusive_group()
+    states.add_argument("--states-per-case", type=int, help="Maximum probe states per case (default: 16)")
+    states.add_argument("--state-limit", type=int, help="Global probe state budget instead of a per-case cap")
     p.add_argument("--samples", type=int, default=8)
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=0, help="State selection seed; not the model sampling seed")
     p.add_argument("--keys", nargs="+")
-    p.add_argument("--question-types", nargs="+")
+    p.add_argument("--question-types", nargs="+", choices=TYPES, help="Case types to include (default: all six)")
     return p
 
 
 def preflight(args):
     """Validate local inputs and role settings before starting any model request."""
-    if min(args.case_limit, args.state_limit, args.samples) < 1:
-        raise ValueError("--case-limit, --state-limit and --samples must be positive")
+    if args.per_type is None and args.case_limit is None and not args.keys:
+        args.per_type = 2
+    if args.states_per_case is None and args.state_limit is None:
+        args.states_per_case = 16
+    for name in ("per_type", "case_limit", "states_per_case", "state_limit", "samples"):
+        value = getattr(args, name)
+        if value is not None and value < 1:
+            raise ValueError(f"--{name.replace('_', '-')} must be positive")
     if not math.isfinite(args.temperature) or args.temperature < 0:
         raise ValueError("--temperature must be finite and nonnegative")
     if any(n < 0 for n in args.sizes):
@@ -107,20 +119,35 @@ def _run_cli(command, config, *arguments):
 
 
 def selected_cases(args):
-    selected = []
+    selected, counts = [], Counter()
+    required_types = args.question_types or TYPES
+    # contexts(per_type=...) groups seven prepare strata, including abstention.
+    # This runner deliberately applies its quota to the six actual question types.
     for context, full_path in contexts(args.prepared, args.split, args.case_limit,
                                        args.keys, args.question_types):
+        qtype = context["question_type"]
+        if qtype not in required_types:
+            raise ValueError(f"Unexpected question type in prepared context: {qtype}")
+        if args.per_type is not None and counts[qtype] >= args.per_type:
+            continue
         full = read(full_path)
         if full.get("fingerprint") != context.get("full_hash"):
             raise ValueError(f"Prepared full/context hash mismatch: {context['key']}")
         selected.append({"key": context["key"], "question_type": context["question_type"],
                          "full_hash": context["full_hash"], "split": context["split"],
                          "sessions": len(full.get("sessions", full.get("history", {}).get("haystack_sessions", [])))})
+        counts[qtype] += 1
+    if args.per_type is not None:
+        shortages = [f"{qtype}: {counts[qtype]}/{args.per_type}" for qtype in required_types
+                     if counts[qtype] < args.per_type]
+        if shortages:
+            raise ValueError(f"Insufficient cases in split={args.split} for --per-type: " + ", ".join(shortages) +
+                             "; check --keys/--question-types or choose a split with enough cases")
     if not selected:
         raise ValueError("No cases match --split/--keys/--question-types in the existing prepared split")
     if args.keys and set(args.keys) - {r["key"] for r in selected}:
-        raise ValueError("Some --keys are absent from the selected split/type or exceed --case-limit; adjust these flags")
-    if args.state_limit < len(selected):
+        raise ValueError("Some --keys are absent from the selected split/type or exceed the case quota; adjust these flags")
+    if args.state_limit is not None and args.state_limit < len(selected):
         raise ValueError("--state-limit must be at least the number of selected cases")
     return selected
 
@@ -137,7 +164,8 @@ def check_stage(folder, keys, *, bank=False):
             raise ValueError(f"No accepted generated questions for {key}; inspect {folder}/{key}/bank_log.json")
 
 
-def select_states(records, case_keys, limit, seed, fingerprint, *, full_hashes=None, split=None):
+def select_states(records, case_keys, limit, seed, fingerprint, *, full_hashes=None, split=None,
+                  per_case_limit=None):
     """Filter before limiting, then sample reproducibly in case round-robin order."""
     grouped = {key: [] for key in case_keys}
     counts = {key: {"all": 0, "available": 0, "selected": 0} for key in case_keys}
@@ -166,6 +194,8 @@ def select_states(records, case_keys, limit, seed, fingerprint, *, full_hashes=N
     for group in grouped.values():
         group.sort(key=lambda row: row["id"])
         rng.shuffle(group)
+        if per_case_limit is not None:
+            del group[per_case_limit:]
     selected = []
     for index in range(max(map(len, grouped.values()))):
         for key in case_keys:
@@ -188,10 +218,14 @@ def run(args):
         _run_cli("prepare", args.config, "--data", args.data, "--sizes", *args.sizes, "--out", args.prepared)
     cases = selected_cases(args)
     keys = [r["key"] for r in cases]
+    types_by_key = {r["key"]: r["question_type"] for r in cases}
+    type_counts = dict(Counter(types_by_key.values()))
+    state_limit = args.state_limit if args.state_limit is not None else args.states_per_case * len(cases)
     args.out.mkdir(parents=True)
     write(args.out / "selected_cases.json", cases)
     print(json.dumps({"nature": "real_history_stream/generated_bank", "roles": roles,
-                      "case_keys": keys, "split": args.split}, ensure_ascii=False), flush=True)
+                      "case_keys": keys, "case_counts_by_type": type_counts,
+                      "split": args.split}, ensure_ascii=False), flush=True)
     common = ["--prepared", args.prepared, "--split", args.split, "--keys", *keys]
     bank, build, collect = (args.out / name for name in ("bank", "build", "collected"))
     _run_cli("bank", args.config, *common, "--out", bank)
@@ -201,16 +235,22 @@ def run(args):
     check_stage(build, keys)
     exported, states = args.out / "states_all.jsonl", args.out / "states.jsonl"
     _run_cli("export", args.config, "--states", collect, "--role", "builder", "--split", args.split, "--out", exported)
-    selected, counts = select_states(rows(exported), keys, args.state_limit, args.seed, cfg.fingerprint(),
-                                    full_hashes={r["key"]: r["full_hash"] for r in cases}, split=args.split)
+    selected, counts = select_states(rows(exported), keys, state_limit, args.seed, cfg.fingerprint(),
+                                    full_hashes={r["key"]: r["full_hash"] for r in cases}, split=args.split,
+                                    per_case_limit=args.states_per_case)
+    # The family field controls reporting only; every state still uses the same reward.
+    selected = [{**row, "family": types_by_key[row["state"]["case_key"]]} for row in selected]
     write_rows(states, selected)
-    write(args.out / "state_selection.json", {"seed": args.seed, "limit": args.state_limit,
+    write(args.out / "state_selection.json", {"seed": args.seed, "limit": state_limit,
+          "states_per_case": args.states_per_case,
           "per_case": counts, "selected_state_ids": [r["id"] for r in selected]})
     probe = args.out / "probe"
     _run_cli("probe", args.config, "--states", states, "--samples", args.samples,
              "--temperature", args.temperature, "--builder-role", "BUILDER", "--out", probe)
     summary = {"nature": "real_history_stream/generated_bank", "split": args.split,
-               "selected_cases": cases, "state_counts": counts, "samples_per_state": args.samples,
+               "selected_cases": cases, "case_counts_by_type": type_counts,
+               "states_per_case": args.states_per_case, "state_limit": state_limit,
+               "state_counts": counts, "samples_per_state": args.samples,
                "state_selection_seed": args.seed, "requested_temperature": args.temperature,
                "config": str(args.config), "environment_fingerprint": cfg.fingerprint(),
                "states": str(states), "probe_summary": str(probe / "summary.json"),

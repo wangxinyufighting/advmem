@@ -466,15 +466,17 @@ CUDA_VISIBLE_DEVICES=4 python scripts/probe_longmemeval.py \
   --config configs/type_aware_4b_nogate.json \
   --data data/longmemeval/longmemeval_s.json \
   --prepared data/prepared_longmemeval \
-  --split val --question-types single-session-user \
-  --case-limit 1 --state-limit 16 --samples 8 --temperature 1.0 \
-  --out outputs/real_builder_probe_v1
+  --split val --per-type 2 --states-per-case 16 \
+  --samples 8 --temperature 1.0 \
+  --out outputs/real_builder_probe_all_types_v1
 ```
 
 - 首次运行默认按 `--sizes 300 50 150` 准备 500 个 case；大 JSON 的 prepare 需要 `ijson`。已有 prepared 目录会复用原划分，其他规模数据须明确传入匹配的 `--sizes`。
-- `selected_cases.json` 固定实际选中的 case；bank 和 build 使用同一批 key。`state_selection.json` 记录有测试题的真实状态数和本次采样数。
-- `--case-limit` 限制完整 case 数；`--state-limit` 仅限制最终 probe 状态数。建题库和构建记忆仍处理选中 case 的全部历史；一个 case 可能包含几十到几百个 session。
-- 先过滤无 tests 的状态，再按种子抽样；最多 16 个状态各采样 8 次，不意味着一轮有 16 个 case。`probe/summary.json` 和 `probe/samples.jsonl` 保存奖励统计及明细，分组为 `stream`，不再是 8 类合成 family。
+- 默认按六种实际 `question_type` 各选 2 个 case，共 12 个：`single-session-user`、`single-session-assistant`、`single-session-preference`、`multi-session`、`knowledge-update`、`temporal-reasoning`。这里不把 prepare 的 `abstention` 分层算作第七种题型。某一类不足 2 个会在建题库前报错，不会静默少跑。
+- `selected_cases.json` 固定实际选中的 case；bank 和 build 使用同一批 key。顶层 `summary.json` 的 `case_counts_by_type` 记录每类 case 数，`state_selection.json` 记录每个 case 的可评分状态数和本次采样数。
+- `--states-per-case 16` 表示每个 case 最多选 16 个有 tests 的状态，每个状态采样 8 次。12 个 case 最多为 192 个状态、1536 条候选；某个 case 可用状态不足时全部选取，不把空余额转给其他 case。建题库和构建记忆仍处理所选 case 的全部历史，一个 case 可能包含几十到几百个 session。
+- 先过滤无 tests 的状态，再按种子抽样；`probe/summary.json` 和 `probe/samples.jsonl` 保存奖励统计及明细。`family` 按 case 的六种题型汇总，仅用于诊断分组；底层状态仍为 `stream`，奖励公式不随题型变化。
+- 若只做单 case 冒烟测试，可改用 `--question-types single-session-user --case-limit 1 --state-limit 16`。`--case-limit` 与 `--per-type` 互斥；全局 `--state-limit` 与 `--states-per-case` 互斥。单独传 `--keys` 时处理全部指定 key，不启用默认每类 2 个的配额。
 - 沿用配置中的构建 fallback 设置；fallback 会影响后续状态的旧记忆，但每条 probe 候选仍按模型原始编辑评分，不使用 fallback 替它修复。
 - 默认只测自然构建阶段，不保证包含 patch/refine。若需要官方问题上的完整 QA 表现，使用前文的 `longmemeval-eval`；那是独立评测目标。
 
