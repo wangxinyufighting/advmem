@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 import random
 import sys
+import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from admem.audit_prompts import TYPES
@@ -144,7 +145,12 @@ def recorded_traces(case, pi, rows, full):
     paths.update(path.resolve() for path in (case / "pack_traces").glob(f"pack_{pi:05d}_attempt_*.json"))
     result = []
     for path in sorted(paths):
-        if not path.resolve().is_relative_to(case.resolve()) or not path.is_file():
+        # Path.is_relative_to and dict union both require Python 3.9.
+        try:
+            path.resolve().relative_to(case.resolve())
+        except ValueError:
+            continue
+        if not path.is_file():
             continue
         trace = read(path)
         if trace.get("case_key") != case.name or trace.get("pack_index") != pi:
@@ -235,17 +241,24 @@ def build_audits(bank_root, prepared, out, *, cache=None, question_types=None, k
                  "Legacy cache matches are unverified candidates, even if exactly one remains.",
                  "Unlinked trace files are unverified; linked traces include only matching earlier retries.",
                  "No prompt regeneration, official questions, model calls or automatic path-quality judgments are used."]}
-    for pack in pending:
-        pack.pop("_full")
-        pack.pop("_context")
-        pack["manual_review"] = {"cross_session_relation": None, "missing_context": None,
-                                 "hidden_content_needed": None, "supported_question_possible": None,
-                                 "gate_decision_reasonable": None, "notes": ""}
-        report_file = Path(pack["case_key"]) / f"pack_{pack['pack']:05d}.json"
-        write(out / report_file, pack)
-        index["packs"].append({k: pack[k] for k in ("case_key", "pack", "statuses", "reasons", "input_provenance")}
-                              | {"report_file": str(report_file)})
-    write(out / "index.json", index)
+    # Publish the complete report directory at once; a failed export must not
+    # leave an output folder that prevents the same command from being retried.
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=out.name + ".tmp-", dir=str(out.parent)) as staging:
+        staging = Path(staging)
+        for pack in pending:
+            pack.pop("_full")
+            pack.pop("_context")
+            pack["manual_review"] = {"cross_session_relation": None, "missing_context": None,
+                                     "hidden_content_needed": None, "supported_question_possible": None,
+                                     "gate_decision_reasonable": None, "notes": ""}
+            report_file = Path(pack["case_key"]) / f"pack_{pack['pack']:05d}.json"
+            write(staging / report_file, pack)
+            entry = {k: pack[k] for k in ("case_key", "pack", "statuses", "reasons", "input_provenance")}
+            entry["report_file"] = str(report_file)
+            index["packs"].append(entry)
+        write(staging / "index.json", index)
+        staging.rename(out)
     return index
 
 

@@ -181,3 +181,32 @@ def test_tampered_trace_prompt_fails_instead_of_claiming_exact_input(tmp_path):
     with pytest.raises(ValueError, match="prompt hash mismatch"):
         audit.build_audits(bank, prepared, out)
     assert not out.exists()
+
+
+def test_failed_export_cleans_staging_and_can_retry_same_output(tmp_path, monkeypatch):
+    logs = [{"pack": 0, "status": "empty"}, {"pack": 1, "status": "empty"}]
+    bank, prepared, out, _, _ = make_case(tmp_path, logs)
+    real_write = audit.write
+
+    def fail_on_index(path, value):
+        if Path(path).name == "index.json":
+            raise OSError("disk write failed")
+        real_write(path, value)
+
+    monkeypatch.setattr(audit, "write", fail_on_index)
+    with pytest.raises(OSError, match="disk write failed"):
+        audit.build_audits(bank, prepared, out)
+    assert not out.exists()
+    assert not list(out.parent.glob(out.name + ".tmp-*"))
+    monkeypatch.setattr(audit, "write", real_write)
+    result = audit.build_audits(bank, prepared, out)
+    assert len(result["packs"]) == 2
+    assert read(out / "index.json") == result
+
+
+def test_existing_partial_output_is_preserved(tmp_path):
+    bank, prepared, out, _, _ = make_case(tmp_path, [{"pack": 0, "status": "empty"}])
+    write(out / "partial.json", {"manual_notes": "keep this"})
+    with pytest.raises(ValueError, match="Output already exists"):
+        audit.build_audits(bank, prepared, out)
+    assert read(out / "partial.json") == {"manual_notes": "keep this"}
