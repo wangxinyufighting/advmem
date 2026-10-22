@@ -37,9 +37,12 @@ def bootstrap(full, full_path, context, memory, bank, env, collector, builder_ro
             state = builder_state(full, full_path, context, m, x, mode, tests, env, ids)
             raw = propose(state, env, builder_role, "bootstrap:" + digest([state, env.policy(builder_role).tag]))
             score = env.builder_score(full, state, raw)
-            verified = bool(score.get("legal") and score.get("faith") and score.get("accuracy") == 1)
+            verified = bool(score.get("legal") and score.get("faith") and score.get("accuracy") == 1
+                            and score.get("edit_quality_pass"))
             if mode == "refine":
-                verified = verified and score.get("after_tokens", 0) < score.get("before_tokens", 0)
+                # Refine demonstrations teach useful compression; a legal NOOP
+                # remains neutral in RL but is not a compression demonstration.
+                verified = verified and score.get("safe_compression", False)
             collector.save(state, raw if verified else None,
                            {"faith": score.get("faith", False), "tests_verified": verified, "mutation": name})
             stats["states"] += 1

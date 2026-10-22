@@ -37,30 +37,21 @@ def _answer_correct(result):
     return bool(accuracy == 1)
 
 
-def _family_constraint(result, raw, state, family):
-    """只检查 probe 的额外约束；未执行的阶段返回 None。"""
-    if "family_constraint_pass" in result:
-        return result.get("family_constraint_pass"), result.get("family_constraint_reason")
-    if not result.get("legal") or not result.get("faith"):
-        return None, None
-
-    mode = state.get("mode")
-    if mode == "refine":
-        before = result.get("before_tokens")
-        after = result.get("after_tokens")
-        if before is None or after is None:
-            return None, "missing token counts"
-        ok = after < before
-        return ok, None if ok else "memory was not shortened"
-
-    if family == "noop_repeat":
-        try:
-            ok = parse(raw).get("ops") == []
-        except Exception:
-            return False, "invalid proposal JSON"
-        return ok, None if ok else "NOOP must contain an empty ops list"
-
-    return True, None
+def _edit_quality_constraint(result):
+    """训练与 probe 共用编辑质量；family 仅用于汇总分组。"""
+    ok = result.get("edit_quality_pass")
+    if ok is None or ok:
+        return ok, None
+    reasons = []
+    if result.get("faith") is False:
+        reasons.append("not all written entries are faithful")
+    if result.get("loss", 0) > 0:
+        reasons.append("previously correct answers were lost")
+    if result.get("retention_pass") is False:
+        reasons.append("key information was not retained")
+    if result.get("redundancy_ratio", 0) > 0:
+        reasons.append("redundant or ineffective edits")
+    return False, result.get("edit_quality_reason") or "; ".join(reasons) or "edit quality check failed"
 
 
 def make_suite(env, out, variants=5):
@@ -80,7 +71,7 @@ def make_suite(env, out, variants=5):
                 sources = [f"For the {name} program, my initial weekly training schedule was Monday and Friday.",
                            f"Starting March 1, I train Tuesday, Thursday, and Saturday instead for the {name} program."]
                 typ, mode = "knowledge-update", "patch"
-                mem = [{"id": "m1", "text": f"In January the user trained Monday and Friday for the {name} program.", "prov": ["s1:r1"], "kind": "card"}]
+                mem = [{"id": "m1", "text": f"The user's initial weekly training schedule for the {name} program was Monday and Friday.", "prov": ["s1:r1"], "kind": "card"}]
                 tests = [(f"What were my original training days in the {name} program?", "Monday and Friday", ["s1:r1"]),
                          (f"What are my training days in the {name} program after March 1?", "Tuesday, Thursday, and Saturday", ["s2:r1"])]
                 raw_ids, old_ids = ["s2:r1"], ["m1"]
@@ -322,26 +313,32 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
                 raw_hash = hashlib.sha256(
                     raw_text.encode("utf-8")
                 ).hexdigest()[:16]
-                result = dict(env.builder_score(full, row["state"], raw, family=family))
+                result = dict(env.builder_score(full, row["state"], raw))
                 result.pop("proposed", None)
 
                 legal = result.get("legal")
                 faith = result.get("faith")
                 answer_correct = _answer_correct(result)
-                family_ok, family_reason = _family_constraint(
-                    result, raw, row["state"], family
-                )
+                quality_ok, quality_reason = _edit_quality_constraint(result)
                 success = bool(
                     legal
                     and faith
                     and answer_correct is True
-                    and family_ok is True
+                    and quality_ok is True
                 )
 
                 result.update({
                     "answer_correct": answer_correct,
-                    "family_constraint_pass": family_ok,
-                    "family_constraint_reason": family_reason,
+                    # Legacy column names remain readable, but carry no family-specific rule.
+                    "family_constraint_pass": quality_ok,
+                    "family_constraint_reason": quality_reason,
+                    "edit_quality_pass": quality_ok,
+                    "edit_quality_reason": quality_reason,
+                    "noop": parse(raw).get("ops") == [] if legal else None,
+                    "compression_success": (
+                        bool(result.get("safe_compression") and result.get("shrink_ratio", 0) > 0)
+                        if row["state"]["mode"] == "refine" and legal else None
+                    ),
                     "success": success,
                     "status": "ok",
                 })
@@ -352,6 +349,7 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
                 record = {
                     "state_id": row["id"],
                     "family": family,
+                    "mode": row["state"]["mode"],
                     "sample_idx": i,
                     "temperature": temperature,
                     "nonce": nonce,
@@ -384,6 +382,7 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
             record = {
                 "state_id": row["id"],
                 "family": family,
+                "mode": row["state"]["mode"],
                 "sample_idx": i,
                 "temperature": temperature,
                 "nonce": nonce,
@@ -401,8 +400,14 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
                 "success": result.get("success"),
                 "status": result.get("status", "ok"),
             }
-            # 保留 accuracy、token 数、答案检查等已有诊断字段。
-            for key in ("accuracy", "before_tokens", "after_tokens", "answer_checks"):
+            # 保存每个奖励分项及对应证据，便于区分内容错误、压缩、冗余和长度差异。
+            for key in (
+                "accuracy", "before_accuracy", "delta", "gain", "loss", "before_scores", "test_scores",
+                "faith_ratio", "faith_scores", "before_tokens", "after_tokens", "growth_ratio",
+                "shrink_ratio", "compression_eligible", "safe_compression", "reward_components", "retention_pass",
+                "information_loss", "retention_checks", "redundancy_ratio", "redundant_ops",
+                "edit_quality_pass", "edit_quality_reason", "noop", "compression_success", "answer_checks",
+            ):
                 if key in result:
                     record[key] = result[key]
 
@@ -424,6 +429,14 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
         checked = [x[key] for x in values if x.get(key) is not None]
         return mean(float(bool(x)) for x in checked) if checked else None
 
+    def all_sample_pass_rate(values, key):
+        # Unknown stays null in samples; this is the observed pass fraction over all attempts.
+        return sum(x.get(key) is True for x in values) / len(values) if values else None
+
+    def numeric_mean(values, key):
+        checked = [x[key] for x in values if x.get(key) is not None]
+        return mean(checked) if checked else None
+
     def reward_values(group, key):
         return [float(x[key]) for x in group if x.get(key) is not None]
 
@@ -436,15 +449,31 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
             "family": family,
             "states": len(groups),
             "samples_per_state": samples,
-            "legal_rate": rate(values, "legal"),
-            "faith_rate_all_samples": rate(values, "faith"),
+            "samples": len(values),
+            "unknown_samples": sum(x.get("status") == "unknown" for x in values),
+            "legal_evaluated_samples": sum(x.get("legal") is not None for x in values),
+            "faith_evaluated_samples": sum(x.get("faith") is not None for x in values),
+            "answer_evaluated_samples": sum(x.get("answer_correct") is not None for x in values),
+            "retention_evaluated_samples": sum(x.get("retention_pass") is not None for x in values),
+            "legal_rate": all_sample_pass_rate(values, "legal"),
+            "legal_rate_evaluated": rate(values, "legal"),
+            "faith_rate_all_samples": all_sample_pass_rate(values, "faith"),
+            "faith_rate_evaluated": rate(values, "faith"),
+            "faith_ratio_mean": numeric_mean(values, "faith_ratio"),
             "answer_correct_rate": rate(values, "answer_correct"),
             "family_constraint_rate": rate(values, "family_constraint_pass"),
-            "success_rate_all_samples": rate(values, "success"),
+            "edit_quality_rate": rate(values, "edit_quality_pass"),
+            "retention_pass_rate": rate(values, "retention_pass"),
+            "compression_success_rate": rate(values, "compression_success"),
+            "noop_rate": rate(values, "noop"),
+            "gain_mean": numeric_mean(values, "gain"),
+            "loss_mean": numeric_mean(values, "loss"),
+            "information_loss_mean": numeric_mean(values, "information_loss"),
+            "redundancy_ratio_mean": numeric_mean(values, "redundancy_ratio"),
+            "success_rate_all_samples": all_sample_pass_rate(values, "success"),
             "first_sample_success_rate": (
-                mean([float(group[0]["success"]) for group in groups
-                      if group and group[0].get("success") is not None])
-                if any(group and group[0].get("success") is not None for group in groups) else None
+                mean(float(group[0].get("success") is True) for group in groups if group)
+                if any(groups) else None
             ),
             "empirical_at_least_one_success": mean(
                 float(any(x.get("success") for x in group)) for group in groups
@@ -463,5 +492,11 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
         "model": env.policy(role).client.model,
         "temperature": temperature,
         "skipped_empty_test_states": empty_test,
+        "metric_notes": {
+            "all_sample_rates": "Observed passes divided by all attempts; unknowns remain null in samples and are counted separately.",
+            "conditional_rates": "Answer, edit quality, retention, compression and noop rates use only evaluated samples.",
+            "family_constraint": "Compatibility alias for generic edit_quality_pass; family is used only for grouping.",
+            "compression_success": "Refine only: safe positive shortening. A valid NOOP can succeed with zero reward and no compression.",
+        },
     })
     return report

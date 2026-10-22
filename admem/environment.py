@@ -8,6 +8,7 @@ from .common import Remote, Unknown, InvalidAction, digest, messages, parse
 from . import prompts
 from .audit_prompts import TYPES, GATE_ORACLE_SYSTEM, GATE_SUPPORT_SYSTEM, personal_score
 from .store import apply, augment, question_key, raw_chunks, text_size
+from .edit_checks import assess_edits
 
 
 def boolean(value, field):
@@ -245,71 +246,78 @@ class Environment:
         return result
 
     def builder_score(self, full, state, completion, family=None):
-        """评估一次 Builder 提议，返回原始与约束后的奖励。
+        """统一训练/probe 奖励；family 仅为兼容旧调用保留，不参与评分。
 
-        reward = Δ可答性×忠实度 + 尺寸项。Δ = 编辑前后的可答性变化：
-        存对 +1、误删 −1、错过 0。尺寸项 = 无损缩短奖励 − 增长惩罚。
-        effective_reward 在违反 family/refine 约束时置 0。
+        答题改善、遗忘、不忠实、关键信息丢失和冗余编辑各自计分。
+        正向答题奖励要求所有写入忠实；压缩还要求没有已答对题目退化，
+        并通过被编辑旧条目的事实保留检查。合法 NOOP 的奖励恒为 0。
         """
+        cfg = self.cfg
+        # 每项负奖励有界；非法输出严格低于合法输出的理论下界，避免
+        # 学到用坏 JSON 逃避信息损失/忠实度惩罚。
+        invalid_reward = -(cfg.builder_loss_weight + cfg.builder_faith_weight
+                           + cfg.builder_retention_weight + cfg.size_weight
+                           + cfg.builder_redundancy_weight * cfg.max_ops + 1.0)
         try:
             action = parse(completion)
             proposed, changed = apply(state["M"], action, mode=state["mode"], visible_ids=state["old_ids"],
                 source_ids=[x["rid"] for x in state["x"]], full_ids=full.rounds, counter=self.counter,
-                limit=state["entry_limit"], max_ops=self.cfg.max_ops)
+                limit=state["entry_limit"], max_ops=cfg.max_ops)
         except InvalidAction as exc:
-            return {"reward": -1.0, "effective_reward": -1.0,
-                    "legal": False, "family_constraint_pass": None,
-                    "reason": str(exc)}
-        faith_scores = self.faith_scores(full, changed)
-        if faith_scores and not any(faith_scores):
-            # 全部改动条目不忠实：整单判0（保留原二值语义，不给部分分）。
-            return {"reward": 0.0, "effective_reward": 0.0,
-                    "legal": True, "faith": False,
-                    "family_constraint_pass": None,
-                    "faith_reason": "No changed entry is faithful",
-                    "reason": "No changed entry is faithful"}
-        faith_ratio = (sum(faith_scores) / len(faith_scores)) if faith_scores else 1.0
+            return {"reward": invalid_reward, "effective_reward": invalid_reward,
+                    "legal": False, "edit_quality_pass": None,
+                    "legal_reason": str(exc), "reason": str(exc)}
         tests = state["tests"]
         if not tests:
             raise Unknown("Empty test set: no answer-retention reward is defined")
 
-        # Δ：编辑前后的可答性变化（不对称：摧毁为负、错过为0、改善为正）。
+        faith_scores = self.faith_scores(full, changed)
+        faithful = all(faith_scores)  # 空写入（NOOP/纯 DELETE）不产生新断言。
+        faith_ratio = sum(faith_scores) / len(faith_scores) if faith_scores else 1.0
+        faith_reason = ("No written entry" if not faith_scores else "All written entries supported"
+                        if faithful else f"{len(faith_scores) - sum(faith_scores)} of {len(faith_scores)} written entries unsupported")
+
         before_scores = [self.answer(state["M"], q)["correct"] for q in tests]
-        after_scores = [self.answer(proposed, q)["correct"] for q in tests]
+        # NOOP 不重复调用有随机性的 Reader/Judge，避免凭环境噪声得到奖励。
+        after_scores = ([self.answer(proposed, q)["correct"] for q in tests]
+                        if action["ops"] else list(before_scores))
         before_acc = sum(before_scores) / len(tests)
         after_acc = sum(after_scores) / len(tests)
-        delta = after_acc - before_acc
+        gain = sum(not b and a for b, a in zip(before_scores, after_scores)) / len(tests)
+        loss = sum(b and not a for b, a in zip(before_scores, after_scores)) / len(tests)
+        checks = assess_edits(self, full, state, action, proposed, changed)
 
         before_size = text_size(state["M"], self.counter)
         after_size = text_size(proposed, self.counter)
         source_size = sum(self.counter.count(x["text"]) for x in state["x"])
-        # 尺寸项：增长惩罚（相对本次source）；无损缩短才奖励（相对既有M）。
-        growth_ratio = max(0.0, (after_size - before_size) / max(1, source_size))
-        shrink_ratio = max(0.0, (before_size - after_size) / max(1, before_size)) if delta >= 0 else 0.0
-
-        constraint_ok, constraint_reason = True, None
-        if state["mode"] == "refine" and after_size >= before_size:
-            constraint_ok = False
-            constraint_reason = "memory was not shortened"
-        if family == "noop_repeat":
-            if action.get("ops") != []:
-                constraint_ok = False
-                constraint_reason = "NOOP must contain an empty ops list"
-
-        base_reward = delta * faith_ratio + self.cfg.size_weight * (shrink_ratio - growth_ratio)
-        # 违反 family/refine 约束罚负分而不是清零：清零会让「正确的NOOP(reward=0)」和
-        # 「违规的冗余编辑」同为0，GRPO优化effective_reward时无梯度可爬（noop_repeat病灶）。
-        effective_reward = base_reward if constraint_ok else -1.0
-        return {"reward": base_reward, "effective_reward": effective_reward,
-                "family_constraint_pass": constraint_ok,
-                "family_constraint_reason": constraint_reason,
-                "legal": True, "faith": True, "faith_ratio": faith_ratio,
-                "faith_scores": faith_scores, "accuracy": after_acc,
-                "delta": delta, "before_accuracy": before_acc,
-                "test_scores": after_scores, "before_scores": before_scores,
+        editable_size = text_size([e for e in state["M"] if e["id"] in state["old_ids"]], self.counter)
+        # 对同一 state 使用固定分母。refine 的 x 为空时也不因一个 token
+        # 的增长产生过大罚分；上限保证非法 JSON 的奖励下界有效。
+        growth_ratio = min(1.0, max(0.0, (after_size - before_size) / max(1, source_size, editable_size)))
+        shrink_ratio = max(0.0, (before_size - after_size) / max(1, before_size))
+        compression_eligible = faithful and loss == 0 and checks["retention_pass"]
+        safe_compression = compression_eligible and shrink_ratio > 0
+        components = {
+            "gain": cfg.builder_gain_weight * gain if faithful else 0.0,
+            "loss": -cfg.builder_loss_weight * loss,
+            "faith": -cfg.builder_faith_weight * (1.0 - faith_ratio),
+            "retention": -cfg.builder_retention_weight * checks["information_loss"],
+            "compression": cfg.size_weight * shrink_ratio if safe_compression else 0.0,
+            "growth": -cfg.size_weight * growth_ratio,
+            # 按冗余操作数处罚，加入其他无害操作不能稀释这项罚分。
+            "redundancy": -cfg.builder_redundancy_weight * len(checks["redundant_ops"]),
+        }
+        reward = sum(components.values())
+        quality_ok = faithful and loss == 0 and checks["retention_pass"] and not checks["redundant_ops"]
+        return {"reward": reward, "effective_reward": reward, "reward_components": components,
+                "edit_quality_pass": quality_ok, "legal": True, "faith": faithful,
+                "faith_reason": faith_reason, "faith_ratio": faith_ratio, "faith_scores": faith_scores,
+                "accuracy": after_acc, "before_accuracy": before_acc, "delta": after_acc - before_acc,
+                "gain": gain, "loss": loss, "test_scores": after_scores, "before_scores": before_scores,
                 "before_tokens": before_size, "after_tokens": after_size,
                 "growth_ratio": growth_ratio, "shrink_ratio": shrink_ratio,
-                "proposed": proposed}
+                "compression_eligible": compression_eligible, "safe_compression": safe_compression,
+                "noop": not action["ops"], **checks, "proposed": proposed}
 
     def attacker_score(self, full, state, completion):
         try:

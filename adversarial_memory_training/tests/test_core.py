@@ -224,15 +224,15 @@ def state_for(env, setup_case):
 def test_builder_reward_uses_raw_action_no_fallback(setup_case,env):
     full,_,_=setup_case;state=state_for(env,setup_case)
     bad=env.builder_score(full,state,'garbage')
-    assert bad['reward']==-1 and not bad['legal']
+    assert bad['reward'] < -1 and not bad['legal']
     noop=env.builder_score(full,state,'{"ops":[]}')
     assert noop['accuracy']==0 and noop['reward']==0
     good=env.builder_score(full,state,json.dumps({'ops':[{'op':'ADD','text':'Milo','prov':['s1:r1']}]}))
     assert good['accuracy']==1 and good['faith'] and 0 < good['reward'] <= 1
 
 
-def test_refine_noop_penalizes_effective_reward(setup_case,env):
-    """A correct-but-uncompressed refine proposal must train as a failure."""
+def test_refine_noop_has_neutral_reward(setup_case,env):
+    """A legal NOOP preserves memory and is neutral even in refine mode."""
     full,_,_=setup_case
     state=state_for(env,setup_case)
     state['mode']='refine'
@@ -244,9 +244,8 @@ def test_refine_noop_penalizes_effective_reward(setup_case,env):
     state['old_ids']=['m1','m2']
     result=env.builder_score(full,state,'{"ops":[]}')
     assert result['legal'] and result['faith'] and result['accuracy']==1
-    assert result['family_constraint_pass'] is False
-    assert result['family_constraint_reason']=='memory was not shortened'
-    assert result['reward']==0 and result['effective_reward']==-1.0
+    assert result['edit_quality_pass'] is True
+    assert result['reward']==0 and result['effective_reward']==0
 
 
 def test_refine_merge_preserves_effective_reward(setup_case,env):
@@ -264,13 +263,13 @@ def test_refine_merge_preserves_effective_reward(setup_case,env):
                     'text':"The user's cat is named Milo.",'prov':[]}]}
     result=env.builder_score(full,state,json.dumps(action))
     assert result['legal'] and result['faith'] and result['accuracy']==1
-    assert result['family_constraint_pass'] is True
+    assert result['edit_quality_pass'] is True
     assert result['after_tokens']<result['before_tokens']
     assert result['effective_reward']==result['reward'] and result['effective_reward']>0
 
 
-def test_noop_repeat_rejects_redundant_update_in_effective_reward(setup_case,env):
-    """NOOP family must score an unnecessary update as negative effective reward."""
+def test_redundant_update_penalty_is_independent_of_family(setup_case,env):
+    """The same redundant update receives the same penalty in probe and training."""
     full,_,_=setup_case
     state=state_for(env,setup_case)
     state['M']=[{'id':'m1','text':"The user's cat is named Milo.",'prov':['s1:r1'],'kind':'card'}]
@@ -279,15 +278,17 @@ def test_noop_repeat_rejects_redundant_update_in_effective_reward(setup_case,env
                     'text':"The user's cat is named Milo.",'prov':['s1:r1']}]}
     result=env.builder_score(full,state,json.dumps(action),family='noop_repeat')
     assert result['legal'] and result['faith'] and result['accuracy']==1
-    assert result['family_constraint_pass'] is False
-    assert result['family_constraint_reason']=='NOOP must contain an empty ops list'
-    assert result['reward']==0 and result['effective_reward']==-1.0
+    assert result['edit_quality_pass'] is False
+    assert result['redundant_ops']
+    assert result['reward']==result['effective_reward'] < 0
+    training=env.builder_score(full,state,json.dumps(action))
+    assert training['reward']==result['reward']
 
 
 def test_unfaithful_action_gets_no_accuracy_bonus(setup_case,env):
     full,_,_=setup_case;state=state_for(env,setup_case)
     result=env.builder_score(full,state,json.dumps({'ops':[{'op':'ADD','text':'Milo UNSUPPORTED','prov':['s1:r1']}]}))
-    assert result['reward']==0 and result['faith'] is False
+    assert result['reward'] < 0 and result['faith'] is False
 
 
 def test_empty_tests_not_vacuous_reward(setup_case,env):
@@ -423,8 +424,14 @@ def test_raw_data_target_changes_do_not_change_full(case):
     assert Full.build(case).fingerprint==before.fingerprint
 
 
-def test_pipeline_patch_and_no_reward_for_fallback(setup_case,env,tmp_path):
+def test_pipeline_patch_and_no_reward_for_fallback(setup_case,env,tmp_path,monkeypatch):
     full,path,ctx=setup_case;env.control['build_noop']=True
+    # A stream NOOP is rejected when memory is empty. Keep memory empty for
+    # the intended audit/patch exercise instead of fixing it via raw fallback.
+    env.cfg.fallback=False
+    # The synthetic attacker only supplies one-session evidence. Pin its task
+    # type rather than depending on a configuration-hash-driven sampling choice.
+    monkeypatch.setattr('admem.pipeline.policy_type', lambda *args: 'single-session-user')
     out=tmp_path/'run';collect=Collector(tmp_path/'states')
     result=run_case(full,path,ctx,env,out,collect=collect)
     assert result['Q_size']==1 and result['Q_solved']==1
@@ -505,8 +512,14 @@ def test_probe_suite_no_official_target_and_modes(env,tmp_path):
     assert all('TARGET_CANARY' not in json.dumps(r['prompt']) for r in suite)
 
 
-def test_bootstrap_constructs_reward_bearing_states(setup_case,env,tmp_path):
+def test_bootstrap_constructs_reward_bearing_states(setup_case,env,tmp_path,monkeypatch):
     full,path,ctx=setup_case
+    # This test concerns collected state coverage, not the semantic edit judge.
+    # Semantic preservation/novelty verdicts have dedicated regression tests.
+    monkeypatch.setattr('admem.environment.assess_edits', lambda *args: {
+        'retention_pass': True, 'information_loss': 0.0, 'retention_checks': [],
+        'redundancy_ratio': 0.0, 'redundant_ops': [],
+    })
     collector=Collector(tmp_path/'collected')
     result=bootstrap(full,path,ctx,memory(),[q()],env,collector,limit=1)
     assert result['states']==3

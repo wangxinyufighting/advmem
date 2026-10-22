@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import os
 import sys
@@ -204,6 +205,11 @@ class Config:
     refine_rounds: int = 1
     replay_questions: int = 12
     size_weight: float = 0.2
+    builder_gain_weight: float = 1.0
+    builder_loss_weight: float = 2.0
+    builder_faith_weight: float = 2.0
+    builder_retention_weight: float = 2.0
+    builder_redundancy_weight: float = 0.1
     gate_mode: str = "full"
     defect_mode: str = "strict"  # strict 是v1；direct另作诊断性扩展。
     fallback: bool = True
@@ -237,6 +243,10 @@ class Config:
                    c.questions_per_pack, c.sweeps]
         if min(numeric) < 1 or c.refine_rounds < 0 or not 0 <= c.size_weight <= 1:
             raise ValueError("Invalid budgets")
+        reward_weights = [c.builder_gain_weight, c.builder_loss_weight, c.builder_faith_weight,
+                          c.builder_retention_weight, c.builder_redundancy_weight]
+        if any(not math.isfinite(w) or w < 0 for w in reward_weights):
+            raise ValueError("Builder reward weights must be finite and nonnegative")
         return c
 
     def fingerprint(self):

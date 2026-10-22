@@ -406,6 +406,49 @@ pytest -q
 ```
 
 **没有在交付环境中运行真实LongMemEval_S、远端LLM或真实本地embedding/cross-encoder权重。**因此没有提供虚构的目标正确率、真实case的最小N或attacker覆盖率。代码接口和离线逻辑已测试，模型/网络兼容性及正式研究指标需按上面的命令在实际环境中测量。
-# advmem
-# advmem
-# advmem
+## 12. Builder 奖励与 Probe 诊断
+
+`admem/environment.py:builder_score` 是 probe、在线 GRPO 和 VERL 的共同评分入口。
+`family` 只用于 probe 汇总，`reward` 和 `effective_reward` 返回相同的通用评分。
+合法 NOOP（包括 refine）得 0 分。默认奖励为：
+
+```text
+R = 1.0 × gain × all_faithful
+    - 2.0 × loss
+    - 2.0 × (1 - faith_ratio)
+    - 2.0 × information_loss
+    + 0.2 × safe_shrink_ratio
+    - 0.2 × growth_ratio
+    - 0.1 × redundant_operation_count
+```
+
+- `gain` / `loss`：同一组测试中，错→对 / 对→错的题数分别除以总题数。即使平均正确率不变，也会独立惩罚遗忘。
+- `faith`：`all(faith_scores)`；`faith_ratio` 另行记录。NOOP、纯 DELETE 没有新断言，忠实度视为通过，但 DELETE 必须检查信息保留。`faith_gate: false` 只控制构建时的执行门控，不关闭训练/probe 奖励中的忠实度检查。
+- `information_loss`：对 DELETE/UPDATE/MERGE 涉及的旧条目，依据原文列出必须保留的原子事实，再在编辑后的记忆中逐项寻找文本证据。原文支持的纠错使用正确事实，历史上成立的旧状态仍需保留。相同文本的存活副本直接通过；比例的分母来自需要语义检查的事实清单。
+- `safe_shrink_ratio`：仅在所有写入忠实、`loss == 0` 且事实保留检查通过时，奖励 `(before_tokens-after_tokens)/before_tokens` 的正值。单纯减少条目数不等于缩短文本。
+- `growth_ratio`：增长 token 数除以本轮来源与可编辑旧记忆 token 数的较大者，上限为 1，避免 refine 的空来源导致异常大罚分。
+- 冗余判断不使用 probe 类型或目标问答：重复 ADD、仅改来源的 UPDATE、没有信息增益且没有缩短文本的等价改写会被处罚；安全缩短的 UPDATE/MERGE 不视为无效编辑。按冗余操作数扣分，不能靠增加其他操作稀释惩罚。
+
+权重对应配置项 `builder_gain_weight`、`builder_loss_weight`、`builder_faith_weight`、
+`builder_retention_weight`、`builder_redundancy_weight`；长度项沿用 `size_weight`。
+上述默认权重尚未经过真实数据调优。非法动作的分数低于这些配置下合法动作的理论下界。
+
+事实清单和覆盖检查使用 JUDGE，增加的调用遵循现有缓存机制。覆盖检查按完整条目分批，只有全部必需事实找到证据才提前通过；缺失判定会遍历全部候选记忆，不把检索未命中当作已丢失。不截断待检查的旧条目或原文，预算/接口/返回结构错误记为 Unknown。语义判官仍可能误判；跨批次才能联合推出的同一事实可能被保守判为缺失，因此这不是无损性的形式化证明。
+
+`samples.jsonl` 保存 `reward_components`、`gain/loss`、`faith_scores/faith_ratio`、
+`retention_checks`、`redundant_ops` 等明细。`summary.json` 中：
+
+- `faith_rate_all_samples` 是全部尝试中严格忠实的已观测比例；同时报告 `unknown_samples`、已评估数量和 `faith_rate_evaluated`。Unknown 样本的 reward 仍为 null，不作为 0 参与训练或方差计算。
+- `success_rate_all_samples` 需要合法、严格忠实、所有测试答对及通用编辑质量通过；refine 的 NOOP 可以满足这些条件。
+- `compression_success_rate` 单独统计 refine 是否安全缩短；NOOP 不计为压缩成功。
+- 旧字段 `family_constraint_rate` 为通用 `edit_quality_rate` 的兼容别名，不再执行 family 专属约束。
+
+修改奖励代码或配置后重新生成状态（环境指纹会变化），使用新的输出目录：
+
+```bash
+python -m admem.cli probe-suite --config configs/type_aware_4b_nogate.json --out outputs/suite_v4
+CUDA_VISIBLE_DEVICES=4 python -m admem.cli probe --config configs/type_aware_4b_nogate.json \
+  --states outputs/suite_v4/probes.jsonl --samples 8 --out outputs/builder_probe_v8
+```
+
+这会调用配置好的模型服务；离线回归测试不代表真实 Qwen Builder 已通过这些场景。

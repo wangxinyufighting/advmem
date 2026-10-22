@@ -184,9 +184,9 @@ def main(argv=None):
                             if len(completion) >= a.max_new_tokens and completion[-1] != tokenizer.eos_token_id:
                                 reward_text += "\n[TRUNCATED_OUTPUT]"
                             detail = env.score(full, state, reward_text)
-                            # Builder constraints (for example refine/no-op) are encoded in
-                            # effective_reward.  The raw reward intentionally remains in the
-                            # detail payload for diagnostics, but must not drive GRPO.
+                            # Probe and training share generic Builder quality checks.
+                            # Keep effective_reward as the optimization interface;
+                            # all component diagnostics remain in the detail payload.
                             if "effective_reward" not in detail:
                                 raise Unknown("Reward detail missing effective_reward")
                             reward = float(detail["effective_reward"])
