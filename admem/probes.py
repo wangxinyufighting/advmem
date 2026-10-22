@@ -272,8 +272,6 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
     records = list(rows(records))
-    if limit is not None:
-        records = records[:limit]
     if not records:
         raise ValueError("No probe states")
     empty_test = sum(1 for r in records if not r["state"].get("tests"))
@@ -283,6 +281,10 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
             "No probe states with non-empty tests; the answer-retention reward "
             "requires test questions (check that `bank` produced accepted questions)"
         )
+    # Collected real-history windows often have no eligible bank question.
+    # Apply the probe budget to scoreable states, not hash-ordered empty ones.
+    if limit is not None:
+        records = records[:limit]
 
     # 每次 probe 使用新的输出目录；若目录已存在，避免旧样本混入本次汇总。
     samples_path = out / "samples.jsonl"

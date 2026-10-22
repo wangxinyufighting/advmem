@@ -100,3 +100,23 @@ def test_suite_original_schedule_does_not_claim_completed_training(env, tmp_path
     text = record["state"]["M"][0]["text"]
     assert "initial weekly training schedule" in text
     assert "the user trained" not in text
+
+
+def test_probe_limit_counts_reward_bearing_states(env, tmp_path, monkeypatch):
+    suite = make_suite(env, tmp_path / "suite", variants=1)
+    empty, eligible = suite[:2]
+    empty["state"]["tests"] = []
+    path = tmp_path / "real_windows.jsonl"
+    write_rows(path, [empty, eligible])
+    scored = []
+
+    def score(full, state, raw):
+        scored.append(state["case_key"])
+        return verdict()
+
+    monkeypatch.setattr(env, "builder_score", score)
+    monkeypatch.setattr(env.policy("BUILDER"), "complete", lambda *a, **kw: '{"ops":[]}')
+    report = run_probe(path, env, tmp_path / "out", samples=1, limit=1)
+    assert scored == [eligible["state"]["case_key"]]
+    assert report[0]["states"] == 1
+    assert read(tmp_path / "out" / "summary.json")["skipped_empty_test_states"] == 1

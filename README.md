@@ -452,3 +452,30 @@ CUDA_VISIBLE_DEVICES=4 python -m admem.cli probe --config configs/type_aware_4b_
 ```
 
 这会调用配置好的模型服务；离线回归测试不代表真实 Qwen Builder 已通过这些场景。
+
+### 12.1 在真实 LongMemEval 历史上运行 Builder reward probe
+
+`scripts/probe_longmemeval.py` 串联现有 prepare、bank、build/collect、export 和 probe。
+它使用真实会话按时间顺序产生的 stream 编辑状态，不调用合成 `probe-suite`，也不人为删除/复制记忆制造状态。
+奖励题由 ATTACKER 从真实历史生成并经 gate 验证；官方问题答案保留在 `private_eval.jsonl`，不用于奖励。
+
+在配置好 `BUILDER`、`ATTACKER`、`DEFENDER`、`JUDGE` 服务的服务器上，从项目根目录运行：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python scripts/probe_longmemeval.py \
+  --config configs/type_aware_4b_nogate.json \
+  --data data/longmemeval/longmemeval_s.json \
+  --prepared data/prepared_longmemeval \
+  --split val --question-types single-session-user \
+  --case-limit 1 --state-limit 16 --samples 8 --temperature 1.0 \
+  --out outputs/real_builder_probe_v1
+```
+
+- 首次运行默认按 `--sizes 300 50 150` 准备 500 个 case；大 JSON 的 prepare 需要 `ijson`。已有 prepared 目录会复用原划分，其他规模数据须明确传入匹配的 `--sizes`。
+- `selected_cases.json` 固定实际选中的 case；bank 和 build 使用同一批 key。`state_selection.json` 记录有测试题的真实状态数和本次采样数。
+- `--case-limit` 限制完整 case 数；`--state-limit` 仅限制最终 probe 状态数。建题库和构建记忆仍处理选中 case 的全部历史；一个 case 可能包含几十到几百个 session。
+- 先过滤无 tests 的状态，再按种子抽样；最多 16 个状态各采样 8 次，不意味着一轮有 16 个 case。`probe/summary.json` 和 `probe/samples.jsonl` 保存奖励统计及明细，分组为 `stream`，不再是 8 类合成 family。
+- 沿用配置中的构建 fallback 设置；fallback 会影响后续状态的旧记忆，但每条 probe 候选仍按模型原始编辑评分，不使用 fallback 替它修复。
+- 默认只测自然构建阶段，不保证包含 patch/refine。若需要官方问题上的完整 QA 表现，使用前文的 `longmemeval-eval`；那是独立评测目标。
+
+脚本拒绝覆盖已有输出目录，并在题库失败/为空、没有可评分状态时给出错误，避免把没有测到误报为模型失败。模型参数或源码变更后，重新收集状态到新输出目录。
