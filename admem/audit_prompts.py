@@ -356,21 +356,20 @@ def attacker_rids(full: Any, pack: Any, qtype: str, view: str) -> list[str]:
 
 
 def feasible_types(full: Any, pack: Any, min_personal: int = 0) -> list[str]:
-    """不看目标题的可出题性预筛：用户事实类题要求种子含个人陈述，避免强迫在通用问答上编题。"""
+    """不看目标题的便宜预筛；multi-session 只检查至少两个会话。
+
+    人称词表无法证明跨会话题不可答：例如 I bought、It cost 或指代承接
+    可能全不命中。相关性、两个会话是否都不可缺少，仍由正式 gate 验证。
+    """
     seed = list(pack.seed_rids)
-    seed_sessions = {full.rounds[r].session_id for r in seed}
-    others = {}
-    for rid in pack.rids:
-        sid = full.rounds[rid].session_id
-        if sid not in seed_sessions:
-            others.setdefault(sid, []).append(rid)
+    sessions = {full.rounds[r].session_id for r in pack.rids}
     personal = personal_score(full, seed) >= min_personal
     allowed = []
     for t in TYPES:
         if t == "single-session-assistant":
             ok = any(m.get("role") == "assistant" for r in seed for m in full.rounds[r].messages)
         elif t == "multi-session":
-            ok = personal and any(personal_score(full, v) >= min_personal for v in others.values())
+            ok = len(sessions) >= 2
         else:
             ok = personal
         if ok:

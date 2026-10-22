@@ -323,6 +323,84 @@ def test_gate_never_repairs_candidate_in_reward(setup_case,env):
     assert result['status']=='rejected' and original['a']=='Rex'
 
 
+def test_gate_evidence_repair_returns_checked_item_without_mutating_original(setup_case,env,monkeypatch):
+    from admem import prompts
+    full,path,ctx=setup_case
+    pack=Pack('p',full.fingerprint,'seed','session',0,['s1:r1'],list(full.rounds))
+    original=q();original['q']="What is my cat's current name?"
+    judge=env.judge
+    def screen(system,payload,key):
+        if system==prompts.SCREEN:
+            complete=set(payload['candidate']['E'])=={'s1:r1','s2:r1'}
+            return {'stable':complete,'additional_rids':[] if complete else ['s2:r1'],
+                    'wrong_rids':[],'reason':'synthetic missing evidence'}
+        return judge(system,payload,key)
+    monkeypatch.setattr(env,'judge',screen)
+    checked=env.gate(full,pack,original,ctx['question_date'],ctx['question_type'])
+    assert checked['status']=='accepted' and checked['repaired']
+    assert checked['item']['E']==['s1:r1','s2:r1']
+    assert original['E']==['s1:r1']
+
+
+def test_bank_retains_gate_repaired_evidence(setup_case,env,tmp_path,monkeypatch):
+    full,path,ctx=setup_case
+    def repaired_gate(full,pack,item,date,qtype):
+        return {'status':'accepted','repaired':True,'item':{**item,'E':['s1:r1','s2:r1']}}
+    monkeypatch.setattr(env,'gate',repaired_gate)
+    folder=tmp_path/'bank'
+    assert generate_bank(full,path,ctx,env,folder)==1
+    assert read(folder/'bank.json')[0]['E']==['s1:r1','s2:r1']
+    assert all(row['item']['E']==['s1:r1','s2:r1'] for row in read(folder/'bank_log.json'))
+
+
+def test_attacker_uses_repaired_evidence_for_defect_and_novelty(setup_case,env,monkeypatch):
+    full,path,ctx=setup_case
+    pack=Pack('p',full.fingerprint,'seed','session',0,['s1:r1'],list(full.rounds))
+    state=attacker_state(full,path,ctx,[],pack,[],env,0)
+    checked=[]
+    def repaired_gate(full,pack,item,date,qtype):
+        return {'status':'accepted','repaired':True,'item':{**item,'E':['s1:r1','s2:r1']}}
+    def defect(full,memory,item):
+        checked.append(('defect',list(item['E'])))
+        return {'kind':'none'}
+    def weight(full,item,usage):
+        checked.append(('weight',list(item['E']),dict(usage)))
+        return 1.0
+    monkeypatch.setattr(env,'gate',repaired_gate)
+    monkeypatch.setattr(env,'defect',defect)
+    monkeypatch.setattr(env,'evidence_weight',weight)
+    other={**q(),'q':'What did I name my cat?'}
+    result=env.attacker_score(full,state,json.dumps({'items':[q(),other]}))
+    assert all(item['item']['E']==['s1:r1','s2:r1'] and item['repaired'] for item in result['items'])
+    assert checked==[('defect',['s1:r1','s2:r1']),('weight',['s1:r1','s2:r1'],{}),
+                     ('defect',['s1:r1','s2:r1']),('weight',['s1:r1','s2:r1'],{'s1:r1':1,'s2:r1':1})]
+
+
+def test_repaired_attacker_output_is_not_saved_as_original_teacher_demo(setup_case,env,tmp_path,monkeypatch):
+    full,path,ctx=setup_case
+    def repaired_score(full,state,raw):
+        return {'legal':True,'items':[{'status':'accepted','repaired':True,
+                                     'item':{**q(),'E':['s1:r1','s2:r1']}}]}
+    monkeypatch.setattr(env,'attacker_score',repaired_score)
+    monkeypatch.setattr(env,'defect',lambda *args:{'kind':'none'})
+    collected=tmp_path/'collected'
+    run_case(full,path,ctx,env,tmp_path/'run',collect=Collector(collected))
+    records=[read(p) for p in (collected/'train'/'attacker').glob('*.json')]
+    assert records and all('completion' not in row for row in records)
+    assert all('demo_quality' not in row for row in records)
+
+
+def test_closed_loop_records_infeasible_pack_without_dereferencing_missing_state(setup_case,env,tmp_path,monkeypatch):
+    full,path,ctx=setup_case
+    monkeypatch.setattr('admem.pipeline.attacker_state',lambda *args:None)
+    out=tmp_path/'run'
+    result=run_case(full,path,ctx,env,out)
+    assert result['status']=='ok'
+    ledger=read(out/'ledger.json')
+    assert ledger and all(row['status']=='type_infeasible' for row in ledger)
+    assert all(row['M_hash'] for row in ledger)
+
+
 def test_attacker_reward_duplicate_same_question_not_different_fact(setup_case,env):
     full,path,ctx=setup_case
     pack=Pack('p',full.fingerprint,'seed','session',0,['s1:r1'],list(full.rounds))
@@ -591,7 +669,10 @@ def test_type_filter_skips_infeasible_pack_without_calling_attacker(env,tmp_path
     assert attacker_state(full,tmp_path/'f.json',ctx,[],generic,[],env,0)['qtype']=='single-session-assistant'
     env.cfg.hint_mode='hidden'
     for i in range(20):
-        assert attacker_state(full,tmp_path/'f.json',ctx,[],generic,[],env,i)['qtype']=='single-session-assistant'
+        # Multi-session feasibility is structural; the semantic gate decides
+        # whether the visible sessions contain indispensable related evidence.
+        assert attacker_state(full,tmp_path/'f.json',ctx,[],generic,[],env,i)['qtype'] in {
+            'single-session-assistant','multi-session'}
     assert not env.control['prompts']
 
 

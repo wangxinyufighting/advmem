@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .common import InvalidAction, Progress, Unknown, digest, parse, read, write, write_rows
 from .data import hint, policy_type
-from .audit_prompts import feasible_types
+from .audit_prompts import attacker_rids, feasible_types
 from .prompts import attacker_messages, builder_prompt, evidence_usage, source_view
 from .store import apply, augment, neutral_round, question_key, raw_chunks, text_size
 
@@ -103,6 +103,10 @@ def attacker_state(full, full_path, context, memory, pack, accepted, env, identi
     allowed = feasible_types(full, pack, env.cfg.seed_min_personal) if env.cfg.attacker_type_filter else None
     qtype = policy_type(context, env.cfg, identity, allowed)
     if qtype is None:
+        return None
+    # compact 视图可能去掉只有 assistant 的邻居；跨会话输入须有两个实际可见会话。
+    visible = attacker_rids(full, pack, qtype, env.cfg.attacker_view)
+    if qtype == "multi-session" and len({full.rounds[r].session_id for r in visible}) < 2:
         return None
     prompt, visible = attacker_messages(full, pack, qtype, context["question_date"], memory, accepted,
                                         env.cfg, env.counter)
@@ -232,9 +236,10 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
                     evaluation = env.attacker_score(full, state, raw)
                 if collect and state is not None:
                     # teacher出题SFT只收本来就有效的完整输出，不能把gate修订答案写成policy输出。
-                    all_valid = evaluation.get("items") and all(r["status"] == "accepted" for r in evaluation["items"])
+                    all_valid = evaluation.get("items") and all(
+                        r["status"] == "accepted" and not r.get("repaired") for r in evaluation["items"])
                     collect.save(state, raw if all_valid else None, {"gate": bool(all_valid)})
-                ledger.append({"seed": pack.seed_id, "sweep": sweep, "M_hash": digest(state["M"]),
+                ledger.append({"seed": pack.seed_id, "sweep": sweep, "M_hash": digest(memory),
                                "status": evaluation.get("skipped") or ("asked" if evaluation.get("items") else
                                          "audited_empty" if evaluation.get("legal") else "invalid_output")})
                 infos = list(evaluation.get("items", []))
@@ -324,38 +329,84 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
         raise
 
 
-def _bank_pack(full, full_path, context, pack, pi, accepted, env, role):
+def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_path=None, attempt=0):
     """Run one pack (attacker propose + gate). Raises Unknown on API/service failure.
 
     Pure with respect to the caller's ``accepted``/``logs`` so a failed pack can
     be retried without duplicating rows.  Returns ``(info, logs, new_items)``.
     """
     # 日志只记中性sN，不记原始seed_id（可能是answer_*标签）。
-    info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None}
-    state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
-    if state is None:
-        return info, [{**info, "status": "type_infeasible"}], []
-    pack = env.pack_module.Pack(**state["pack"])
-    info.update(qtype=state["qtype"], prompt_tokens=env.counter.prompt_count(state["prompt"]),
-                visible_rounds=len(pack.rids))
-    raw = propose(state, env, role, "bank:" + digest([state["prompt"], env.policy(role).tag]))
+    info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None,
+            "case_question_type": context["question_type"], "qtype": hint(context, env.cfg),
+            "pack_sessions": len({full.rounds[r].session_id for r in pack.rids})}
+    trace = None
+    if trace_path is not None:
+        trace_path = Path(trace_path)
+        info["trace_file"] = str(Path("pack_traces") / trace_path.name)
+        trace = {"schema": 1, "case_key": context["key"], "pack_index": pi, "attempt": attempt,
+                 "full_hash": full.fingerprint, "environment_fingerprint": env.cfg.fingerprint(),
+                 "seed_rids": list(pack.seed_rids), "pack_rids": list(pack.rids),
+                 "dropped_rids": list(pack.dropped_rids or []), "visible_rids": None,
+                 "prompt": None, "prompt_kind": "policy_prompt", "prompt_hash": None,
+                 "request_body": None, "raw": None, "logs": [], "added_items": [],
+                 "stage": "preparing", "error": None}
+
+    def snapshot(stage, **values):
+        if trace is not None:
+            trace.update(stage=stage, **values)
+            write(trace_path, trace)
+
+    snapshot("preparing")
     try:
-        data = parse(raw)
-        if set(data) != {"items"} or not isinstance(data["items"], list) or len(data["items"]) > env.cfg.questions_per_pack:
-            raise InvalidAction("Invalid items")
-    except InvalidAction as exc:
-        return info, [{**info, "status": "invalid", "reason": str(exc)}], []
-    logs = []
-    if not data["items"]:
-        logs.append({**info, "status": "empty"})
-    new_items, seen = [], {question_key(x) for x in accepted}
-    for q in data["items"]:
-        result = env.gate(full, pack, q, state["date"], state["qtype"])
-        logs.append({**info, **result})
-        if result["status"] == "accepted" and question_key(q) not in seen:
-            seen.add(question_key(q))
-            new_items.append(q)
-    return info, logs, new_items
+        state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
+        if state is None:
+            logs = [{**info, "status": "type_infeasible", "reason": "requested_type_not_feasible",
+                     "feasible_types": feasible_types(full, pack, env.cfg.seed_min_personal)}]
+            snapshot("skipped", logs=logs)
+            return info, logs, []
+        pack = env.pack_module.Pack(**state["pack"])
+        info.update(qtype=state["qtype"], prompt_tokens=env.counter.prompt_count(state["prompt"]),
+                    visible_rounds=len(pack.rids),
+                    visible_sessions=len({full.rounds[r].session_id for r in pack.rids}))
+        remote = env.policy(role)
+        nonce = "bank:" + digest([state["prompt"], remote.tag])
+        snapshot("prepared", prompt=state["prompt"], prompt_hash=digest(state["prompt"]),
+                 visible_rids=list(pack.rids), qtype=state["qtype"], nonce=nonce,
+                 policy_role=role, policy_tag=remote.tag)
+        try:
+            raw = propose(state, env, role, nonce)
+        except Unknown:
+            snapshot("request_failed", request_body=deepcopy(getattr(remote, "last_request", None)))
+            raise
+        snapshot("response", raw=raw, request_body=deepcopy(getattr(remote, "last_request", None)))
+        try:
+            data = parse(raw)
+            if set(data) != {"items"} or not isinstance(data["items"], list) or len(data["items"]) > env.cfg.questions_per_pack:
+                raise InvalidAction("Invalid items")
+        except InvalidAction as exc:
+            logs = [{**info, "status": "invalid", "reason": str(exc)}]
+            snapshot("invalid", logs=logs)
+            return info, logs, []
+        logs = []
+        if not data["items"]:
+            logs.append({**info, "status": "empty"})
+        new_items, seen = [], {question_key(x) for x in accepted}
+        for q in data["items"]:
+            result = env.gate(full, pack, q, state["date"], state["qtype"])
+            logs.append({**info, **result})
+            if result["status"] == "accepted":
+                checked = result["item"]
+                if question_key(checked) not in seen:
+                    seen.add(question_key(checked))
+                    new_items.append(checked)
+            snapshot("gating", logs=logs, added_items=new_items)
+        snapshot("complete", logs=logs, added_items=new_items)
+        return info, logs, new_items
+    except Unknown as exc:
+        # Preserve response and completed judgments even if a later gate request
+        # failed. Failed attempts never commit their items to the bank.
+        snapshot("error", failed_stage=trace["stage"] if trace else None, error=str(exc))
+        raise
 
 
 def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
@@ -373,13 +424,16 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
     for pi, pack in enumerate(pool):
         info, pack_logs, new_items = {"pack": pi}, None, None
         for attempt in range(retries):
+            trace_path = out / "pack_traces" / f"pack_{pi:05d}_attempt_{attempt:02d}.json"
             try:
                 info, pack_logs, new_items = _bank_pack(
-                    full, full_path, context, pack, pi, accepted, env, role)
+                    full, full_path, context, pack, pi, accepted, env, role,
+                    trace_path=trace_path, attempt=attempt)
                 break
             except Unknown as exc:
                 if attempt + 1 >= retries:
-                    logs.append({"pack": pi, "status": "transport_error", "reason": str(exc)})
+                    logs.append({"pack": pi, "status": "transport_error", "reason": str(exc),
+                                 "trace_file": str(trace_path.relative_to(out))})
                     bar.update(suffix=f"p{pi} transport_error")
                     pack_logs = None
                     break

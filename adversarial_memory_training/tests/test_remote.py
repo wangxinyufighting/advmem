@@ -67,6 +67,22 @@ def test_complete_failure_reports_prompt_tokens(tmp_path, monkeypatch):
     assert "prompt_tokens=12345" in message and "max_tokens=4096" in message
 
 
+def test_trace_request_uses_effective_body_and_clears_stale_request(tmp_path, monkeypatch):
+    _clear_llm_env(monkeypatch)
+    effective = [{"role": "user", "content": "overridden input"}]
+    monkeypatch.setenv("JUDGE_EXTRA_BODY", json.dumps({"messages": effective, "temperature": 0.3}))
+    client = _FakeClient([{"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}])
+    _FakeCore.client = client
+    remote = Remote("JUDGE", _FakeCore, tmp_path / "api")
+    remote.complete([{"role": "user", "content": "original input"}], "first")
+    assert remote.last_request == client.requests[0][1]
+    assert remote.last_request["messages"] == effective
+    client.calls = client.max_calls
+    with pytest.raises(Unknown, match="MAX_API_CALLS"):
+        remote.complete([], "second")
+    assert remote.last_request is None
+
+
 def test_json_retry_when_reasoning_returns_null_content(tmp_path, monkeypatch):
     _clear_llm_env(monkeypatch)
     client = _FakeClient([

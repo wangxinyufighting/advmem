@@ -312,7 +312,7 @@ attacker 输入只有：原文pack、M provenance标记、题型、case允许使
 题型来源由 `hint_mode` 决定。`configs/type_aware.json`（`target_type`）把**当前case的官方题型**交给 attacker/builder，属于有意的类型已知诊断基线，不是无标签设定；`configs/type_hidden.json`（`hidden`）按pack确定性随机抽题型，才是主结果设定。admem 中可用以下配置给 4B attacker 减负、抑制刷分：
 
 - `attacker_view: "compact"`：单session题型只给种子session；跨session题型给种子全文+邻居的user消息（`assistant_elided`），被隐去的round不允许作为E。
-- `attacker_type_filter: true`：按种子文本预筛可出题型（SSA要求种子有assistant回复；其余题型要求一人称个人陈述≥`seed_min_personal`；multi-session另需一个有个人陈述的邻居session）。不可出时该pack记为 `type_infeasible`，不调用attacker、不产生奖励。
+- `attacker_type_filter: true`：SSA 要求种子有 assistant 回复；multi-session 只检查输入中有至少两个实际可见的 session，个人相关性和跨会话必要性由 gate 验证。其余题型保留 `seed_min_personal` 词表预筛。不能用人称词表未命中来证明 multi-session 不可出题，例如 `I bought…`、`It cost…` 都可能未命中。不可出时该 pack 记为 `type_infeasible`，不调用 attacker、不产生奖励。
 - `evidence_novelty`：同一round被反复出题时奖励按 `1/(1+已用次数均值)` 递减；`impersonal_weight`：非SSA题的E里没有一人称个人陈述时乘该权重。
 - `attacker_memory_entries` / `attacker_context_items`：控制附带的M条目和已接受题提示数量，设为0即不附带。
 
@@ -481,3 +481,33 @@ CUDA_VISIBLE_DEVICES=4 python scripts/probe_longmemeval.py \
 - 默认只测自然构建阶段，不保证包含 patch/refine。若需要官方问题上的完整 QA 表现，使用前文的 `longmemeval-eval`；那是独立评测目标。
 
 脚本拒绝覆盖已有输出目录，并在题库失败/为空、没有可评分状态时给出错误，避免把没有测到误报为模型失败。模型参数或源码变更后，重新收集状态到新输出目录。
+
+如果 multi-session 的 bank 只有 0～2 题，先分析已有日志，无需重新调用模型：
+
+```bash
+python scripts/attacker_report.py \
+  --prepared data/prepared_longmemeval \
+  outputs/real_builder_probe_all_types_v1/bank \
+  --question-types multi-session \
+  --json outputs/real_builder_probe_all_types_v1/multi_session_diagnostics.json
+```
+
+报告按 case 区分 `type_infeasible`（预筛跳过）、`empty`（模型未提出问题）、`invalid`（输出格式错误）、`rejected`（gate 拒绝）和服务失败；输出拒绝原因、oracle 未通过的字段及少量示例。兼容旧日志缺少 qtype 的跳过记录，也会单独列出失败 case 的 partial 日志。`nogate` 配置只关闭 Builder 的 `faith_gate`，`gate_mode: full` 仍校验 bank 的答案、跨会话必要性、问题范围和闭卷可答性。每包最多 4 题不是保证 4 题；`neighbors: 4` 指额外召回的 round 数，也不保证找到 4 个有关联的 session。
+
+bank 保存 gate 实际接受的题目；若 gate 修复过证据 `E`，后续评分和建记忆使用修复后的 `E`。旧 bank 不会自动改写，验证修复效果时使用新输出目录。
+
+联合抽查实际输入与 gate 日志：新运行会在每个 case 的 `pack_traces/` 保存逐次尝试的输入快照、原始输出和 gate 结果，`bank_log.json` 用 `trace_file` 关联。`request_body` 保存应用 `EXTRA_BODY` 后的有效请求（含缓存命中）；`prompt` 保存交给策略接口的输入。预筛跳过的 pack 没有模型输入，失败后的重试会分别保留。以下命令按状态/拒绝原因各抽 2 包，不调用模型、tokenizer 或 embedding：
+
+```bash
+python scripts/audit_bank_packs.py \
+  --bank outputs/real_builder_probe_all_types_v1/bank \
+  --prepared data/prepared_longmemeval \
+  --cache .cache/admem/api \
+  --question-types multi-session \
+  --per-status 2 --seed 0 \
+  --out outputs/real_builder_probe_all_types_v1/pack_audit
+```
+
+先看 `pack_audit/index.json`，再看其中列出的 `<case>/pack_<编号>.json`。每份报告包含同包的 `bank_log`、输入/原始输出、可见文本与原文的对照，以及未展示的前后 round。人工检查：两个会话的事实有何联系、是否缺少前提、隐藏文本是否关键、是否能构造合格问题、gate 的拒绝是否合理；填写 `manual_review` 即可。
+
+旧运行没有 trace 时，脚本可从 API 缓存按历史内容和模型输出查找候选；即使只有一个候选也标为 `cache_candidates_unverified`，不宣称已恢复原始 pack。没有日志关联的快照标为 `trace_candidates_unverified`；有明确关联时，只合并同一输入对应的此前重试，排除旧目录残留的其他尝试。无匹配则标为 `unavailable`，预筛跳过标为 `not_sent`。`debug_bank_pack.py` 会重新构造输入，不带历史时刻的完整已接受题上下文，因此不应用来证明旧运行当时发送了什么。需要指定包时追加 `--keys c0070 --packs 0 3`，编号与 bank 日志一致，从 0 开始。脚本拒绝覆盖已有抽查目录。

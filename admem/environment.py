@@ -338,6 +338,9 @@ class Environment:
                 rewards.append(r)
                 details.append({**gate, "reward": r})
                 continue
+            # gate may repair E after scope screening. All downstream checks must
+            # use the item it actually accepted, not the original incomplete E.
+            q = gate["item"]
             key = question_key(q)
             if key in seen:
                 rewards.append(0.0)
@@ -350,7 +353,8 @@ class Environment:
             for rid in q["E"]:
                 usage[rid] = usage.get(rid, 0) + 1
             rewards.append((0.5 + 0.5 * repairable) * weight)
-            details.append({"status": "accepted", "item": q, "defect": defect, "weight": weight})
+            details.append({"status": "accepted", "item": q, "defect": defect, "weight": weight,
+                            "repaired": gate.get("repaired", False)})
         # 固定题数分母：不让单道简单题比多道有价值题占便宜；空列表reward=0。
         reward = sum(rewards) / self.cfg.questions_per_pack
         # Attacker rewards currently have no family-specific gate, so the

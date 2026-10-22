@@ -327,6 +327,7 @@ class Remote:
         self.client = core.from_env(role, cache)
         self.tag = digest([role, self.client.model, self.client.base_url])
         self.retry_dir = Path(cache) / "judge_retries"
+        self.last_request = None
 
     def complete(self, prompt, nonce, temperature=0.0, max_tokens=None,
                  output_tokens=None, prompt_tokens=None):
@@ -338,6 +339,7 @@ class Remote:
         ``max_tokens``) receive the larger retry budget as well.  The initial
         request remains byte-for-byte compatible with the configured body.
         """
+        self.last_request = None
         if max_tokens is None:
             max_tokens = int(os.getenv(f"{self.role}_MAX_TOKENS",
                                        os.getenv("LLM_MAX_TOKENS", "4096")))
@@ -383,6 +385,9 @@ class Remote:
         if self.client.calls >= self.client.max_calls:
             raise Unknown("MAX_API_CALLS exhausted; stop and inspect the budget before resuming")
         try:
+            # Preserve the effective request after EXTRA_BODY, including cache hits.
+            # HTTP headers and API keys are not part of this request body.
+            self.last_request = json.loads(json.dumps(body))
             response = self.client.post("/chat/completions", body, nonce=nonce)
             choice = response["choices"][0]
             value = choice["message"]["content"]
