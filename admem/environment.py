@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import re
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
-from .common import Remote, Unknown, InvalidAction, digest, messages, parse
+from .common import BudgetExceeded, Remote, Unknown, InvalidAction, digest, messages, parse
 from . import prompts
-from .audit_prompts import TYPES, GATE_ORACLE_SYSTEM, GATE_SUPPORT_SYSTEM, personal_score
+from .audit_prompts import (SINGLE_SESSION, TYPES, GATE_ORACLE_SYSTEM, GATE_SUPPORT_SYSTEM,
+                            personal_score, plan_item_type)
 from .store import apply, augment, question_key, raw_chunks, text_size
 from .edit_checks import assess_edits
 
@@ -77,7 +78,11 @@ class Environment:
         prompt = messages(system, payload)
         count = self.counter.prompt_count(prompt)
         if count > self.cfg.judge_input_tokens:
-            raise Unknown(f"Judge context exceeds configured token budget ({count}>{self.cfg.judge_input_tokens})")
+            raise BudgetExceeded(
+                f"Judge context exceeds configured token budget ({count}>{self.cfg.judge_input_tokens})",
+                stage="judge:" + (key.split(":", 1)[0] if ":" in key else
+                                  "faith" if system == prompts.FAITH else "other"),
+                tokens=count, limit=self.cfg.judge_input_tokens)
         return self.policy("JUDGE").json(prompt, "judge:" + key, prompt_tokens=count)
 
     def index(self, documents):
@@ -112,7 +117,8 @@ class Environment:
         prompt = messages(prompts.READ, payload)
         count = self.counter.prompt_count(prompt)
         if count > self.cfg.reader_tokens + 1500:
-            raise Unknown(f"Reader prompt exceeds budget ({count}>{self.cfg.reader_tokens + 1500})")
+            raise BudgetExceeded(f"Reader prompt exceeds budget ({count}>{self.cfg.reader_tokens + 1500})",
+                                 stage="reader", tokens=count, limit=self.cfg.reader_tokens + 1500)
         value = self.policy("DEFENDER").json(prompt, "reader:" + key, prompt_tokens=count)
         if not isinstance(value.get("answer"), str):
             raise Unknown("Reader response has no answer string")
@@ -136,7 +142,8 @@ class Environment:
             new = "\n\n".join(chunks + [entry["text"]])
             if self.counter.count(new) > self.cfg.reader_tokens:
                 if all_memory:
-                    raise Unknown("All-M condition cannot fit; do not report truncated M as all-M")
+                    raise BudgetExceeded("All-M condition cannot fit; do not report truncated M as all-M",
+                                         stage="reader_all_memory", limit=self.cfg.reader_tokens)
                 continue
             chunks.append(entry["text"])
             kept.append(entry["id"])
@@ -180,7 +187,7 @@ class Environment:
                         digest([full.fingerprint, entry])), "faithful")
                 for entry in changed]
 
-    def validate_question(self, q, pack, date, qtype):
+    def validate_question(self, q, pack, date, qtype, *, seed_only=False):
         if not isinstance(q, dict) or set(q) != {"q", "a", "type", "question_date", "E"}:
             raise InvalidAction("Question schema mismatch")
         if any(not isinstance(q.get(k), str) or not q[k].strip() for k in ["q", "a", "type", "question_date"]):
@@ -193,9 +200,13 @@ class Environment:
             any(not isinstance(r, str) for r in evidence) or len(set(evidence)) != len(evidence) or
             not set(evidence) <= set(pack.rids)):
             raise InvalidAction("Unknown/empty/repeated/overbudget evidence")
+        if seed_only and qtype in SINGLE_SESSION and not set(evidence) <= set(pack.seed_rids):
+            # 多题型计划里单session题也能看到邻居；它们只能引用种子round（同一session）。
+            raise InvalidAction("Single-session question cites non-seed rounds")
 
-    def gate(self, full, pack, q, date, qtype):
-        result = self._gate_once(full, pack, q, date, qtype)
+    def gate(self, full, pack, q, date, qtype, *, seed_only=False):
+        options = {"seed_only": True} if seed_only else {}
+        result = self._gate_once(full, pack, q, date, qtype, **options)
         if result["status"] != "rejected" or result.get("reason") != "scope_or_completeness":
             return result
         # 一次修复尝试：screen 指出 wrong_rids / additional_rids，修 E 后重跑整条校验链。
@@ -208,12 +219,39 @@ class Environment:
         repaired = {**q, "E": sorted(set(q["E"]) - set(wrong) | set(extra))}
         if not repaired["E"]:
             return result
-        fixed = self._gate_once(full, pack, repaired, date, qtype)
+        fixed = self._gate_once(full, pack, repaired, date, qtype, **options)
         return dict(fixed, repaired=True) if fixed["status"] == "accepted" else result
 
-    def _gate_once(self, full, pack, q, date, qtype):
+    def _screen_fits(self, full, q, rids):
+        prompt = messages(prompts.SCREEN, {"candidate": q, "history": prompts.source_view(full, rids)})
+        return self.counter.prompt_count(prompt) <= self.cfg.judge_input_tokens
+
+    def _screen_rids(self, full, q):
+        """宽检索候选：E∪top-screen_k。全部装得进judge预算时与旧实现逐字相同；装不下时E必须
+        完整保留（E本身装不下就BudgetExceeded），其余按检索排名逐个放入、放不下的跳过并计数。"""
+        index = self.index(full.documents())
+        ranked = [h.id for h in index.search(q["q"], self.cfg.screen_k, expand=0)]
+        rids = set(q["E"]) | set(ranked)
+        if self._screen_fits(full, q, rids):
+            return rids, None
+        chosen = set(q["E"])
+        if not self._screen_fits(full, q, chosen):
+            raise BudgetExceeded("Screen evidence alone exceeds judge budget",
+                                 stage="judge:screen", limit=self.cfg.judge_input_tokens)
+        omitted = 0
+        for rid in ranked:
+            if rid in chosen:
+                continue
+            if self._screen_fits(full, q, chosen | {rid}):
+                chosen.add(rid)
+            else:
+                omitted += 1
+        return chosen, {"candidates": len(ranked), "kept": len(chosen), "omitted": omitted,
+                        "limit": self.cfg.judge_input_tokens}
+
+    def _gate_once(self, full, pack, q, date, qtype, *, seed_only=False):
         try:
-            self.validate_question(q, pack, date, qtype)
+            self.validate_question(q, pack, date, qtype, **({"seed_only": True} if seed_only else {}))
         except InvalidAction as exc:
             return {"status": "rejected", "reason": str(exc), "item": q}
         evidence = prompts.source_view(full, q["E"])
@@ -234,8 +272,9 @@ class Environment:
         wide = qtype in {"multi-session", "knowledge-update", "temporal-reasoning"} or bool(re.search(
             r"\b(all|total|latest|current|currently|ever|so far)\b", q["q"], re.I))
         if self.cfg.gate_mode == "full" and wide:
-            index = self.index(full.documents())
-            rids = set(q["E"]) | {h.id for h in index.search(q["q"], 30, expand=0)}
+            rids, fitted = self._screen_rids(full, q)
+            if fitted:
+                result["screen_budget"] = fitted
             screen = self.judge(prompts.SCREEN, {"candidate": q, "history": prompts.source_view(full, rids)},
                                 "screen:" + key)
             for field in ("additional_rids", "wrong_rids"):
@@ -357,8 +396,13 @@ class Environment:
         seen = set(state.get("seen_keys", []))
         usage = dict(state.get("evidence_usage", {}))
         rewards, details = [], []
+        plan, used = state.get("type_plan"), Counter()
         for q in value["items"]:
-            gate = self.gate(full, pack, q, state["date"], state["qtype"])
+            qtype = plan_item_type(state, q, used)
+            if plan:
+                gate = self.gate(full, pack, q, state["date"], qtype, seed_only=True)
+            else:
+                gate = self.gate(full, pack, q, state["date"], qtype)
             if gate["status"] != "accepted":
                 r = rejection_reward(gate)
                 rewards.append(r)

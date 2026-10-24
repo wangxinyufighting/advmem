@@ -16,6 +16,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from collections import Counter
+
+from admem.audit_prompts import plan_item_type
 from admem.common import Config, TokenBudget, Unknown, connect, read, parse
 from admem.environment import Environment
 from admem.pipeline import attacker_state, make_pool, propose
@@ -62,7 +65,8 @@ def main() -> None:
 
     system, payload = pretty_payload(state["prompt"])
     print("=" * 90)
-    print(f"key={a.key} pack={a.pack} qtype={state['qtype']} seed={state['pack']['seed_id']}")
+    print(f"key={a.key} pack={a.pack} qtype={state['qtype']} type_plan={state.get('type_plan')} "
+          f"seed={state['pack']['seed_rids'][0].split(':')[0]}")
     print(f"visible_rids={state['pack']['rids']}")
     print("=" * 90)
     print("\n########## SYSTEM ##########\n")
@@ -78,8 +82,11 @@ def main() -> None:
     print(raw)
     data = parse(raw)
     print("\n########## GATE 判定 ##########\n")
+    used = Counter()
     for i, q in enumerate(data["items"]):
-        result = env.gate(full, pack, q, state["date"], state["qtype"])
+        qtype = plan_item_type(state, q, used)
+        result = (env.gate(full, pack, q, state["date"], qtype, seed_only=True) if state.get("type_plan")
+                  else env.gate(full, pack, q, state["date"], qtype))
         print(f"--- 题{i}: {q['q'][:120]}")
         print(f"    status={result.get('status')} reason={result.get('reason')}")
         print(f"    oracle={result.get('oracle')}")

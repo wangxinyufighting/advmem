@@ -240,6 +240,92 @@ def attacker_prompt(qtype: str) -> str:
     return ATTACKER_SYSTEM + "\n" + TYPE_GUIDANCE[qtype]
 
 
+CROSS_SESSION = frozenset({"multi-session", "knowledge-update", "temporal-reasoning"})
+# 题型计划下，不在计划内（或超出该题型槽位数）的题按这个不存在的题型校验，从而被schema拒绝。
+OUTSIDE_PLAN = "outside-type-plan"
+
+_SINGLE_TYPE_RULE = ("- Generate at most n_questions items, all of the requested type. "
+                     "Do not silently change type.\n")
+PLAN_RULES = """- slots maps each requested type to the maximum number of items of that type; the total never
+  exceeds n_questions. Every item's type must be one of the slot keys. Never relabel an item to fill
+  a slot; return fewer items instead.
+- An item of a single-session type (single-session-user, single-session-assistant,
+  single-session-preference) must cite only is_seed rounds. Other types may also cite the other
+  supplied rounds.
+- max_evidence_rounds gives the evidence limit for each requested type.
+"""
+
+
+def evidence_cap(qtype: str) -> int:
+    return 8 if ALIASES.get(qtype, qtype) in CROSS_SESSION else 3
+
+
+def attacker_prompt_plan(type_plan) -> str:
+    """多题型计划（balanced）的system prompt：把“全部同一题型”的规则换成按槽位出题，并拼接各题型指引。"""
+    types = [ALIASES.get(t, t) for t in type_plan]
+    if not types or any(t not in TYPE_GUIDANCE for t in types) or len(set(types)) != len(types):
+        raise ValueError(f"Invalid type plan: {list(type_plan)}")
+    if _SINGLE_TYPE_RULE not in ATTACKER_SYSTEM:
+        raise AssertionError("ATTACKER_SYSTEM changed; update the type-plan rule replacement")
+    system = ATTACKER_SYSTEM.replace(_SINGLE_TYPE_RULE, PLAN_RULES)
+    return system + "\n" + "\n".join(TYPE_GUIDANCE[t] for t in types)
+
+
+def build_plan_payload(full: Any, pack: Any, type_plan: Mapping[str, int], date: str, n_questions: int = 4,
+                       marks: Mapping[str, list[str]] | None = None,
+                       audit_context: Mapping[str, Any] | None = None, *, view: str = "full",
+                       usage: Mapping[str, int] | None = None, max_context_items: int = 24) -> dict:
+    """与build_payload相同的原文白名单视图，但用slots/各题型证据上限代替单一type。"""
+    types = [ALIASES.get(t, t) for t in type_plan]
+    slots = {t: int(type_plan[t]) for t in type_plan}
+    if any(n < 1 for n in slots.values()) or sum(slots.values()) > n_questions:
+        raise ValueError("Type plan slots must be positive and fit n_questions")
+    base = build_payload(full, pack, types[0], date, n_questions, marks, audit_context, view=view,
+                         usage=usage, max_context_items=max_context_items)
+    payload = {"slots": slots, "question_date": base["question_date"], "n_questions": sum(slots.values()),
+               "max_evidence_rounds": {t: evidence_cap(t) for t in types}, "rounds": base["rounds"]}
+    if "audit_context" in base:
+        payload["audit_context"] = base["audit_context"]
+    return payload
+
+
+def plan_item_type(state: Mapping[str, Any], item: Any, used) -> str:
+    """返回该题应按哪个题型送去gate。无计划时就是state["qtype"]；有计划时题型必须在计划内且未超出
+    其槽位数，否则返回OUTSIDE_PLAN（validate_question会以题型不符拒绝，属于格式非法）。"""
+    plan = state.get("type_plan")
+    if not plan:
+        return state["qtype"]
+    qtype = item.get("type") if isinstance(item, dict) else None
+    if qtype in plan and used[qtype] < plan[qtype]:
+        used[qtype] += 1
+        return qtype
+    return OUTSIDE_PLAN
+
+
+def structural_types(full: Any, pack: Any, view: str = "full") -> list[str]:
+    """不依赖人称词表的结构可行性：SSA要求种子里有assistant文本；multi-session要求跨会话视图下
+    至少两个可见session；其余题型要求种子里有user文本。只排除注定无法出题的组合，相关性仍由gate验证。"""
+    seed = list(pack.seed_rids)
+
+    def has(role):
+        return any(m.get("role") == role and str(m.get("content", "")).strip()
+                   for rid in seed for m in full.rounds[rid].messages)
+
+    seed_user, seed_assistant = has("user"), has("assistant")
+    sessions = {full.rounds[r].session_id for r in attacker_rids(full, pack, "multi-session", view)}
+    allowed = []
+    for t in TYPES:
+        if t == "single-session-assistant":
+            ok = seed_assistant
+        elif t == "multi-session":
+            ok = len(sessions) >= 2
+        else:
+            ok = seed_user
+        if ok:
+            allowed.append(t)
+    return allowed
+
+
 def _as_prior_context(value: Mapping[str, Any] | None, visible: set[str], full_hash: str,
                       limit: int = 24) -> dict:
     """只取相关题；调用方必须提供本case经gate接受的自生成题，而非目标题。"""

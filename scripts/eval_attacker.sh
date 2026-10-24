@@ -14,7 +14,8 @@
 #                                        设了PER_TYPE且未显式设LIMIT时不再套用LIMIT默认值10
 #   BASE_CONFIG=configs/type_aware.json  消融的基准配置（type_hidden.json 则测hidden设定）
 #   TOKENIZER=...                        覆盖配置里的tokenizer路径（本地/服务器路径不同时）
-#   VARIANTS="baseline compact filter neighbors4 all4b"   要跑的变体
+#   VARIANTS="baseline compact filter neighbors4 all4b"   要跑的变体（另有 pipeline_v2：token pack +
+#                                        hybrid事实句邻居 + balanced多题型，不在默认列表里）
 #   HEAD_BASELINE=1                      另在git HEAD代码的worktree上跑一次未修改版本
 #   PARALLEL=1                           各变体并行跑（注意API并发和MAX_API_CALLS）
 #   OUT=runs/attacker_eval_<时间戳>
@@ -54,7 +55,8 @@ if tok:
     base["tokenizer"] = tok
 off = {"attacker_view": "full", "attacker_type_filter": False, "attacker_memory_entries": 20,
        "attacker_context_items": 24, "evidence_novelty": False, "neighbors": 8,
-       "attacker_input_tokens": 16384}
+       "attacker_input_tokens": 16384, "pack_builder": "legacy", "neighbor_mode": "topical",
+       "type_policy": "auto"}
 variants = {
     "baseline": {},
     "compact": {"attacker_view": "compact"},
@@ -63,6 +65,9 @@ variants = {
     "all4b": {"attacker_view": "compact", "attacker_type_filter": True, "neighbors": 4,
               "attacker_memory_entries": 0, "attacker_context_items": 8, "evidence_novelty": True,
               "attacker_input_tokens": 12288},
+    "pipeline_v2": {"attacker_view": "compact", "neighbors": 8, "attacker_memory_entries": 12,
+                    "attacker_context_items": 8, "evidence_novelty": True, "attacker_input_tokens": 12288,
+                    "pack_builder": "token", "neighbor_mode": "hybrid", "type_policy": "balanced"},
 }
 for name, delta in variants.items():
     (out / f"{name}.json").write_text(json.dumps({**base, **off, **delta}, indent=2) + "\n")
@@ -98,7 +103,9 @@ if [[ "${HEAD_BASELINE:-0}" == 1 ]]; then
 import json, sys
 c = json.load(open(sys.argv[1]))
 new = {"attacker_view", "attacker_type_filter", "seed_min_personal", "attacker_memory_entries",
-       "attacker_context_items", "evidence_novelty", "impersonal_weight"}
+       "attacker_context_items", "evidence_novelty", "impersonal_weight", "pack_builder", "neighbor_mode",
+       "neighbor_session_cap", "fact_queries", "fact_query_k", "pack_neighbor_reserve", "type_policy",
+       "types_per_pack", "type_weights", "screen_k", "bank_defects"}
 c = {k: v for k, v in c.items() if k not in new}
 if sys.argv[3]:
     c["tokenizer"] = sys.argv[3]

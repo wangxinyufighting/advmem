@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from .common import Unknown, digest, messages
+from .common import BudgetExceeded, Unknown, digest, messages
 from .prompts import source_view
 
 
@@ -119,7 +119,8 @@ def _coverage(env, facts, candidates):
             trial = dict(payload, entries=payload["entries"] + [candidate])
             if env.counter.prompt_count(messages(COVERAGE, trial)) > env.cfg.judge_input_tokens:
                 if not payload["entries"]:
-                    raise Unknown("Edit coverage cannot fit one complete entry and fact inventory")
+                    raise BudgetExceeded("Edit coverage cannot fit one complete entry and fact inventory",
+                                         stage="judge:edit-coverage", limit=env.cfg.judge_input_tokens)
                 break
             payload = trial
             offset += 1

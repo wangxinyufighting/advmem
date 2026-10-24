@@ -212,7 +212,10 @@ def build_audits(bank_root, prepared, out, *, cache=None, question_types=None, k
             if not rows:
                 raise ValueError(f"No log rows for {case.name} pack {pi}")
             traces = recorded_traces(case, pi, rows, full)
-            no_send = all(r.get("status") == "type_infeasible" for r in rows)
+            # 预筛跳过、或prompt阶段就超出预算的pack都没有发给模型。
+            no_send = all(r.get("status") == "type_infeasible"
+                          or (r.get("status") == "over_budget" and r.get("stage") == "attacker_prompt")
+                          for r in rows)
             provenance = ("not_sent" if no_send else
                           "trace" if any(t["linked_to_bank_log"] for t in traces) else
                           "trace_candidates_unverified" if traces else "unavailable")

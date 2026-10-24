@@ -1,8 +1,9 @@
 """策略提示词全部英文；中文只用于源码注释。"""
 import json
 
-from .common import messages, Unknown
-from .audit_prompts import attacker_prompt, attacker_rids, build_payload
+from .common import BudgetExceeded, messages, Unknown
+from .audit_prompts import (CROSS_SESSION, attacker_prompt, attacker_prompt_plan, attacker_rids,
+                            build_payload, build_plan_payload)
 from .store import neutral_round
 
 BUILDER = """You are a memory editor, not a question writer or answer generator.
@@ -299,10 +300,12 @@ def builder_prompt(full, memory, old_ids, x, mode, hint, cfg, counter,
         if hint is not None:
             payload["task_type"] = hint
         prompt = messages(system, payload)
-        if counter.prompt_count(prompt) <= cfg.builder_input_tokens:
+        count = counter.prompt_count(prompt)
+        if count <= cfg.builder_input_tokens:
             return prompt, selected, limit
         if not selected:
-            raise Unknown("Builder x alone exceeds token budget; no silent truncation")
+            raise BudgetExceeded("Builder x alone exceeds token budget; no silent truncation",
+                                 stage="builder_prompt", tokens=count, limit=cfg.builder_input_tokens)
         selected.pop()  # 只裁候选旧条目，x中的原文不丢。
 
 
@@ -314,30 +317,79 @@ def evidence_usage(accepted):
     return usage
 
 
-def attacker_messages(full, pack, qtype, date, memory, accepted, cfg, counter):
-    """返回(prompt, visible_rids)。visible_rids是attacker可引用的E范围，gate按它校验。"""
+MEMORY_NOTE = ("\nThe optional memory_entries are the current editable memory; "
+               "use them to identify omissions, but only raw rounds are factual evidence.")
+
+
+def attacker_view_type(qtype, type_plan=None):
+    """决定compact视图下展示哪些round：计划里只要有跨会话题型，就按跨会话视图展示邻居。"""
+    if type_plan and len(type_plan) > 1:
+        cross = [t for t in type_plan if t in CROSS_SESSION]
+        return cross[0] if cross else next(iter(type_plan))
+    return qtype
+
+
+def attacker_messages(full, pack, qtype, date, memory, accepted, cfg, counter, type_plan=None):
+    """返回(prompt, visible_rids)。visible_rids是attacker可引用的E范围，gate按它校验。
+
+    超出attacker_input_tokens时依次：(1) 同时去掉memory_entries与audit_context（旧行为，
+    之前能装下的pack得到逐字相同的prompt）；(2) 从只含种子开始，按pack.rids顺序逐个加回非种子
+    round，装不下的跳过（token构建的pack里这个顺序就是检索排名，所以一个排名靠前的超大邻居
+    不会挤掉后面放得下的邻居）；(3) 只含种子仍装不下则BudgetExceeded。任何round的原文都不截断。
+    type_plan含两个以上题型时使用多题型prompt。"""
+    plan = dict(type_plan) if type_plan and len(type_plan) > 1 else None
     marks = {}
     for e in memory:
         for rid in e["prov"]:
             marks.setdefault(rid, []).append(e["id"])
-    visible = attacker_rids(full, pack, qtype, cfg.attacker_view)
-    view = type(pack)(**{**pack.to_dict(), "rids": visible})
+    visible = attacker_rids(full, pack, attacker_view_type(qtype, plan), cfg.attacker_view)
+    usage = evidence_usage(accepted)
     prior = {"full_hash": full.fingerprint, "accepted_items": accepted}
-    payload = build_payload(full, view, qtype, date, cfg.questions_per_pack, marks, prior,
-                            view=cfg.attacker_view, usage=evidence_usage(accepted),
-                            max_context_items=cfg.attacker_context_items)
-    entries = [{"id": e["id"], "text": e["text"], "prov": e["prov"]}
-               for e in memory if set(e["prov"]) & set(visible)][:cfg.attacker_memory_entries]
-    system = attacker_prompt(qtype)
-    if entries:
-        payload["memory_entries"] = entries
-        system += ("\nThe optional memory_entries are the current editable memory; "
-                   "use them to identify omissions, but only raw rounds are factual evidence.")
-    prompt = messages(system, payload)
-    if counter.prompt_count(prompt) > cfg.attacker_input_tokens:
-        payload.pop("memory_entries", None)
-        payload.pop("audit_context", None)
-        prompt = messages(attacker_prompt(qtype), payload)
-    if counter.prompt_count(prompt) > cfg.attacker_input_tokens:
-        raise Unknown("Attacker pack exceeds token budget; rebuild smaller packs, do not truncate evidence")
-    return prompt, visible
+
+    def render(rids, optional):
+        view = type(pack)(**{**pack.to_dict(), "rids": rids})
+        context = prior if optional else None
+        if plan:
+            payload = build_plan_payload(full, view, plan, date, cfg.questions_per_pack, marks, context,
+                                         view=cfg.attacker_view, usage=usage,
+                                         max_context_items=cfg.attacker_context_items)
+            system = attacker_prompt_plan(plan)
+        else:
+            payload = build_payload(full, view, qtype, date, cfg.questions_per_pack, marks, context,
+                                    view=cfg.attacker_view, usage=usage,
+                                    max_context_items=cfg.attacker_context_items)
+            system = attacker_prompt(qtype)
+        if optional:
+            entries = [{"id": e["id"], "text": e["text"], "prov": e["prov"]}
+                       for e in memory if set(e["prov"]) & set(rids)][:cfg.attacker_memory_entries]
+            if entries:
+                payload["memory_entries"] = entries
+                system += MEMORY_NOTE
+        return messages(system, payload)
+
+    limit = cfg.attacker_input_tokens
+    prompt = render(visible, True)
+    if counter.prompt_count(prompt) <= limit:
+        return prompt, visible
+    prompt = render(visible, False)  # 旧版的唯一回退：之前能装下的pack得到逐字相同的prompt
+    if counter.prompt_count(prompt) <= limit:
+        return prompt, visible
+    seed = set(pack.seed_rids)
+    rids = [rid for rid in visible if rid in seed]
+    prompt = render(rids, False)
+    count = counter.prompt_count(prompt)
+    if count > limit:
+        raise BudgetExceeded(
+            "Attacker pack exceeds token budget even with seed rounds only; "
+            "rebuild smaller packs (pack_builder=token), do not truncate evidence",
+            stage="attacker_prompt", tokens=count, limit=limit)
+    # 按pack.rids顺序（token构建的pack里即检索排名）逐个加回邻居，装不下的跳过而不是截断。
+    for rid in visible:
+        if rid in seed:
+            continue
+        kept = set(rids) | {rid}
+        trial = [r for r in visible if r in kept]
+        candidate = render(trial, False)
+        if counter.prompt_count(candidate) <= limit:
+            rids, prompt = trial, candidate
+    return prompt, rids

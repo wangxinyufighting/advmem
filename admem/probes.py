@@ -11,7 +11,8 @@ from pathlib import Path
 from statistics import mean, pstdev
 from time import perf_counter
 
-from .common import Progress, Unknown, digest, read, write, write_rows, parse
+from .common import BudgetExceeded, Progress, Unknown, digest, read, write, write_rows, parse
+from .data import TypeScheduler, resolve_type_policy
 from .pipeline import attacker_state, builder_state, make_pool
 from .store import neutral_round
 
@@ -149,7 +150,8 @@ def _item_summary(scored):
 
 
 def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_packs=None,
-                       temperature=1.0, pack_sample=None, pack_seed=0):
+                       temperature=1.0, pack_sample=None, pack_seed=0, memory_run=None,
+                       memory_snapshot="M_build"):
     """诊断 attacker reward 是否有组内学习信号（GRPO 要求每个 prompt 内 reward 有方差）。
 
     对每个 pack 构造一个 attacker state（honor ``cfg.attacker_type_filter`` 等开关），
@@ -158,6 +160,10 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
 
     ``pack_sample=N`` 随机抽 N 个 pack（可复现，seed 由 ``pack_seed+case`` 决定）
     而非跑满该 case 的所有 session；``max_packs=N`` 仍是取前 N 个。
+
+    ``memory_run`` 指向一次 ``run --mode build`` 的输出目录时，attacker 针对每个 case 的
+    ``memory_snapshot``（默认 M_build）出题，奖励里的 defect 项才有意义；不传时沿用空 M，
+    此时通过 gate 的题几乎都被判为 missing，defect 项退化为常数（summary 中会注明）。
     """
     out = Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -165,9 +171,12 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
     for path in (samples_path, raw_path):
         if path.exists():
             path.unlink()
-    records = []
+    records, over_budget, memory_cases = [], 0, 0
     for context, full_path in contexts_iter:
         full = env.memory_module.FullMemory.load(full_path)
+        memory = read(Path(memory_run) / context["key"] / f"{memory_snapshot}.json") if memory_run else []
+        memory_cases += bool(memory)
+        scheduler = TypeScheduler(env.cfg) if resolve_type_policy(env.cfg) == "balanced" else None
         pool = make_pool(full, env)
         if pack_sample is not None:
             rng = random.Random(digest([pack_seed, context["key"]]))
@@ -177,7 +186,12 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
             pool = pool[:max_packs]
         bar = Progress(len(pool), label=f"{context['key']} attacker-probe")
         for pi, pack in enumerate(pool):
-            state = attacker_state(full, full_path, context, [], pack, [], env, ["probe", pi])
+            try:
+                state = attacker_state(full, full_path, context, memory, pack, [], env, ["probe", pi], scheduler)
+            except BudgetExceeded:
+                over_budget += 1
+                bar.update(suffix=f"p{pi} over_budget")
+                continue
             if state is None:
                 bar.update(suffix=f"p{pi} type_infeasible")
                 continue
@@ -188,6 +202,10 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
                 raw_text = _json_text(raw)
                 try:
                     scored = dict(env.attacker_score(full, state, raw))
+                except BudgetExceeded as exc:
+                    # 确定性的judge预算溢出：该样本不可评分（reward=None，不计入统计），继续下一个。
+                    scored = {"reward": None, "effective_reward": None, "legal": None,
+                              "reason": f"over_budget: {exc}", "items": []}
                 except Unknown as exc:
                     write(out / "interrupted.json", {"case": context["key"], "pack": pi,
                                                      "sample": i, "error": str(exc)})
@@ -244,6 +262,12 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
     total_groups = len(per_group)
     summary = {
         "role": role, "model": env.policy(role).client.model, "temperature": temperature,
+        "type_policy": resolve_type_policy(env.cfg),
+        "memory": {"run": str(memory_run) if memory_run else None, "snapshot": memory_snapshot if memory_run else None,
+                   "cases_with_memory": memory_cases,
+                   "note": None if memory_run else "empty M: accepted questions are almost always 'missing', "
+                                                     "so the defect term is constant; pass --memory-run"},
+        "over_budget_packs": over_budget,
         "groups": total_groups, "samples_per_group": samples,
         "groups_with_signal": len(signal),
         "signal_group_rate": len(signal) / total_groups if total_groups else None,

@@ -44,7 +44,7 @@ def case_diagnostics(key, qtype, logs, bank, *, included, failure=None, max_exam
             if row.get("screen", {}).get("stable") is False:
                 screen[row["screen"].get("reason", "unspecified")] += 1
         reason = row.get("reason", status)
-        if (status in {"rejected", "invalid", "transport_error"}
+        if (status in {"rejected", "invalid", "transport_error", "over_budget"}
                 and reason not in seen_reasons and len(examples) < max_examples):
             seen_reasons.add(reason)
             item = row.get("item") or {}
@@ -62,8 +62,12 @@ def case_diagnostics(key, qtype, logs, bank, *, included, failure=None, max_exam
                                                 if "pack_sessions" in r)),
             "visible_session_counts": dict(Counter(r["visible_sessions"] for r in packs.values()
                                                    if "visible_sessions" in r)),
-            "questions_proposed": sum(r.get("status") in {"accepted", "rejected"} for r in logs),
-            "gate_accepted_questions": sum(r.get("status") == "accepted" for r in logs),
+            "questions_proposed": sum(r.get("status") in {"accepted", "rejected", "accepted_no_defect"}
+                                      or (r.get("status") == "over_budget" and "item" in r) for r in logs),
+            "gate_accepted_questions": sum(r.get("status") in {"accepted", "accepted_no_defect"} for r in logs),
+            "over_budget_packs": len({r["pack"] for r in logs if r.get("status") == "over_budget" and "item" not in r}),
+            "over_budget_questions": sum(r.get("status") == "over_budget" and "item" in r for r in logs),
+            "defect_kinds": dict(Counter(r["defect"] for r in logs if "defect" in r)),
             "rejection_reasons": dict(rejected), "oracle_false_flags": dict(oracle_flags),
             "support_reasons_top10": [{"reason": str(r)[:400], "count": n} for r, n in support.most_common(10)],
             "screen_reasons_top10": [{"reason": str(r)[:400], "count": n} for r, n in screen.most_common(10)],
@@ -101,10 +105,13 @@ def summarize(root: Path, prepared: Path, question_types=None, max_examples=3) -
             packs.setdefault(row["pack"], row)
             t = row.get("qtype") or row.get("case_question_type") or qtype
             status = row["status"]
-            if status in {"type_infeasible", "invalid", "empty", "transport_error"}:
+            if status in {"type_infeasible", "invalid", "empty", "transport_error", "over_budget",
+                          "accepted_no_defect"}:
                 by_type[t][status] += 1
             else:
                 by_type[t]["accepted" if status == "accepted" else "rejected"] += 1
+            if "defect" in row:
+                stats["defect:" + str(row["defect"])] += 1
         stats["cases"] += 1
         stats["packs"] += len(packs)
         tokens += [r["prompt_tokens"] for r in packs.values() if "prompt_tokens" in r]
@@ -122,8 +129,9 @@ def summarize(root: Path, prepared: Path, question_types=None, max_examples=3) -
         stats["distinct_evidence_rounds"] += len(rids)
         if sessions:
             gini_like.append(max(sessions.values()) / sum(sessions.values()))
-    accepted = sum(c["accepted"] for c in by_type.values())
+    accepted = sum(c["accepted"] + c["accepted_no_defect"] for c in by_type.values())
     asked = accepted + sum(c["rejected"] for c in by_type.values())
+    over_budget = sum(c["over_budget"] for c in by_type.values())
     infeasible = sum(c["type_infeasible"] for c in by_type.values())
     invalid = sum(c["invalid"] for c in by_type.values())
     transport_errors = sum(c["transport_error"] for c in by_type.values())
@@ -132,6 +140,8 @@ def summarize(root: Path, prepared: Path, question_types=None, max_examples=3) -
         "cases": stats["cases"], "failed_cases": failed,
         "packs": stats["packs"], "type_infeasible_packs": infeasible,
         "transport_error_packs": transport_errors,
+        "over_budget_rows": over_budget,
+        "defect_kinds": {k.split(":", 1)[1]: v for k, v in sorted(stats.items()) if k.startswith("defect:")},
         "invalid_output_rate": round(invalid / max(1, stats["packs"] - infeasible), 3),
         "bank_per_feasible_pack": round(stats["bank"] / max(1, stats["packs"] - infeasible), 3),
         "prompt_tokens_p50/p90/max": [pct(tokens, .5), pct(tokens, .9), max(tokens, default=None)],
@@ -165,7 +175,8 @@ def main():
     results = {run: summarize(Path(run), Path(a.prepared), a.question_types, a.max_examples) for run in a.runs}
     if a.json:
         Path(a.json).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    cols = ["cases", "failed_cases", "packs", "type_infeasible_packs", "transport_error_packs", "prompt_tokens_p50/p90/max", "invalid_output_rate",
+    cols = ["cases", "failed_cases", "packs", "type_infeasible_packs", "transport_error_packs", "over_budget_rows",
+            "prompt_tokens_p50/p90/max", "invalid_output_rate",
             "gate_accept_rate", "bank_per_feasible_pack", "distinct_rounds_per_question",
             "same_E_repeat_rate", "top_session_share_mean", "impersonal_rate"]
     print("| metric | " + " | ".join(Path(r).name for r in a.runs) + " |")

@@ -53,6 +53,12 @@ def parser():
     p.add_argument("--seed", type=int, default=0, help="State selection seed; not the model sampling seed")
     p.add_argument("--keys", nargs="+")
     p.add_argument("--question-types", nargs="+", choices=TYPES, help="Case types to include (default: all six)")
+    p.add_argument("--bank-rounds", type=int, default=1,
+                   help="1 = cold-start bank against empty memory (old behaviour). N>1 rebuilds memory with the "
+                        "current Builder after each round and asks the attacker for questions against that memory, "
+                        "merged into the previous bank; states are collected from the final build only.")
+    p.add_argument("--bank-defects-only", action="store_true",
+                   help="From round 2 on, keep only new questions that expose a defect of the current memory")
     return p
 
 
@@ -62,6 +68,10 @@ def preflight(args):
         args.per_type = 2
     if args.states_per_case is None and args.state_limit is None:
         args.states_per_case = 16
+    if args.bank_rounds < 1:
+        raise ValueError("--bank-rounds must be positive")
+    if args.bank_defects_only and args.bank_rounds < 2:
+        raise ValueError("--bank-defects-only needs --bank-rounds >= 2")
     for name in ("per_type", "case_limit", "states_per_case", "state_limit", "samples"):
         value = getattr(args, name)
         if value is not None and value < 1:
@@ -252,13 +262,27 @@ def run(args):
     common = ["--prepared", args.prepared, "--split", args.split, "--keys", *keys]
     bank, build, collect = (args.out / name for name in ("bank", "build", "collected"))
     timings = {}
-    with timed_stage(args.out, timings, "bank"):
-        _run_cli("bank", args.config, *common, "--out", bank)
-        check_stage(bank, keys, bank=True)
-    with timed_stage(args.out, timings, "build"):
-        _run_cli("run", args.config, *common, "--mode", "build", "--builder-role", "BUILDER",
-                 "--bank", bank, "--collect", collect, "--out", build)
-        check_stage(build, keys)
+    # 第0轮：空M冷启动题库（旧行为）。之后每轮：用上一轮题库训练状态下的Builder重建记忆，
+    # 再让attacker针对M_build出题、并入上一轮题库。只在最后一轮build时收集状态。
+    previous_bank = previous_build = None
+    for round_index in range(args.bank_rounds):
+        last = round_index == args.bank_rounds - 1
+        suffix = "" if round_index == 0 else f"_r{round_index}"
+        bank_dir = args.out / f"bank{suffix}"
+        extra = [] if previous_build is None else [
+            "--memory-run", previous_build, "--memory-snapshot", "M_build", "--base-bank", previous_bank,
+            *(["--defects-only"] if args.bank_defects_only else [])]
+        with timed_stage(args.out, timings, f"bank{suffix}"):
+            _run_cli("bank", args.config, *common, *extra, "--out", bank_dir)
+            check_stage(bank_dir, keys, bank=True)
+        build_dir = build if last else args.out / f"build_r{round_index}"
+        collect_args = ["--collect", collect] if last else []
+        with timed_stage(args.out, timings, "build" if last else f"build_r{round_index}"):
+            _run_cli("run", args.config, *common, "--mode", "build", "--builder-role", "BUILDER",
+                     "--bank", bank_dir, *collect_args, "--out", build_dir)
+            check_stage(build_dir, keys)
+        previous_bank, previous_build = bank_dir, build_dir
+    bank = previous_bank
     exported, states = args.out / "states_all.jsonl", args.out / "states.jsonl"
     with timed_stage(args.out, timings, "export"):
         _run_cli("export", args.config, "--states", collect, "--role", "builder", "--split", args.split, "--out", exported)
@@ -280,6 +304,7 @@ def run(args):
                "states_per_case": args.states_per_case, "state_limit": state_limit,
                "state_counts": counts, "samples_per_state": args.samples,
                "state_selection_seed": args.seed, "requested_temperature": args.temperature,
+               "bank_rounds": args.bank_rounds, "final_bank": str(bank),
                "config": str(args.config), "environment_fingerprint": cfg.fingerprint(),
                "states": str(states), "probe_summary": str(probe / "summary.json"),
                "stage_timings": timings,

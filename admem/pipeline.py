@@ -2,26 +2,69 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
-from .common import InvalidAction, Progress, Unknown, digest, parse, read, write, write_rows
-from .data import hint, policy_type
-from .audit_prompts import attacker_rids, feasible_types
-from .prompts import attacker_messages, builder_prompt, evidence_usage, source_view
+from .common import BudgetExceeded, InvalidAction, Progress, Unknown, digest, parse, read, write, write_rows
+from .data import TypeScheduler, hint, policy_type, resolve_type_policy
+from .audit_prompts import TYPES, attacker_rids, feasible_types, plan_item_type, structural_types
+from .prompts import attacker_messages, attacker_view_type, builder_prompt, evidence_usage, source_view
 from .store import apply, augment, neutral_round, question_key, raw_chunks, text_size
 
+# defect类别里，能靠把E原文补进M修复的那几类；none/unresolved不算当前M的缺陷。
+REPAIRABLE_DEFECTS = {"missing", "lossy_or_reasoning", "unretrievable", "retrieval_composition_candidate"}
 
-def make_pool(full, env):
+
+def make_pool(full, env, report=None):
+    """attacker的pack池。report（可选dict）回填被切分/跳过的session与round，供pack_pool.json记账。
+
+    pack_builder=legacy：旧Sampler（字符预算，超长种子session整段跳过——现在会记录下来）。
+    pack_builder=token：admem.packing.token_pool（token预算、切分长session、事实句邻居）。"""
+    if getattr(env.cfg, "pack_builder", "legacy") == "token":
+        from .packing import token_pool
+        pool, details = token_pool(full, env)
+    else:
+        pool, details = _legacy_pool(full, env)
+    if report is not None:
+        report.update(details)
+    return pool
+
+
+def _legacy_pool(full, env):
     idx = env.index(full.documents())
     sampler = env.pack_module.Sampler(full, idx, seed=env.cfg.seed, neighbors=env.cfg.neighbors,
                                        max_chars=env.cfg.pack_chars)
     # 跳过 seed 原文超出 pack 预算的 session（不截断原文）；测试替身无 fit_seeds 时保持原行为。
     if hasattr(sampler, "fit_seeds"):
         sampler.fit_seeds()
-    return sampler.sample(len(sampler.seeds))
+    skipped = []
+    for sid, row in (getattr(sampler, "ledger", None) or {}).items():
+        if isinstance(row, dict) and row.get("status") == "seed_over_budget" and sid in full.sessions:
+            rids = list(full.sessions[sid].rids)
+            # 只记中性sN，不记原始session ID（可能是answer_*标签）。
+            skipped.append({"session": rids[0].split(":")[0] if rids else None, "rounds": len(rids),
+                            "reason": "seed_over_char_budget", "pack_chars": env.cfg.pack_chars})
+    return sampler.sample(len(sampler.seeds)), {"skipped_sessions": skipped}
+
+
+def pool_summary(pool, report, cfg):
+    """pack池的可审计摘要：只含中性rid/sN与事实句查询，不含原始session ID。"""
+    packs = []
+    for i, pack in enumerate(pool):
+        seed = list(pack.seed_rids)
+        packs.append({"pack": i, "seed": seed[0].split(":")[0] if seed else None, "kind": pack.kind,
+                      "seed_rids": seed, "other_rids": [r for r in pack.rids if r not in set(seed)],
+                      "fact_queries": list(getattr(pack, "searches", None) or [])})
+    summary = {"schema": 1, "pack_builder": getattr(cfg, "pack_builder", "legacy"),
+               "neighbor_mode": getattr(cfg, "neighbor_mode", "topical"), "neighbors": cfg.neighbors,
+               "packs": packs, "skipped_sessions": report.get("skipped_sessions", []),
+               "skipped_rounds": report.get("skipped_rounds", []),
+               "split_sessions": report.get("split_sessions", [])}
+    summary.update({k: report[k] for k in ("seed_token_limit", "attacker_input_tokens") if k in report})
+    return summary
 
 
 def windows(full, counter, limit):
@@ -98,25 +141,72 @@ def builder_state(full, full_path, context, memory, x, mode, tests, env, old_ids
             "x": deepcopy(x), "entry_limit": cap, "tests": tests, "prompt": prompt}
 
 
-def attacker_state(full, full_path, context, memory, pack, accepted, env, identity):
-    """题型对该pack不可出题时返回None：调用方记为type_infeasible，不调用attacker、不产生奖励。"""
-    allowed = feasible_types(full, pack, env.cfg.seed_min_personal) if env.cfg.attacker_type_filter else None
-    qtype = policy_type(context, env.cfg, identity, allowed)
-    if qtype is None:
-        return None
-    # compact 视图可能去掉只有 assistant 的邻居；跨会话输入须有两个实际可见会话。
-    visible = attacker_rids(full, pack, qtype, env.cfg.attacker_view)
-    if qtype == "multi-session" and len({full.rounds[r].session_id for r in visible}) < 2:
-        return None
+def _sessions(full, rids):
+    return {full.rounds[r].session_id for r in rids}
+
+
+def attacker_feasible(full, pack, cfg):
+    """当前题型策略下该pack可出的题型（type_infeasible日志用）。"""
+    if resolve_type_policy(cfg) == "balanced":
+        feasible = structural_types(full, pack, cfg.attacker_view)
+        if cfg.attacker_type_filter:
+            allowed = set(feasible_types(full, pack, cfg.seed_min_personal))
+            feasible = [t for t in feasible if t in allowed]
+        return feasible
+    return feasible_types(full, pack, cfg.seed_min_personal)
+
+
+def attacker_state(full, full_path, context, memory, pack, accepted, env, identity, scheduler=None):
+    """题型对该pack不可出题时返回None：调用方记为type_infeasible，不调用attacker、不产生奖励。
+
+    official/uniform为单题型（旧行为）；balanced由TypeScheduler按结构可行性分配多题型计划，
+    不读取context里的官方题型。prompt只剩种子仍超出attacker预算时抛BudgetExceeded。"""
+    cfg = env.cfg
+    policy = resolve_type_policy(cfg)
+    plan = None
+    if policy == "balanced":
+        plan = (scheduler or TypeScheduler(cfg)).plan(attacker_feasible(full, pack, cfg), identity)
+        if not plan:
+            return None
+        qtype = next(iter(plan))
+        plan = plan if len(plan) > 1 else None  # 单题型计划沿用旧版prompt与校验
+    else:
+        allowed = feasible_types(full, pack, cfg.seed_min_personal) if cfg.attacker_type_filter else None
+        qtype = policy_type(context, cfg, identity, allowed)
+        if qtype is None:
+            return None
+        # compact 视图可能去掉只有 assistant 的邻居；跨会话输入须有两个实际可见会话。
+        if qtype == "multi-session" and len(_sessions(full, attacker_rids(full, pack, qtype, cfg.attacker_view))) < 2:
+            return None
+    shown = attacker_rids(full, pack, attacker_view_type(qtype, plan), cfg.attacker_view)
     prompt, visible = attacker_messages(full, pack, qtype, context["question_date"], memory, accepted,
-                                        env.cfg, env.counter)
-    # gate只接受attacker实际看到的round作E；compact视图下隐去的邻居不能被引用。
+                                        cfg, env.counter, type_plan=plan)
+    needs_two = "multi-session" in (plan or {qtype: 1})
+    if needs_two and len(_sessions(full, visible)) < 2:
+        if not plan:
+            raise BudgetExceeded("Attacker pack exceeds token budget: the multi-session pack keeps fewer "
+                                 "than two sessions", stage="attacker_prompt", limit=cfg.attacker_input_tokens)
+        # 预算裁掉了全部邻居：去掉multi-session槽位，按剩下的题型重新渲染。
+        plan = {t: n for t, n in plan.items() if t != "multi-session"}
+        qtype = next(iter(plan))
+        plan = plan if len(plan) > 1 else None
+        shown = attacker_rids(full, pack, attacker_view_type(qtype, plan), cfg.attacker_view)
+        prompt, visible = attacker_messages(full, pack, qtype, context["question_date"], memory, accepted,
+                                            cfg, env.counter, type_plan=plan)
+    # gate只接受attacker实际看到的round作E；compact视图下隐去的邻居、被预算裁掉的邻居都不能被引用。
+    budget_dropped = [r for r in shown if r not in set(visible)]
     pack = type(pack)(**{**pack.to_dict(), "rids": visible})
-    return {"role": "attacker", "split": context["split"], "case_key": context["key"],
-            "full_path": str(Path(full_path).resolve()), "full_hash": full.fingerprint,
-            "hint_mode": env.cfg.hint_mode, "environment_fingerprint": env.cfg.fingerprint(), "M": deepcopy(memory), "pack": pack.to_dict(),
-            "date": context["question_date"], "qtype": qtype, "prompt": prompt,
-            "seen_keys": [question_key(q) for q in accepted], "evidence_usage": evidence_usage(accepted)}
+    state = {"role": "attacker", "split": context["split"], "case_key": context["key"],
+             "full_path": str(Path(full_path).resolve()), "full_hash": full.fingerprint,
+             "hint_mode": cfg.hint_mode, "environment_fingerprint": cfg.fingerprint(), "M": deepcopy(memory), "pack": pack.to_dict(),
+             "date": context["question_date"], "qtype": qtype, "prompt": prompt,
+             "seen_keys": [question_key(q) for q in accepted], "evidence_usage": evidence_usage(accepted),
+             "type_policy": policy}
+    if plan:
+        state["type_plan"] = dict(plan)
+    if budget_dropped:
+        state["budget_dropped_rids"] = budget_dropped
+    return state
 
 
 class Collector:
@@ -223,23 +313,32 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
             return {"status": "ok", "M_tokens": text_size(memory, env.counter), "Q_size": 0,
                     "fallback_count": sum(e.get("fallback", False) for e in events)}
         pool = make_pool(full, env)
+        scheduler = TypeScheduler(env.cfg) if resolve_type_policy(env.cfg) == "balanced" else None
         ledger = []
         for sweep in range(env.cfg.sweeps):
             before_cycle = digest(memory)
             for pi, pack in enumerate(pool):
                 identity = [namespace, sweep, pi]
-                state = attacker_state(full, full_path, context, memory, pack, accepted, env, identity)
-                if state is None:
-                    evaluation = {"legal": True, "items": [], "skipped": "type_infeasible"}
+                try:
+                    state = attacker_state(full, full_path, context, memory, pack, accepted, env, identity, scheduler)
+                except BudgetExceeded:
+                    # 确定性预算溢出：跳过该pack，不让一个装不下的pack中止整个case。
+                    state, evaluation = None, {"legal": True, "items": [], "skipped": "over_budget"}
                 else:
+                    evaluation = {"legal": True, "items": [], "skipped": "type_infeasible"}
+                if state is not None:
                     raw = propose(state, env, attacker_role, f"{namespace}:audit:{sweep}:{pi}")
-                    evaluation = env.attacker_score(full, state, raw)
+                    try:
+                        evaluation = env.attacker_score(full, state, raw)
+                    except BudgetExceeded:
+                        evaluation = {"legal": True, "items": [], "skipped": "over_budget"}
                 if collect and state is not None:
                     # teacher出题SFT只收本来就有效的完整输出，不能把gate修订答案写成policy输出。
                     all_valid = evaluation.get("items") and all(
                         r["status"] == "accepted" and not r.get("repaired") for r in evaluation["items"])
                     collect.save(state, raw if all_valid else None, {"gate": bool(all_valid)})
-                ledger.append({"seed": pack.seed_id, "sweep": sweep, "M_hash": digest(memory),
+                ledger.append({"seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None,
+                               "sweep": sweep, "M_hash": digest(memory),
                                "status": evaluation.get("skipped") or ("asked" if evaluation.get("items") else
                                          "audited_empty" if evaluation.get("legal") else "invalid_output")})
                 infos = list(evaluation.get("items", []))
@@ -329,16 +428,27 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
         raise
 
 
-def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_path=None, attempt=0):
+def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_path=None, attempt=0,
+               memory=None, scheduler=None, defects_only=False):
     """Run one pack (attacker propose + gate). Raises Unknown on API/service failure.
 
     Pure with respect to the caller's ``accepted``/``logs`` so a failed pack can
     be retried without duplicating rows.  Returns ``(info, logs, new_items)``.
+
+    预算溢出是确定性的，不抛给重试逻辑：pack级（只剩种子仍装不下）记一行over_budget并返回；
+    题级（gate的judge装不下）只把该题记为over_budget，同包其余题照常判定。
+    memory非空时attacker针对这份记忆出题（看得到provenance标记与memory_entries），通过gate的题
+    记录defect类别；defects_only=True时不暴露缺陷的题记为accepted_no_defect、不进bank。
     """
+    memory = list(memory or [])
+    balanced = resolve_type_policy(env.cfg) == "balanced"
     # 日志只记中性sN，不记原始seed_id（可能是answer_*标签）。
     info = {"pack": pi, "seed": pack.seed_rids[0].split(":")[0] if pack.seed_rids else None,
-            "case_question_type": context["question_type"], "qtype": hint(context, env.cfg),
+            "case_question_type": context["question_type"],
+            "qtype": None if balanced else hint(context, env.cfg),
             "pack_sessions": len({full.rounds[r].session_id for r in pack.rids})}
+    if memory:
+        info["memory_entries"] = len(memory)
     trace = None
     if trace_path is not None:
         trace_path = Path(trace_path)
@@ -350,6 +460,8 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
                  "prompt": None, "prompt_kind": "policy_prompt", "prompt_hash": None,
                  "request_body": None, "raw": None, "logs": [], "added_items": [],
                  "stage": "preparing", "error": None}
+        if memory:
+            trace["memory_hash"] = digest(memory)
 
     def snapshot(stage, **values):
         if trace is not None:
@@ -358,16 +470,25 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
 
     snapshot("preparing")
     try:
-        state = attacker_state(full, full_path, context, [], pack, accepted, env, ["bank", pi])
+        try:
+            state = attacker_state(full, full_path, context, memory, pack, accepted, env, ["bank", pi], scheduler)
+        except BudgetExceeded as exc:
+            logs = [{**info, "status": "over_budget", **exc.details()}]
+            snapshot("over_budget", logs=logs)
+            return info, logs, []
         if state is None:
             logs = [{**info, "status": "type_infeasible", "reason": "requested_type_not_feasible",
-                     "feasible_types": feasible_types(full, pack, env.cfg.seed_min_personal)}]
+                     "feasible_types": attacker_feasible(full, pack, env.cfg)}]
             snapshot("skipped", logs=logs)
             return info, logs, []
         pack = env.pack_module.Pack(**state["pack"])
         info.update(qtype=state["qtype"], prompt_tokens=env.counter.prompt_count(state["prompt"]),
                     visible_rounds=len(pack.rids),
                     visible_sessions=len({full.rounds[r].session_id for r in pack.rids}))
+        if state.get("type_plan"):
+            info["type_plan"] = dict(state["type_plan"])
+        if state.get("budget_dropped_rids"):
+            info["budget_dropped_rounds"] = len(state["budget_dropped_rids"])
         remote = env.policy(role)
         nonce = "bank:" + digest([state["prompt"], remote.tag])
         snapshot("prepared", prompt=state["prompt"], prompt_hash=digest(state["prompt"]),
@@ -391,14 +512,34 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
         if not data["items"]:
             logs.append({**info, "status": "empty"})
         new_items, seen = [], {question_key(x) for x in accepted}
+        plan, used = state.get("type_plan"), Counter()
         for q in data["items"]:
-            result = env.gate(full, pack, q, state["date"], state["qtype"])
-            logs.append({**info, **result})
+            qtype = plan_item_type(state, q, used)
+            try:
+                if plan:
+                    result = env.gate(full, pack, q, state["date"], qtype, seed_only=True)
+                else:
+                    result = env.gate(full, pack, q, state["date"], qtype)
+            except BudgetExceeded as exc:
+                logs.append({**info, "status": "over_budget", **exc.details(), "item": q})
+                snapshot("gating", logs=logs, added_items=new_items)
+                continue
+            row = {**info, **result}
+            if plan and isinstance(q, dict) and q.get("type") in TYPES:
+                row["qtype"] = q["type"]
             if result["status"] == "accepted":
                 checked = result["item"]
-                if question_key(checked) not in seen:
+                if memory and env.cfg.bank_defects:
+                    try:
+                        row["defect"] = env.defect(full, memory, checked)["kind"]
+                    except BudgetExceeded as exc:
+                        row.update(defect="over_budget", defect_budget=exc.details())
+                    if defects_only and row["defect"] not in REPAIRABLE_DEFECTS:
+                        row["status"] = "accepted_no_defect"
+                if row["status"] == "accepted" and question_key(checked) not in seen:
                     seen.add(question_key(checked))
                     new_items.append(checked)
+            logs.append(row)
             snapshot("gating", logs=logs, added_items=new_items)
         snapshot("complete", logs=logs, added_items=new_items)
         return info, logs, new_items
@@ -409,14 +550,44 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
         raise
 
 
-def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
+def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory=None, base_bank=None,
+                  memory_source=None, defects_only=False):
+    """为一个case生成题库。
+
+    memory：attacker针对的当前M（默认空M，即旧行为的冷启动题库）。base_bank：已有题库，作为
+    accepted的初值参与去重、novelty计数与audit_context，输出的bank.json是合并后的结果。
+    pack_pool.json记录pack构成与被切分/跳过的session、round；bank_manifest.json记录题型策略、
+    记忆快照与基础题库的hash。"""
     out = Path(out)
-    accepted, logs = [], []
-    pool = make_pool(full, env)
+    memory = list(memory or [])
+    accepted, keys = [], set()
+    for q in base_bank or []:
+        if question_key(q) not in keys:
+            keys.add(question_key(q))
+            accepted.append(clean_question(q))
+    base_size = len(accepted)
+    logs = []
+    pool_report = {}
+    pool = make_pool(full, env, pool_report)
+    policy = resolve_type_policy(env.cfg)
+    scheduler = TypeScheduler(env.cfg) if policy == "balanced" else None
+    write(out / "pack_pool.json", pool_summary(pool, pool_report, env.cfg))
+    write(out / "bank_manifest.json", {
+        "schema": 1, "type_policy": policy, "hint_mode": env.cfg.hint_mode,
+        "label_informed_types": policy == "official",
+        "pack_builder": getattr(env.cfg, "pack_builder", "legacy"),
+        "neighbor_mode": getattr(env.cfg, "neighbor_mode", "topical"),
+        "memory": {"entries": len(memory), "hash": digest(memory) if memory else None, "source": memory_source},
+        "base_bank": {"questions": base_size, "hash": digest(accepted) if accepted else None},
+        "defects_only": bool(defects_only), "environment_fingerprint": env.cfg.fingerprint()})
+    if policy == "official":
+        print(f"[bank] {context['key']}: type_policy=official uses the case's gold question type "
+              "(diagnostic only, not a label-free result)", file=sys.stderr, flush=True)
     # <variant>/<case>：PARALLEL=1 多进程混排时能区分是哪条流水线。
     parent = Path(out).parent.name
     bar = Progress(len(pool), label=f"{parent}/{context['key']}")
     # 瞬时API失败只重试这条pack（attacker响应走缓存，重试便宜）；连续失败到上限才中止整个case。
+    # 预算溢出是确定性的：不重试，不计入连续失败。
     retries = max(1, int(os.getenv("PACK_RETRIES", "2")))
     backoff = float(os.getenv("PACK_BACKOFF", "1.0"))
     fail_limit = max(1, int(os.getenv("PACK_FAIL_LIMIT", "5")))
@@ -428,7 +599,12 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
             try:
                 info, pack_logs, new_items = _bank_pack(
                     full, full_path, context, pack, pi, accepted, env, role,
-                    trace_path=trace_path, attempt=attempt)
+                    trace_path=trace_path, attempt=attempt, memory=memory, scheduler=scheduler,
+                    defects_only=defects_only)
+                break
+            except BudgetExceeded as exc:  # 兜底：_bank_pack之外的确定性溢出
+                pack_logs, new_items = [{"pack": pi, "status": "over_budget", **exc.details(),
+                                         "trace_file": str(trace_path.relative_to(out))}], []
                 break
             except Unknown as exc:
                 if attempt + 1 >= retries:
@@ -450,7 +626,8 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER"):
         accepted.extend(new_items)
         write(out / "bank.json", accepted)
         write(out / "bank_log.json", logs)
-        bar.update(suffix=f"p{pi} qtype={info.get('qtype')} bank={len(accepted)}")
+        status = "over_budget" if pack_logs and all(r.get("status") == "over_budget" for r in pack_logs) else None
+        bar.update(suffix=f"p{pi} qtype={info.get('qtype')} bank={len(accepted)}" + (f" {status}" if status else ""))
     bar.close()
     write(out / "bank.json", accepted)
     write(out / "bank_log.json", logs)

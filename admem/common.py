@@ -101,6 +101,20 @@ class Unknown(RuntimeError):
     """环境未完成：停止或跳过整组，不产生负奖励。"""
 
 
+class BudgetExceeded(Unknown):
+    """确定性的预算溢出：某个prompt装不进配置的token预算，重试也不会变。
+
+    仍是Unknown（不产生负奖励、不截断原文），但调用方可以据此跳过并单独记账，
+    而不是当成网络/服务失败去重试、计入连续失败并放弃整个case。"""
+
+    def __init__(self, message, *, stage, tokens=None, limit=None):
+        super().__init__(message)
+        self.stage, self.tokens, self.limit = stage, tokens, limit
+
+    def details(self):
+        return {"stage": self.stage, "tokens": self.tokens, "limit": self.limit, "reason": str(self)}
+
+
 def parse(text):
     try:
         value = json.loads(text)
@@ -224,10 +238,34 @@ class Config:
     # 防reward hacking：反复引用同一round按1/(1+平均已用次数)衰减；非SSA题证据无一人称个人陈述时降权。
     evidence_novelty: bool = True
     impersonal_weight: float = 0.25
+    # ---- 出题流水线。dataclass默认值=旧行为；推荐组合见 configs/hidden_4b_nogate_v2.json ----
+    # pack构建：legacy=旧Sampler（字符预算，超长种子整段跳过）；token=按attacker真实token预算
+    # 构建，超长session切成多个连续片段，单个round装不下时记录而不是静默丢弃。
+    pack_builder: str = "legacy"
+    # 邻居：topical=种子每条用户发言整段检索round（旧）；facts=从种子用户发言里挑一人称事实句，
+    # 逐句检索其他session的用户句；hybrid=先facts，名额不足再用topical补齐。
+    neighbor_mode: str = "topical"
+    neighbor_session_cap: int = 2   # facts/hybrid：先每个session取1个round，余量才放宽到此上限
+    fact_queries: int = 8           # 每个种子最多几条事实句查询
+    fact_query_k: int = 10          # 每条事实句召回几个用户句
+    pack_neighbor_reserve: float = 0.3  # token构建：切分种子时给邻居预留的attacker预算比例
+    # 题型分配：auto=旧行为（target_type→官方题型；hidden→按hash单题型）；official=case官方题型
+    # （标签泄漏，仅作诊断）；uniform=按hash单题型；balanced=按可行性与配额缺口逐包分配多题型，
+    # 完全不读官方题型。
+    type_policy: str = "auto"
+    types_per_pack: int = 2         # balanced：每包几个不同题型，questions_per_pack平均分给它们
+    type_weights: dict | None = None  # balanced：目标题型比例；None=六类均匀
+    screen_k: int = 30              # gate宽检索候选数；装不进judge预算时按排名截断并记录
+    bank_defects: bool = True       # bank针对非空M时，为通过gate的题记录defect类别
 
     @classmethod
     def load(cls, path):
         c = cls(**read(path)) if path else cls()
+        c.validate()
+        return c
+
+    def validate(self):
+        c = self
         if c.hint_mode not in {"target_type", "hidden"} or c.defect_mode not in {"strict", "direct"}:
             raise ValueError("Unknown hint_mode/defect_mode")
         if c.embedding not in {"none", "local", "api"} or c.gate_mode not in {"basic", "full"}:
@@ -247,6 +285,23 @@ class Config:
                           c.builder_retention_weight, c.builder_redundancy_weight]
         if any(not math.isfinite(w) or w < 0 for w in reward_weights):
             raise ValueError("Builder reward weights must be finite and nonnegative")
+        if c.pack_builder not in {"legacy", "token"}:
+            raise ValueError("Unknown pack_builder")
+        if c.neighbor_mode not in {"topical", "facts", "hybrid"}:
+            raise ValueError("Unknown neighbor_mode")
+        if c.type_policy not in {"auto", "official", "uniform", "balanced"}:
+            raise ValueError("Unknown type_policy")
+        if (min(c.neighbor_session_cap, c.fact_queries, c.fact_query_k, c.screen_k, c.types_per_pack) < 1
+                or c.neighbors < 0 or not 0 <= c.pack_neighbor_reserve < 1):
+            raise ValueError("Invalid pack/neighbor/type settings")
+        if c.type_weights is not None:
+            from .audit_prompts import TYPES  # 局部导入，避免循环依赖
+            if (not isinstance(c.type_weights, dict) or not c.type_weights
+                    or set(c.type_weights) - set(TYPES)
+                    or any(isinstance(w, bool) or not isinstance(w, (int, float))
+                           or not math.isfinite(w) or w < 0 for w in c.type_weights.values())
+                    or not sum(c.type_weights.values()) > 0):
+                raise ValueError("type_weights must map known question types to nonnegative weights")
         return c
 
     def fingerprint(self):

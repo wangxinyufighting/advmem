@@ -495,6 +495,12 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
     return summary
 
 
+def _require_case_files(root, keys, name, flag):
+    missing = [key for key in keys if not (Path(root) / key / name).is_file()]
+    if missing:
+        raise SystemExit(f"{flag} {root} has no {name} for {len(missing)} case(s), first: {missing[0]}")
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("command", choices=["check", "prepare", "bank", "run", "bootstrap", "probe-suite", "probe", "attacker-probe", "export", "relocate", "evaluate", "longmemeval-eval", "merge"])
@@ -517,6 +523,14 @@ def main(argv=None):
     p.add_argument("--attacker-role", default="ATTACKER")
     p.add_argument("--collect", help="保存状态和通过验证的模型示范")
     p.add_argument("--bank", help="bank命令输出根目录，用于stream训练状态的自生成问答奖励")
+    p.add_argument("--memory-run", help="bank/attacker-probe：用该run目录下每个case的记忆快照作为attacker"
+                   "针对的当前M（默认空M，即冷启动题库）")
+    p.add_argument("--memory-snapshot", default="M_build",
+                   help="与--memory-run配合：M_build / M_final / M_audit_0（默认M_build）")
+    p.add_argument("--base-bank", help="bank：在该已有bank目录的基础上追加；旧题参与去重/novelty/audit_context，"
+                   "输出合并后的bank.json")
+    p.add_argument("--defects-only", action="store_true",
+                   help="bank+--memory-run：新题只保留暴露当前M缺陷（missing/lossy/unretrievable）的题")
     p.add_argument("--role", choices=["builder", "attacker"], default="builder")
     p.add_argument("--samples", type=int, default=8)
     p.add_argument("--max-packs", type=int, help="attacker-probe：每个case取前N个pack")
@@ -605,10 +619,13 @@ def main(argv=None):
         if a.samples < 2:
             p.error("attacker-probe requires --samples >= 2（否则无法测组内方差）")
         entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
+        if a.memory_run:
+            _require_case_files(a.memory_run, [c["key"] for c, _ in entries], a.memory_snapshot + ".json", "--memory-run")
         summary = run_attacker_probe(entries, env, a.out, samples=a.samples,
                                      role=a.attacker_role, max_packs=a.max_packs,
                                      temperature=a.temperature,
-                                     pack_sample=a.pack_sample, pack_seed=a.pack_seed)
+                                     pack_sample=a.pack_sample, pack_seed=a.pack_seed,
+                                     memory_run=a.memory_run, memory_snapshot=a.memory_snapshot)
         print({k: summary[k] for k in ("groups", "signal_group_rate", "diagnosis_rates",
                                        "reward_std_mean", "reward_overall_mean",
                                        "reward_min", "reward_max")})
@@ -642,6 +659,16 @@ def main(argv=None):
         return
     reports = []
     entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
+    if a.command != "bank" and (a.memory_run or a.base_bank or a.defects_only):
+        p.error("--memory-run/--base-bank/--defects-only apply to bank (and --memory-run to attacker-probe)")
+    if a.defects_only and not a.memory_run:
+        p.error("--defects-only needs --memory-run: defects are measured against a built memory")
+    if a.command == "bank":
+        # 先检查全部输入，避免跑了一半才发现某个case缺快照。
+        if a.memory_run:
+            _require_case_files(a.memory_run, [c["key"] for c, _ in entries], a.memory_snapshot + ".json", "--memory-run")
+        if a.base_bank:
+            _require_case_files(a.base_bank, [c["key"] for c, _ in entries], "bank.json", "--base-bank")
     # 带输出目录名，PARALLEL=1 时各进程的进度条才能区分。
     bar = Progress(len(entries), label=f"{a.command} {Path(a.out).name}")
     for context, full_path in entries:
@@ -657,7 +684,12 @@ def main(argv=None):
                 result = {"status": "ok", **bootstrap(full, full_path, context, memory, bank, env,
                           Collector(a.collect), a.builder_role, cfg.replay_questions)}
             elif a.command == "bank":
-                n = generate_bank(full, full_path, context, env, Path(a.out) / key, a.attacker_role)
+                memory = read(Path(a.memory_run) / key / (a.memory_snapshot + ".json")) if a.memory_run else None
+                base = read(Path(a.base_bank) / key / "bank.json") if a.base_bank else None
+                source = f"{Path(a.memory_run).resolve()}/{key}/{a.memory_snapshot}.json" if a.memory_run else None
+                n = generate_bank(full, full_path, context, env, Path(a.out) / key, a.attacker_role,
+                                  memory=memory, base_bank=base, memory_source=source,
+                                  defects_only=a.defects_only)
                 result = {"status": "ok", "questions": n}
             else:
                 bank = read(Path(a.bank) / key / "bank.json") if a.bank else []

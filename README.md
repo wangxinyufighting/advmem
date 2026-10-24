@@ -309,7 +309,7 @@ python run.py attack \
 
 attacker 输入只有：原文pack、M provenance标记、题型、case允许使用的 `question_date`。不传目标问题/答案/证据标签。`question_date`逐字复制；题型使用官方名称，并接受设计中的 `preference` / `temporal` 别名。
 
-题型来源由 `hint_mode` 决定。`configs/type_aware.json`（`target_type`）把**当前case的官方题型**交给 attacker/builder，属于有意的类型已知诊断基线，不是无标签设定；`configs/type_hidden.json`（`hidden`）按pack确定性随机抽题型，才是主结果设定。admem 中可用以下配置给 4B attacker 减负、抑制刷分：
+题型来源由 `hint_mode` 决定（admem 里 attacker 侧现由 `type_policy` 单独控制，默认 `auto` 保持本段行为，`balanced` 不读官方题型，见第13节）。`configs/type_aware.json`（`target_type`）把**当前case的官方题型**交给 attacker/builder，属于有意的类型已知诊断基线，不是无标签设定；`configs/type_hidden.json`（`hidden`）按pack确定性随机抽题型，才是主结果设定。admem 中可用以下配置给 4B attacker 减负、抑制刷分：
 
 - `attacker_view: "compact"`：单session题型只给种子session；跨session题型给种子全文+邻居的user消息（`assistant_elided`），被隐去的round不允许作为E。
 - `attacker_type_filter: true`：SSA 要求种子有 assistant 回复；multi-session 只检查输入中有至少两个实际可见的 session，个人相关性和跨会话必要性由 gate 验证。其余题型保留 `seed_min_personal` 词表预筛。不能用人称词表未命中来证明 multi-session 不可出题，例如 `I bought…`、`It cost…` 都可能未命中。不可出时该 pack 记为 `type_infeasible`，不调用 attacker、不产生奖励。
@@ -531,3 +531,65 @@ python scripts/audit_bank_packs.py \
 先看 `pack_audit/index.json`，再看其中列出的 `<case>/pack_<编号>.json`。每份报告包含同包的 `bank_log`、输入/原始输出、可见文本与原文的对照，以及未展示的前后 round。人工检查：两个会话的事实有何联系、是否缺少前提、隐藏文本是否关键、是否能构造合格问题、gate 的拒绝是否合理；填写 `manual_review` 即可。
 
 旧运行没有 trace 时，脚本可从 API 缓存按历史内容和模型输出查找候选；即使只有一个候选也标为 `cache_candidates_unverified`，不宣称已恢复原始 pack。没有日志关联的快照标为 `trace_candidates_unverified`；有明确关联时，只合并同一输入对应的此前重试，排除旧目录残留的其他尝试。无匹配则标为 `unavailable`，预筛跳过标为 `not_sent`。`debug_bank_pack.py` 会重新构造输入，不带历史时刻的完整已接受题上下文，因此不应用来证明旧运行当时发送了什么。需要指定包时追加 `--keys c0070 --packs 0 3`，编号与 bank 日志一致，从 0 开始。脚本拒绝覆盖已有抽查目录。
+
+## 13. 出题流水线修复（pipeline v2）
+
+新增配置项的默认值都保持旧行为；推荐组合见 `configs/hidden_4b_nogate_v2.json`，它与 `type_aware_4b_nogate.json` 的 Builder/judge 设置相同，只改了 `hint_mode` 和出题相关项。源码改动会改变环境指纹，旧的 states/bank 需要重新生成到新目录。
+
+### 13.1 预算溢出不再伪装成网络失败
+
+- 新异常 `BudgetExceeded`（`Unknown` 的子类，仍不产生负奖励）：attacker prompt、judge、reader、builder prompt、edit coverage 的预算检查都抛它，并带 `stage/tokens/limit`。
+- bank：只剩种子仍装不下的 pack 记一行 `status=over_budget, stage=attacker_prompt`，不重试、不计入连续失败，不会再让整个 case 因“连续 5 个 pack API 失败”被放弃。gate 里某道题的 judge 装不下时，只把这道题记为 `over_budget`，同包其他题照常判定。
+- attacker prompt 超预算时：先同时去掉 `memory_entries` 与 `audit_context`（旧行为，之前能装下的 pack 得到逐字相同的 prompt）；仍不够则从只含种子开始，按 `pack.rids` 顺序逐个加回邻居，装不下的跳过。被裁掉的 round 记在 state 的 `budget_dropped_rids` 和日志的 `budget_dropped_rounds`，gate 不接受引用它们的 E。
+- gate 的宽检索 screen：E∪top-`screen_k` 装不进 judge 预算时，E 完整保留，其余按检索排名放到装满为止，记录在 gate 结果的 `screen_budget`；全部装得下时与旧实现逐字相同。
+- closed_loop 中预算溢出的 pack 记为 `over_budget` 并跳过；attacker-probe 中不可评分的样本 reward 为 null，不计入统计。
+
+### 13.2 token 预算的 pack 与事实句邻居（`pack_builder: token`）
+
+- 用 attacker tokenizer 和最长的 system prompt 估算种子长度。session 超过 `(1-pack_neighbor_reserve)×attacker_input_tokens` 时切成多个连续片段（`kind=session_part`），连 system 都装不下的单个 round 记入 bank 目录 `pack_pool.json` 的 `skipped_rounds`，不截断、不静默丢弃。
+- `neighbor_mode`：`topical` 为旧做法（种子每条用户发言整段检索 round）；`facts` 从种子用户发言中挑一人称事实句（`I bought a road bike for $900`），逐句检索其他 session 的用户句，RRF 合并后先每个 session 取 1 个 round，再放宽到 `neighbor_session_cap`；`hybrid`（推荐）先 facts，名额不足再用 topical 补齐。LongMemEval 的证据多是任务型对话里顺带提到的个人事实，整段发言作查询时会被对话主题主导。
+- 事实句是启发式：必须含一人称，数字/专名/“I bought”“my X”类事件加分，“can you / write / explain”等请求开头扣分；超长缺标点的段落只取一人称词附近的窗口。它只决定检索查询，不决定出什么题，也不读评测标签。`pack.rids` 为种子 round 加按排名的邻居，渲染时仍按时间重排。
+- `scripts/pack_coverage.py` 离线比较各组合下，官方跨 session 证据被同一个 pack（按 attacker 跨会话视图和 token 预算）同时看到的比例。它读 `private_eval.jsonl`，只用于比较设计，默认拒绝 test split：
+
+```bash
+python scripts/pack_coverage.py --config configs/hidden_4b_nogate_v2.json \
+  --prepared data/prepared_longmemeval --split train \
+  --modes legacy:topical token:topical token:facts token:hybrid --out runs/pack_coverage_train.json
+```
+
+### 13.3 attacker 题型与官方题型解耦（`type_policy`）
+
+| 取值 | 行为 |
+| --- | --- |
+| `auto`（默认） | 旧行为：`target_type`→`official`，`hidden`→`uniform` |
+| `official` | 每个 pack 用 case 官方题型。这是评测标签：bank 会打印警告，`bank_manifest.json` 记 `label_informed_types: true`，只能作诊断 |
+| `uniform` | 旧 hidden：按 hash 在可行题型里选一个 |
+| `balanced` | `TypeScheduler` 按结构可行性与本 case 已请求槽位的缺口，每包分配 `types_per_pack` 个题型，`questions_per_pack` 平均分给它们；目标比例由 `type_weights` 给出（默认六类均匀）；完全不读官方题型 |
+
+结构可行性：single-session-assistant 需要种子里有 assistant 文本；multi-session 需要跨会话视图下至少两个 session；其余题型需要种子里有 user 文本；开启 `attacker_type_filter` 时再与人称词表预筛取交集。多题型 prompt 用 `slots` 和各题型的 `max_evidence_rounds`；超出计划（题型不在计划内或超出槽位数）的题按题型不符拒绝，单 session 题型只能引用种子 round。bank 日志按每道题的实际题型统计。`hint_mode` 仍只决定 Builder/Reader 是否看到题型提示。
+
+### 13.4 针对当前记忆出题（对抗题库）
+
+```bash
+# 第0轮：空M冷启动题库（与旧行为相同）
+python -m admem.cli bank --config configs/hidden_4b_nogate_v2.json \
+  --prepared data/prepared_longmemeval --split train --out runs/bank_r0
+python -m admem.cli run --config configs/hidden_4b_nogate_v2.json \
+  --prepared data/prepared_longmemeval --split train --mode build --bank runs/bank_r0 --out runs/build_r0
+# 第1轮：针对M_build出题，并入旧题库；--defects-only只保留暴露当前M缺陷的新题
+python -m admem.cli bank --config configs/hidden_4b_nogate_v2.json \
+  --prepared data/prepared_longmemeval --split train \
+  --memory-run runs/build_r0 --memory-snapshot M_build --base-bank runs/bank_r0 \
+  --defects-only --out runs/bank_r1
+```
+
+- attacker 看得到 `referenced_by_memory` 与（预算允许时）`memory_entries`；旧题进入去重、novelty 计数与 `audit_context`。通过 gate 的题在 `bank_log.json` 记录 `defect`（`missing`/`lossy_or_reasoning`/`unretrievable`/`none`/`unresolved`），`--defects-only` 时不暴露缺陷的题记为 `accepted_no_defect`、不进 bank。
+- `scripts/probe_longmemeval.py --bank-rounds 2 [--bank-defects-only]` 自动执行上述轮次，只在最后一轮 build 时收集状态；默认 `--bank-rounds 1` 与旧流程相同。
+- `attacker-probe --memory-run runs/build_r0` 让 attacker 奖励里的 defect 项针对真实记忆计算；不传时 summary 会注明空 M 下 defect 项退化为常数。
+- 每个 bank case 目录新增 `pack_pool.json`（pack 构成、事实句查询、被切分/跳过的 session 与 round，只含中性 ID）与 `bank_manifest.json`（题型策略、记忆快照与基础题库的 hash）。
+
+### 13.5 划分与日志
+
+- `prepare_longmemeval_cases.py`：`--manifest data/prepared_longmemeval/manifest.json` 直接沿用 admem 的划分，与 admem 产物混用时必须这样做；不传时，完全相同的历史按组内字典序最小的 question_id 一起 hash（单例组的划分与旧版相同），`_abs` 等共享历史的变体不会跨 split。`--select-sessions all` 不用官方证据标签挑选 session（默认 `evidence` 仍是旧行为，报告中标 `label_informed_selection: true`）；`--no-question-meta` 去掉 prompt 中的官方题型/日期；`--max-history-sessions K` 只内联最近 K 个 session。
+- legacy pack 构建跳过的超长种子 session 写入 `pack_pool.json` 的 `skipped_sessions`；closed_loop 的 `ledger.json` 只记中性 `sN`，不再写原始 session ID。
+- `scripts/attacker_report.py` 单独统计 `over_budget`、`accepted_no_defect` 与 defect 类别；`audit_bank_packs.py` 把 prompt 阶段溢出的 pack 标为 `not_sent`。

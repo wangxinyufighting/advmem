@@ -184,11 +184,68 @@ def hint(context, cfg):
     return context["question_type"] if cfg.hint_mode == "target_type" else None
 
 
+def resolve_type_policy(cfg):
+    """attacker题型分配策略。auto保持旧行为：target_type→official，hidden→uniform。
+
+    type_policy与hint_mode解耦：hint_mode只决定Builder/Reader是否看到题型提示；
+    只有official会把case的官方题型（评测标签）交给attacker。"""
+    policy = getattr(cfg, "type_policy", "auto")
+    if policy == "auto":
+        return "official" if cfg.hint_mode == "target_type" else "uniform"
+    return policy
+
+
 def policy_type(context, cfg, identity, allowed=None):
-    """target_type固定为case题型；不在allowed内时返回None（该pack跳过，不强迫编题）。"""
+    """单题型策略：official固定为case官方题型（标签泄漏，仅诊断）；uniform按(seed, identity)的hash
+    在allowed里均匀选一个。不在allowed内时返回None（该pack跳过，不强迫编题）。"""
     from .audit_prompts import TYPES
-    if cfg.hint_mode == "target_type":
+    if resolve_type_policy(cfg) == "official":
         qtype = context["question_type"]
         return qtype if allowed is None or qtype in allowed else None
     choices = [t for t in TYPES if allowed is None or t in allowed]
     return choices[int(digest([cfg.seed, identity]), 16) % len(choices)] if choices else None
+
+
+class TypeScheduler:
+    """balanced策略：逐包给出多题型计划，从不读取case官方题型。
+
+    每个pack在结构可行的题型里选types_per_pack个，questions_per_pack个槽位平均分给它们。
+    选择按“目标比例×(已分配+本次)−已分配”的缺口从大到小贪心，同分用(seed, identity, 题型)的hash
+    打破，结果可复现。同一identity重复调用（例如pack因网络失败重试）返回同一计划且不重复计数。
+    计数只统计“请求的槽位”，与模型输出、gate结果无关。"""
+
+    def __init__(self, cfg):
+        from .audit_prompts import TYPES
+        weights = cfg.type_weights or {t: 1.0 for t in TYPES}
+        total = float(sum(weights.values()))
+        self.types = list(TYPES)
+        self.share = {t: float(weights.get(t, 0.0)) / total for t in TYPES}
+        self.cfg = cfg
+        self.requested = Counter()
+        self.plans = {}
+
+    def plan(self, feasible, identity):
+        key = digest(identity)
+        if key in self.plans:
+            return dict(self.plans[key])
+        candidates = [t for t in self.types if t in set(feasible) and self.share[t] > 0]
+        n_types = min(self.cfg.types_per_pack, self.cfg.questions_per_pack, len(candidates))
+        if n_types < 1:
+            self.plans[key] = {}
+            return {}
+        base, extra = divmod(self.cfg.questions_per_pack, n_types)
+        slots = [base + (1 if i < extra else 0) for i in range(n_types)]
+        counts, chosen = Counter(self.requested), {}
+        for size in slots:
+            total = sum(counts.values()) + size
+
+            def priority(t):
+                return (self.share[t] * total - counts[t],
+                        int(digest([self.cfg.seed, identity, t]), 16))
+
+            qtype = max((t for t in candidates if t not in chosen), key=priority)
+            chosen[qtype] = size
+            counts[qtype] += size
+        self.requested.update(chosen)
+        self.plans[key] = dict(chosen)
+        return dict(chosen)
