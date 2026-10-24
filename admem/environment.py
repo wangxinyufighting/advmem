@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
+from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 
 from .common import Remote, Unknown, InvalidAction, digest, messages, parse
@@ -51,6 +54,19 @@ class Environment:
         self.embedder = self.reranker = None
         self.loaded = False
         self.index_cache = {}  # 每个进程仅保留最近少量M索引，不随训练无限增长。
+        self._answer_cache = None
+
+    @contextmanager
+    def cached_answers(self, max_entries=256):
+        """同一冻结环境中的一组采样复用完整答案；退出时释放，不跨状态混用。"""
+        if max_entries < 1:
+            raise ValueError("Answer cache size must be positive")
+        previous = self._answer_cache
+        self._answer_cache = (OrderedDict(), max_entries)
+        try:
+            yield
+        finally:
+            self._answer_cache = previous
 
     def policy(self, role):
         if role not in self.clients:
@@ -129,13 +145,23 @@ class Environment:
     def answer(self, memory, q, *, all_memory=False, abstention=False, type_hint=None):
         if type_hint is None:
             type_hint = self.cfg.hint_mode == "target_type"
+        cache = self._answer_cache
+        cache_key = digest([memory, q, all_memory, abstention, type_hint]) if cache is not None else None
+        if cache is not None and cache_key in cache[0]:
+            cache[0].move_to_end(cache_key)
+            return deepcopy(cache[0][cache_key])
         context, ids = self.context(memory, q, all_memory)
         # cache身份包含实际文本、日期、模型配置和完整问答；服务客户端还会hash完整request。
         key = digest([context, q, all_memory, abstention, type_hint])
         answer = self.reader(q, context, key, task_type=q["type"] if type_hint else None)
         correct = self.grade(q, answer, key, abstention)
-        return {"correct": correct, "answer": answer, "visible_ids": ids,
-                "context_tokens": self.counter.count(context)}
+        result = {"correct": correct, "answer": answer, "visible_ids": ids,
+                  "context_tokens": self.counter.count(context)}
+        if cache is not None:
+            cache[0][cache_key] = deepcopy(result)
+            if len(cache[0]) > cache[1]:
+                cache[0].popitem(last=False)
+        return result
 
     def faith(self, full, changed):
         if not changed:

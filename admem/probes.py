@@ -1,13 +1,15 @@
 """Builder基础能力诊断：独立合成情境，不使用LongMemEval官方问题作为训练奖励。"""
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
+from copy import deepcopy
 import hashlib
 import json
 import os
 import random
 from pathlib import Path
 from statistics import mean, pstdev
+from time import perf_counter
 
 from .common import Progress, Unknown, digest, read, write, write_rows, parse
 from .pipeline import attacker_state, builder_state, make_pool
@@ -298,134 +300,170 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
     fail_limit = max(1, int(os.getenv("PROBE_FAIL_LIMIT", "10")))
     consecutive_errors = 0
 
-    for row in records:
-        full = env.memory_module.FullMemory.load(row["state"]["full_path"])
-        values = []
-        family = row.get("family", row["state"]["mode"])
+    bar = Progress(len(records) * samples, label="builder-probe")
+    try:
+        for row in records:
+            full = env.memory_module.FullMemory.load(row["state"]["full_path"])
+            values = []
+            family = row.get("family", row["state"]["mode"])
+            score_cache = OrderedDict()
 
-        for i in range(samples):
-            # 禁用逐字回退；所有结果完全来自该模型本次提议。
-            nonce = "probe:" + digest([row["id"], i, env.policy(role).tag])
-            raw_text, raw_hash, record = None, None, None
-            try:
-                raw = env.policy(role).complete(
-                    row["prompt"], nonce, temperature=temperature
-                )
-                raw_text = _json_text(raw)
-                raw_hash = hashlib.sha256(
-                    raw_text.encode("utf-8")
-                ).hexdigest()[:16]
-                result = dict(env.builder_score(full, row["state"], raw))
-                result.pop("proposed", None)
+            with env.cached_answers():
+                for i in range(samples):
+                    # 禁用逐字回退；所有结果完全来自该模型本次提议。
+                    nonce = "probe:" + digest([row["id"], i, env.policy(role).tag])
+                    raw_text, raw_hash, record = None, None, None
+                    generation_seconds = scoring_seconds = 0.0
+                    score_cache_hit = False
+                    phase, started = "generation", perf_counter()
+                    try:
+                        raw = env.policy(role).complete(
+                            row["prompt"], nonce, temperature=temperature
+                        )
+                        generation_seconds = perf_counter() - started
+                        phase, started = "scoring", perf_counter()
+                        raw_text = _json_text(raw)
+                        raw_hash = hashlib.sha256(
+                            raw_text.encode("utf-8")
+                        ).hexdigest()[:16]
+                        score_cache_hit = raw_text in score_cache
+                        if score_cache_hit:
+                            score_cache.move_to_end(raw_text)
+                            result = deepcopy(score_cache[raw_text])
+                        else:
+                            result = dict(env.builder_score(full, row["state"], raw))
+                            result.pop("proposed", None)
 
-                legal = result.get("legal")
-                faith = result.get("faith")
-                answer_correct = _answer_correct(result)
-                quality_ok, quality_reason = _edit_quality_constraint(result)
-                success = bool(
-                    legal
-                    and faith
-                    and answer_correct is True
-                    and quality_ok is True
-                )
+                        legal = result.get("legal")
+                        faith = result.get("faith")
+                        answer_correct = _answer_correct(result)
+                        quality_ok, quality_reason = _edit_quality_constraint(result)
+                        success = bool(
+                            legal
+                            and faith
+                            and answer_correct is True
+                            and quality_ok is True
+                        )
 
-                result.update({
-                    "answer_correct": answer_correct,
-                    # Legacy column names remain readable, but carry no family-specific rule.
-                    "family_constraint_pass": quality_ok,
-                    "family_constraint_reason": quality_reason,
-                    "edit_quality_pass": quality_ok,
-                    "edit_quality_reason": quality_reason,
-                    "noop": parse(raw).get("ops") == [] if legal else None,
-                    "compression_success": (
-                        bool(result.get("safe_compression") and result.get("shrink_ratio", 0) > 0)
-                        if row["state"]["mode"] == "refine" and legal else None
-                    ),
-                    "success": success,
-                    "status": "ok",
-                })
-                consecutive_errors = 0
-            except Unknown as exc:
-                # 瞬时/服务端失败记unknown（不计入reward统计）；连续失败到上限才中止。
-                consecutive_errors += 1
-                record = {
-                    "state_id": row["id"],
-                    "family": family,
-                    "mode": row["state"]["mode"],
-                    "sample_idx": i,
-                    "temperature": temperature,
-                    "nonce": nonce,
-                    "raw_hash": raw_hash,
-                    "raw_text": raw_text,
-                    "status": "unknown",
-                    "error": str(exc),
-                    "reward": None,
-                    "effective_reward": None,
-                }
-                _append_jsonl(samples_path, record)
-                _append_jsonl(raw_path, {
-                    "state_id": row["id"],
-                    "family": family,
-                    "sample_idx": i,
-                    "temperature": temperature,
-                    "raw_hash": raw_hash,
-                    "raw_text": raw_text,
-                })
-                values.append(record)
-                if consecutive_errors >= fail_limit:
-                    write(
-                        out / "interrupted.json",
-                        {"case": row["id"], "sample": i, "error": str(exc),
-                         "consecutive_errors": consecutive_errors},
-                    )
-                    raise
-                continue
+                        result.update({
+                            "answer_correct": answer_correct,
+                            # Legacy column names remain readable, but carry no family-specific rule.
+                            "family_constraint_pass": quality_ok,
+                            "family_constraint_reason": quality_reason,
+                            "edit_quality_pass": quality_ok,
+                            "edit_quality_reason": quality_reason,
+                            "noop": parse(raw).get("ops") == [] if legal else None,
+                            "compression_success": (
+                                bool(result.get("safe_compression") and result.get("shrink_ratio", 0) > 0)
+                                if row["state"]["mode"] == "refine" and legal else None
+                            ),
+                            "success": success,
+                            "status": "ok",
+                        })
+                        if not score_cache_hit:
+                            # 只缓存完成的评分；失败/Unknown 留待后续相同候选重新检查。
+                            score_cache[raw_text] = deepcopy(result)
+                            if len(score_cache) > 64:
+                                score_cache.popitem(last=False)
+                        scoring_seconds = perf_counter() - started
+                        consecutive_errors = 0
+                    except Unknown as exc:
+                        # 瞬时/服务端失败记unknown（不计入reward统计）；连续失败到上限才中止。
+                        consecutive_errors += 1
+                        if phase == "generation":
+                            generation_seconds = perf_counter() - started
+                        else:
+                            scoring_seconds = perf_counter() - started
+                        record = {
+                            "state_id": row["id"],
+                            "family": family,
+                            "mode": row["state"]["mode"],
+                            "sample_idx": i,
+                            "temperature": temperature,
+                            "nonce": nonce,
+                            "raw_hash": raw_hash,
+                            "raw_text": raw_text,
+                            "status": "unknown",
+                            "error": str(exc),
+                            "reward": None,
+                            "effective_reward": None,
+                            "generation_seconds": generation_seconds,
+                            "scoring_seconds": scoring_seconds,
+                            "score_cache_hit": score_cache_hit,
+                        }
+                        _append_jsonl(samples_path, record)
+                        _append_jsonl(raw_path, {
+                            "state_id": row["id"],
+                            "family": family,
+                            "sample_idx": i,
+                            "temperature": temperature,
+                            "raw_hash": raw_hash,
+                            "raw_text": raw_text,
+                        })
+                        values.append(record)
+                        bar.update(suffix=f"{row['state']['case_key']} sample={i + 1}/{samples} unknown")
+                        if consecutive_errors >= fail_limit:
+                            write(
+                                out / "interrupted.json",
+                                {"case": row["id"], "sample": i, "error": str(exc),
+                                 "consecutive_errors": consecutive_errors},
+                            )
+                            raise
+                        continue
 
-            record = {
-                "state_id": row["id"],
-                "family": family,
-                "mode": row["state"]["mode"],
-                "sample_idx": i,
-                "temperature": temperature,
-                "nonce": nonce,
-                "raw_hash": raw_hash,
-                "raw_text": raw_text,
-                "legal": result.get("legal"),
-                "legal_reason": result.get("legal_reason"),
-                "faith": result.get("faith"),
-                "faith_reason": result.get("faith_reason"),
-                "answer_correct": result.get("answer_correct"),
-                "family_constraint_pass": result.get("family_constraint_pass"),
-                "family_constraint_reason": result.get("family_constraint_reason"),
-                "reward": result.get("reward"),
-                "effective_reward": result.get("effective_reward"),
-                "success": result.get("success"),
-                "status": result.get("status", "ok"),
-            }
-            # 保存每个奖励分项及对应证据，便于区分内容错误、压缩、冗余和长度差异。
-            for key in (
-                "accuracy", "before_accuracy", "delta", "gain", "loss", "before_scores", "test_scores",
-                "faith_ratio", "faith_scores", "before_tokens", "after_tokens", "growth_ratio",
-                "shrink_ratio", "compression_eligible", "safe_compression", "reward_components", "retention_pass",
-                "information_loss", "retention_checks", "redundancy_ratio", "redundant_ops",
-                "edit_quality_pass", "edit_quality_reason", "noop", "compression_success", "answer_checks",
-            ):
-                if key in result:
-                    record[key] = result[key]
+                    record = {
+                        "state_id": row["id"],
+                        "family": family,
+                        "mode": row["state"]["mode"],
+                        "sample_idx": i,
+                        "temperature": temperature,
+                        "nonce": nonce,
+                        "raw_hash": raw_hash,
+                        "raw_text": raw_text,
+                        "legal": result.get("legal"),
+                        "legal_reason": result.get("legal_reason"),
+                        "faith": result.get("faith"),
+                        "faith_reason": result.get("faith_reason"),
+                        "answer_correct": result.get("answer_correct"),
+                        "family_constraint_pass": result.get("family_constraint_pass"),
+                        "family_constraint_reason": result.get("family_constraint_reason"),
+                        "reward": result.get("reward"),
+                        "effective_reward": result.get("effective_reward"),
+                        "success": result.get("success"),
+                        "status": result.get("status", "ok"),
+                        "generation_seconds": generation_seconds,
+                        "scoring_seconds": scoring_seconds,
+                        "score_cache_hit": score_cache_hit,
+                    }
+                    # 保存每个奖励分项及对应证据，便于区分内容错误、压缩、冗余和长度差异。
+                    for key in (
+                        "accuracy", "before_accuracy", "delta", "gain", "loss", "before_scores", "test_scores",
+                        "faith_ratio", "faith_scores", "before_tokens", "after_tokens", "growth_ratio",
+                        "shrink_ratio", "compression_eligible", "safe_compression", "reward_components", "retention_pass",
+                        "information_loss", "retention_checks", "redundancy_ratio", "redundant_ops",
+                        "edit_quality_pass", "edit_quality_reason", "noop", "compression_success", "answer_checks",
+                    ):
+                        if key in result:
+                            record[key] = result[key]
 
-            _append_jsonl(samples_path, record)
-            _append_jsonl(raw_path, {
-                "state_id": row["id"],
-                "family": family,
-                "sample_idx": i,
-                "temperature": temperature,
-                "raw_hash": raw_hash,
-                "raw_text": raw_text,
-            })
+                    _append_jsonl(samples_path, record)
+                    _append_jsonl(raw_path, {
+                        "state_id": row["id"],
+                        "family": family,
+                        "sample_idx": i,
+                        "temperature": temperature,
+                        "raw_hash": raw_hash,
+                        "raw_text": raw_text,
+                    })
 
-            values.append(record)
+                    values.append(record)
+                    bar.update(suffix=f"{row['state']['case_key']} sample={i + 1}/{samples} "
+                                      f"score_cache_hit={score_cache_hit}")
 
-        aggregates[family].append(values)
+            aggregates[family].append(values)
+
+    finally:
+        bar.close()
 
     def rate(values, key):
         checked = [x[key] for x in values if x.get(key) is not None]
@@ -453,6 +491,9 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
             "samples_per_state": samples,
             "samples": len(values),
             "unknown_samples": sum(x.get("status") == "unknown" for x in values),
+            "score_cache_hits": sum(x.get("score_cache_hit", False) for x in values),
+            "generation_seconds": sum(x.get("generation_seconds", 0.0) for x in values),
+            "scoring_seconds": sum(x.get("scoring_seconds", 0.0) for x in values),
             "legal_evaluated_samples": sum(x.get("legal") is not None for x in values),
             "faith_evaluated_samples": sum(x.get("faith") is not None for x in values),
             "answer_evaluated_samples": sum(x.get("answer_correct") is not None for x in values),
@@ -487,6 +528,7 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
             "effective_reward_std_mean": mean(effective_stds) if effective_stds else 0.0,
         })
 
+    all_samples = [sample for groups in aggregates.values() for group in groups for sample in group]
     write(out / "summary.json", {
         "fallback": False,
         "groups": report,
@@ -494,11 +536,24 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
         "model": env.policy(role).client.model,
         "temperature": temperature,
         "skipped_empty_test_states": empty_test,
+        "performance": {
+            "generation_attempts": len(all_samples),
+            "generated_samples": sum(s.get("raw_text") is not None for s in all_samples),
+            "scoring_attempts": sum(s.get("raw_text") is not None and not s["score_cache_hit"]
+                                    for s in all_samples),
+            "scored_samples": sum(s.get("status") == "ok" and not s["score_cache_hit"]
+                                  for s in all_samples),
+            "score_cache_hits": sum(s["score_cache_hit"] for s in all_samples),
+            "generation_seconds": sum(s["generation_seconds"] for s in all_samples),
+            "scoring_seconds": sum(s["scoring_seconds"] for s in all_samples),
+        },
         "metric_notes": {
             "all_sample_rates": "Observed passes divided by all attempts; unknowns remain null in samples and are counted separately.",
             "conditional_rates": "Answer, edit quality, retention, compression and noop rates use only evaluated samples.",
             "family_constraint": "Compatibility alias for generic edit_quality_pass; family is used only for grouping.",
             "compression_success": "Refine only: safe positive shortening. A valid NOOP can succeed with zero reward and no compression.",
+            "score_cache": "Exact raw repeats within one state reuse a completed score; every sample still generates independently. Unknown scores are not cached.",
+            "timing": "Wall seconds spent generating and scoring, including cache access and failed attempts; not pure model inference latency.",
         },
     })
     return report

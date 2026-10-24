@@ -61,7 +61,9 @@ def test_probe_counts_unknowns_and_strict_faith_separately(env, tmp_path, monkey
         return result
 
     monkeypatch.setattr(env, "builder_score", score)
-    monkeypatch.setattr(env.policy("BUILDER"), "complete", lambda *a, **kw: '{"ops":[]}')
+    candidates = iter(json.dumps({"ops": [{"op": "ADD", "text": f"Candidate {i}",
+                                          "prov": ["s1:r1"]}]}) for i in range(3))
+    monkeypatch.setattr(env.policy("BUILDER"), "complete", lambda *a, **kw: next(candidates))
     report = run_probe(path, env, tmp_path / "out", samples=3)[0]
     assert report["unknown_samples"] == 1
     assert report["faith_evaluated_samples"] == 2

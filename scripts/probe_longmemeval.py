@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -16,6 +17,7 @@ from pathlib import Path
 import random
 import subprocess
 import sys
+import time
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -116,6 +118,27 @@ def preflight(args):
 def _run_cli(command, config, *arguments):
     subprocess.run([sys.executable, "-m", "admem.cli", command, "--config", str(config),
                     *map(str, arguments)], cwd=ROOT, check=True)
+
+
+@contextmanager
+def timed_stage(out, timings, name):
+    """记录阶段耗时；进行中或失败的阶段也可从输出目录定位。"""
+    started = time.perf_counter()
+    entry = {"status": "running"}
+    timings[name] = entry
+    write(out / "stage_timings.json", timings)
+    print(f"[stage] {name}: starting", flush=True)
+    try:
+        yield
+    except BaseException:
+        entry["status"] = "failed"
+        raise
+    else:
+        entry["status"] = "ok"
+    finally:
+        entry["seconds"] = time.perf_counter() - started
+        write(out / "stage_timings.json", timings)
+        print(f"[stage] {name}: {entry['status']} ({entry['seconds']:.1f}s)", flush=True)
 
 
 def selected_cases(args):
@@ -228,13 +251,17 @@ def run(args):
                       "split": args.split}, ensure_ascii=False), flush=True)
     common = ["--prepared", args.prepared, "--split", args.split, "--keys", *keys]
     bank, build, collect = (args.out / name for name in ("bank", "build", "collected"))
-    _run_cli("bank", args.config, *common, "--out", bank)
-    check_stage(bank, keys, bank=True)
-    _run_cli("run", args.config, *common, "--mode", "build", "--builder-role", "BUILDER",
-             "--bank", bank, "--collect", collect, "--out", build)
-    check_stage(build, keys)
+    timings = {}
+    with timed_stage(args.out, timings, "bank"):
+        _run_cli("bank", args.config, *common, "--out", bank)
+        check_stage(bank, keys, bank=True)
+    with timed_stage(args.out, timings, "build"):
+        _run_cli("run", args.config, *common, "--mode", "build", "--builder-role", "BUILDER",
+                 "--bank", bank, "--collect", collect, "--out", build)
+        check_stage(build, keys)
     exported, states = args.out / "states_all.jsonl", args.out / "states.jsonl"
-    _run_cli("export", args.config, "--states", collect, "--role", "builder", "--split", args.split, "--out", exported)
+    with timed_stage(args.out, timings, "export"):
+        _run_cli("export", args.config, "--states", collect, "--role", "builder", "--split", args.split, "--out", exported)
     selected, counts = select_states(rows(exported), keys, state_limit, args.seed, cfg.fingerprint(),
                                     full_hashes={r["key"]: r["full_hash"] for r in cases}, split=args.split,
                                     per_case_limit=args.states_per_case)
@@ -245,8 +272,9 @@ def run(args):
           "states_per_case": args.states_per_case,
           "per_case": counts, "selected_state_ids": [r["id"] for r in selected]})
     probe = args.out / "probe"
-    _run_cli("probe", args.config, "--states", states, "--samples", args.samples,
-             "--temperature", args.temperature, "--builder-role", "BUILDER", "--out", probe)
+    with timed_stage(args.out, timings, "probe"):
+        _run_cli("probe", args.config, "--states", states, "--samples", args.samples,
+                 "--temperature", args.temperature, "--builder-role", "BUILDER", "--out", probe)
     summary = {"nature": "real_history_stream/generated_bank", "split": args.split,
                "selected_cases": cases, "case_counts_by_type": type_counts,
                "states_per_case": args.states_per_case, "state_limit": state_limit,
@@ -254,6 +282,7 @@ def run(args):
                "state_selection_seed": args.seed, "requested_temperature": args.temperature,
                "config": str(args.config), "environment_fingerprint": cfg.fingerprint(),
                "states": str(states), "probe_summary": str(probe / "summary.json"),
+               "stage_timings": timings,
                "probe": read(probe / "summary.json")}
     write(args.out / "summary.json", summary)
     print(f"Real-history reward probe complete: {args.out / 'summary.json'}", flush=True)

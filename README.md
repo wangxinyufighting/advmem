@@ -482,6 +482,26 @@ CUDA_VISIBLE_DEVICES=4 python scripts/probe_longmemeval.py \
 
 脚本拒绝覆盖已有输出目录，并在题库失败/为空、没有可评分状态时给出错误，避免把没有测到误报为模型失败。模型参数或源码变更后，重新收集状态到新输出目录。
 
+加速默认启用，不需要减少每类 case 数或修改奖励权重：
+
+- 同一进程的多个记忆索引共享文本切分和 embedding 缓存，记忆变化时优先复用未改动文本、相同问题的向量。`EMBED_CACHE_ITEMS` 默认 `4096`，分别限制切分缓存和向量缓存的条目数；设为 `0` 可关闭这两层内存缓存。原有磁盘索引/API 缓存继续使用。
+- 同一个 session 的多条检索 query 每组最多 32 条批量编码，再按原顺序检索和融合；不会把它们拼成一条长 query。
+- 每个 probe 状态仍独立生成指定数量的候选；完全相同的原始输出复用已完成的评分，并保留每次采样的日志。旧记忆的答题结果在同状态内复用；失败的评分不会当作成功结果缓存。缓存有界，离开该状态即释放。
+- `probe/samples.jsonl` 记录 `score_cache_hit`、`generation_seconds`、`scoring_seconds`，并逐样本显示进度；`probe/summary.json` 的 `performance` 汇总采样/评分次数、评分缓存命中数和耗时。这些次数是客户端逻辑调用次数，不是 HTTP 请求次数；耗时包含缓存读取等客户端工作，不等同于服务端纯推理时间。
+- 顶层 `stage_timings.json` 记录 bank/build/export/probe 的状态和耗时；进入阶段即写入 `running`，完成或失败时更新。这些优化保留全部 gate、忠实度和信息保留检查；LLM 请求目前仍串行，实际提速取决于重复比例和服务端延迟。向量缓存仅在当前进程共享，未承诺跨进程复用或真实模型浮点结果逐位相同。
+
+已经有 `states.jsonl`、希望在固定状态上重新评估采样/评分时，可直接跳过 bank 和 build：
+
+```bash
+CUDA_VISIBLE_DEVICES=4 python -m admem.cli probe \
+  --config configs/type_aware_4b_nogate.json \
+  --states outputs/real_builder_probe_all_types_v1/states.jsonl \
+  --samples 8 --temperature 1.0 \
+  --out outputs/real_builder_probe_only_v2
+```
+
+这会沿用旧状态的历史记忆和 prompt；如果要检验新的 Builder 构建过程，仍需重新收集状态。`--limit` 只减少最终 probe 状态总数，不保证各 case 等额抽样。
+
 如果 multi-session 的 bank 只有 0～2 题，先分析已有日志，无需重新调用模型：
 
 ```bash

@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import os
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
@@ -48,6 +48,32 @@ class Embedder:
                               self.query_prefix, self.document_prefix]
         else:
             raise ValueError("embedding backend 必须是 local 或 api")
+        # 多个 M 索引共用这个 Embedder：未改动文本不随整个索引重复编码。
+        # 仅缓存当前进程，模型身份由实例隔离；0 可关闭，便于性能对照。
+        self.cache_items = int(os.getenv("EMBED_CACHE_ITEMS", "4096"))
+        if self.cache_items < 0:
+            raise ValueError("EMBED_CACHE_ITEMS 必须 >=0")
+        self._split_cache = OrderedDict()
+        self._vector_cache = OrderedDict()
+
+    def _cached(self, cache, key):
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    def _remember(self, cache, key, value):
+        if not self.cache_items:
+            return
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self.cache_items:
+            cache.popitem(last=False)
+
+    def _cache_identity(self):
+        return [self.signature, self.query_prefix, self.document_prefix,
+                self._local_max_length() if self.backend == "local" else None,
+                os.getenv("EMBED_CHUNK_CHARS", "1200")]
 
     def _local_max_length(self) -> int:
         """Return a limit accepted by both SentenceTransformer and its encoder."""
@@ -79,6 +105,16 @@ class Embedder:
                 tokenizer.model_max_length = old_limit
 
     def split(self, text: str) -> list[str]:
+        if not self.cache_items:
+            return self._split_uncached(text)
+        key = digest([self._cache_identity(), text])
+        parts = self._cached(self._split_cache, key)
+        if parts is None:
+            parts = tuple(self._split_uncached(text))
+            self._remember(self._split_cache, key, parts)
+        return list(parts)  # 调用方不能修改缓存里的切分结果。
+
+    def _split_uncached(self, text: str) -> list[str]:
         if self.backend == "api":
             # API 的索引切片使用字符预算；不会截断/改写原文库。
             size = int(os.getenv("EMBED_CHUNK_CHARS", "1200"))
@@ -98,6 +134,28 @@ class Embedder:
                 for i in range(0, len(ids), size)] or [" "]
 
     def encode(self, chunks: list[str], *, query: bool = False) -> np.ndarray:
+        if not self.cache_items or not chunks:
+            return self._encode_uncached(chunks, query=query)
+        identity = self._cache_identity()
+        keys = [digest([identity, query, chunk]) for chunk in chunks]
+        found, missing = {}, {}
+        for key, chunk in zip(keys, chunks):
+            if key in found or key in missing:
+                continue
+            vector = self._cached(self._vector_cache, key)
+            if vector is None:
+                missing[key] = chunk
+            else:
+                found[key] = vector
+        if missing:
+            vectors = self._encode_uncached(list(missing.values()), query=query)
+            for key, vector in zip(missing, vectors):
+                # 独立复制每行，避免一条缓存引用让整个临时大 batch 常驻内存。
+                found[key] = vector.copy()
+                self._remember(self._vector_cache, key, found[key])
+        return np.stack([found[key] for key in keys])
+
+    def _encode_uncached(self, chunks: list[str], *, query: bool = False) -> np.ndarray:
         prefix = self.query_prefix if query else self.document_prefix
         values = [prefix + (s or " ") for s in chunks]
         if self.backend == "local":
@@ -227,6 +285,22 @@ class Retriever:
         np.maximum.at(scores, self.owners, chunk_scores)
         return scores
 
+    def _warm_queries(self, queries: list[str]):
+        pending = [q for q in queries if q.strip() and q not in self.query_cache]
+        # session 的多条发言一起编码；检索与 RRF 仍按原来的 query 顺序执行。
+        for start in range(0, len(pending), 32):
+            group = pending[start:start + 32]
+            chunks, sizes = [], []
+            for query in group:
+                parts = self.embedder.split(query)
+                chunks.extend(parts)
+                sizes.append(len(parts))
+            vectors = self.embedder.encode(chunks, query=True)
+            offset = 0
+            for query, size in zip(group, sizes):
+                self.query_cache[query] = vectors[offset:offset + size].copy()
+                offset += size
+
     def search(self, query: str, k: int = 10, candidate_k: int = 40, *,
                exclude_sessions: set[str] | None = None, exclude_ids: set[str] | None = None,
                expand: int = 0) -> list[Hit]:
@@ -274,9 +348,16 @@ class Retriever:
 
     def search_many(self, queries: list[str], k: int = 10, candidate_k: int = 40, **kwargs) -> list[Hit]:
         """各用户发言分别检索，再做并集排序；不向量化拼接整个 session。"""
+        queries = list(dict.fromkeys(queries))
+        search_k = max(k, candidate_k)
+        # 参数错误仍交给 search；无效调用不预先触发昂贵的向量计算。
+        if (self.embedder is not None and candidate_k >= 1 and search_k >= 1
+                and kwargs.get("expand", 0) >= 0
+                and set(kwargs) <= {"expand", "exclude_ids", "exclude_sessions"}):
+            self._warm_queries(queries)
         fused, origins = defaultdict(float), defaultdict(set)
-        for q in dict.fromkeys(queries):
-            for rank, hit in enumerate(self.search(q, max(k, candidate_k), candidate_k, **kwargs), 1):
+        for q in queries:
+            for rank, hit in enumerate(self.search(q, search_k, candidate_k, **kwargs), 1):
                 fused[hit.id] += 1 / (60 + rank)
                 origins[hit.id].update(hit.channels)
         ranked = sorted(fused, key=lambda rid: (-fused[rid], self.positions[rid]))[:k]
