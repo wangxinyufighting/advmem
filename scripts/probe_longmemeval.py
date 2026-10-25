@@ -25,7 +25,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from admem.audit_prompts import TYPES
-from admem.common import Config, read, rows, write, write_rows
+from admem.common import Config, read, rows, self_judging, write, write_rows
 from admem.data import contexts
 
 
@@ -120,6 +120,10 @@ def preflight(args):
         if not isinstance(extra, dict):
             raise ValueError(f"{role}_EXTRA_BODY or LLM_EXTRA_BODY must be a JSON object")
         roles[role] = model
+    overlap = self_judging()
+    if overlap:
+        print("WARNING: policy and scorer share a model (" + ", ".join(overlap) + "); rewards are self-judged. "
+              "Set JUDGE_MODEL/DEFENDER_MODEL to a different model for reported results.", file=sys.stderr, flush=True)
     if cfg.embedding == "api" and not (cfg.embed_model or os.getenv("EMBED_MODEL")):
         raise ValueError("API embeddings require config.embed_model or EMBED_MODEL")
     return cfg, roles
@@ -216,7 +220,7 @@ def select_states(records, case_keys, limit, seed, fingerprint, *, full_hashes=N
         if row["prompt"] != state["prompt"] or state.get("environment_fingerprint") != fingerprint:
             raise ValueError("Collected state prompt/config differs; regenerate with the same code and config")
         counts[key]["all"] += 1
-        if state.get("tests"):
+        if state.get("tests") or state.get("coverage_scorable"):
             grouped[key].append(row)
             counts[key]["available"] += 1
     missing = [key for key in case_keys if not grouped[key]]
@@ -305,6 +309,7 @@ def run(args):
                "state_counts": counts, "samples_per_state": args.samples,
                "state_selection_seed": args.seed, "requested_temperature": args.temperature,
                "bank_rounds": args.bank_rounds, "final_bank": str(bank),
+               "self_judging": self_judging(),
                "config": str(args.config), "environment_fingerprint": cfg.fingerprint(),
                "states": str(states), "probe_summary": str(probe / "summary.json"),
                "stage_timings": timings,

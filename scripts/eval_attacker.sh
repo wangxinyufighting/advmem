@@ -105,7 +105,9 @@ c = json.load(open(sys.argv[1]))
 new = {"attacker_view", "attacker_type_filter", "seed_min_personal", "attacker_memory_entries",
        "attacker_context_items", "evidence_novelty", "impersonal_weight", "pack_builder", "neighbor_mode",
        "neighbor_session_cap", "fact_queries", "fact_query_k", "pack_neighbor_reserve", "type_policy",
-       "types_per_pack", "type_weights", "screen_k", "bank_defects"}
+       "types_per_pack", "type_weights", "screen_k", "bank_defects", "attacker_reward",
+       "attacker_reject_penalty", "attacker_repair_credit", "builder_reward", "builder_coverage_weight",
+       "builder_redundancy_cap", "builder_prompt"}
 c = {k: v for k, v in c.items() if k not in new}
 if sys.argv[3]:
     c["tokenizer"] = sys.argv[3]

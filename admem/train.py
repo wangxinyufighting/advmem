@@ -9,7 +9,10 @@ import torch
 
 from .common import Config, TokenBudget, Unknown, connect, digest, read, rows, write, write_rows
 from .environment import Environment
+from .rewards import builder_state_scorable
+from .common import BudgetExceeded
 from .learning import Rollout, advantages, completion_logp, optimize_groups, sample_tokens
+from .rewards import shape_group
 
 
 def load_training_records(path, role, method):
@@ -23,7 +26,7 @@ def load_training_records(path, role, method):
             raise ValueError("Policy role/prompt mismatch")
         if method == "sft" and not row.get("completion"):
             continue
-        if method == "grpo" and role == "builder" and not state.get("tests"):
+        if method == "grpo" and role == "builder" and not builder_state_scorable(state):
             continue
         selected.append(row)
     if not selected:
@@ -62,19 +65,36 @@ def main(argv=None):
     p.add_argument("--beta", type=float, default=0.02)
     p.add_argument("--clip", type=float, default=0.2)
     p.add_argument("--lora-r", type=int, default=16)
-    p.add_argument("--max-prompt-tokens", type=int, default=8192)
+    p.add_argument("--max-prompt-tokens", type=int,
+                   help="默认取config里该角色的输入预算（builder_input_tokens / attacker_input_tokens）+256")
+    p.add_argument("--max-skip-fraction", type=float, default=0.05,
+                   help="超长被跳过的状态比例超过它就报错，而不是悄悄只训练短状态")
+    p.add_argument("--std-floor", type=float,
+                   help="GRPO优势归一化的std下限；默认：该角色用v2奖励时0.1，否则0（旧行为）")
+    p.add_argument("--shape-invalid", choices=["auto", "on", "off"], default="auto",
+                   help="组内非法样本的奖励改为“最低合法奖励−合法std”；auto=该角色用v2奖励时开启")
+    p.add_argument("--max-env-errors", type=int, default=3,
+                   help="连续多少个group评分失败（judge/服务错误）才中止；单个失败只跳过该group")
     p.add_argument("--max-new-tokens", type=int, default=2048)
     p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cuda")
     p.add_argument("--resume", action="store_true")
     a = p.parse_args(argv)
-    if min(a.steps, a.max_attempts, a.groups_per_update, a.topvar, a.lora_r, a.max_prompt_tokens,
-           a.max_new_tokens, a.save_every) < 1 or a.group_size < 2 or a.topvar > a.groups_per_update:
+    if min(a.steps, a.max_attempts, a.groups_per_update, a.topvar, a.lora_r,
+           a.max_new_tokens, a.save_every, a.max_env_errors) < 1 or a.group_size < 2 or a.topvar > a.groups_per_update:
         p.error("Invalid training budgets")
+    if a.max_prompt_tokens is not None and a.max_prompt_tokens < 1 or not 0 <= a.max_skip_fraction <= 1:
+        p.error("Invalid prompt budget / skip fraction")
     if not 0 < a.clip < 1 or a.beta < 0 or a.lr <= 0:
         p.error("Invalid optimization parameters")
     cfg = Config.load(a.config)
+    v2_reward = (cfg.builder_reward if a.role == "builder" else cfg.attacker_reward) == "v2"
+    if a.max_prompt_tokens is None:
+        a.max_prompt_tokens = (cfg.builder_input_tokens if a.role == "builder" else cfg.attacker_input_tokens) + 256
+    if a.std_floor is None:
+        a.std_floor = 0.1 if v2_reward else 0.0
+    shape_invalid = a.shape_invalid == "on" or (a.shape_invalid == "auto" and v2_reward)
     records = load_training_records(a.data, a.role, a.method)
     if any(r["state"].get("environment_fingerprint") != cfg.fingerprint() for r in records):
         raise ValueError("Collected environment differs from training config; do not silently change reward")
@@ -93,6 +113,12 @@ def main(argv=None):
             encoded.append((row, ids))
     if not encoded:
         raise ValueError("All prompts exceed budget; no silent truncation")
+    skip_fraction = len(skipped) / len(records)
+    print(f"{len(skipped)}/{len(records)} states exceed --max-prompt-tokens={a.max_prompt_tokens}", flush=True)
+    if skip_fraction > a.max_skip_fraction:
+        raise ValueError(f"{skip_fraction:.1%} of states exceed --max-prompt-tokens={a.max_prompt_tokens} "
+                         "(large-memory states would be silently excluded); raise --max-prompt-tokens or "
+                         "--max-skip-fraction explicitly")
     out = Path(a.out)
     options = {k: v for k, v in vars(a).items() if k not in {"resume", "steps", "max_attempts"}}
     fingerprint = digest([options, cfg.fingerprint(), records])
@@ -136,6 +162,7 @@ def main(argv=None):
         if saved["cuda_rng"] and torch.cuda.is_available():
             torch.cuda.set_rng_state_all(saved["cuda_rng"])
     env = None
+    env_errors, unscorable = 0, set()
     if a.method == "grpo":
         legacy = connect(cfg.project)
         counter = TokenBudget(cfg.tokenizer, cfg.tokenizer_revision)
@@ -163,7 +190,8 @@ def main(argv=None):
             else:
                 candidates, group_logs = [], []
                 for gi in range(a.groups_per_update):
-                    row, ids = rng.choice(encoded)
+                    choices = [item for item in encoded if item[0]["id"] not in unscorable] or encoded
+                    row, ids = rng.choice(choices)
                     state = row["state"]
                     full = env.memory_module.FullMemory.load(state["full_path"])
                     if full.fingerprint != state["full_hash"]:
@@ -193,24 +221,41 @@ def main(argv=None):
                             if not torch.isfinite(torch.tensor(reward)):
                                 raise Unknown("Reward detail has non-finite effective_reward")
                             group.append(Rollout(ids, completion, text, old, ref, reward, detail))
+                    except BudgetExceeded as exc:
+                        # 确定性的预算溢出：这个状态永远评不了分，跳过并不再抽它，不算服务错误。
+                        unscorable.add(row["id"])
+                        group_logs.append({"state": row["id"], "status": "over_budget", "error": str(exc)})
+                        write_rows(out / "last_group_errors.jsonl", group_logs)
+                        continue
                     except Unknown as exc:
-                        # 一条环境判分失败则整组不更新，防止只保留较易判分的动作。
+                        # 一条环境判分失败则整组不更新，防止只保留较易判分的动作。单次失败只跳过该组；
+                        # 连续max_env_errors组失败才中止（网络修好后再resume，不烧完整轮API预算）。
+                        env_errors += 1
                         group_logs.append({"state": row["id"], "status": "environment_error", "error": str(exc)})
                         write_rows(out / "last_group_errors.jsonl", group_logs)
-                        raise  # fail-fast，网络修好后再resume，不烧完整轮API预算。
-                    adv, std = advantages([r.reward for r in group])
+                        if env_errors >= a.max_env_errors:
+                            raise
+                        continue
+                    env_errors = 0
+                    raw_group = [r.reward for r in group]
+                    if shape_invalid:
+                        shaped = shape_group(raw_group, [r.detail.get("legal") is not False for r in group])
+                        for rollout, value in zip(group, shaped):
+                            rollout.reward = value
+                    adv, std = advantages([r.reward for r in group], a.std_floor)
                     group_logs.append({"state": row["id"], "std": std,
                                        # ``rewards`` is the value used by GRPO.  Keep the
                                        # un-gated values separately so reward debugging does
                                        # not accidentally change the optimization signal.
                                        "rewards": [r.reward for r in group],
+                                       "unshaped_rewards": raw_group,
                                        "raw_rewards": [float(r.detail["reward"]) for r in group],
                                        "responses": [r.text for r in group]})
                     if std > 1e-8:
                         candidates.append((std, group))
                 chosen = [g for _, g in sorted(candidates, key=lambda x: -x[0])[:a.topvar]]
                 if chosen:
-                    loss = optimize_groups(model, optimizer, chosen, a.device, a.clip, a.beta)
+                    loss = optimize_groups(model, optimizer, chosen, a.device, a.clip, a.beta, a.std_floor)
                     step += 1
                 else:
                     loss = None

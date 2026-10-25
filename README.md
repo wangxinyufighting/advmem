@@ -309,7 +309,7 @@ python run.py attack \
 
 attacker 输入只有：原文pack、M provenance标记、题型、case允许使用的 `question_date`。不传目标问题/答案/证据标签。`question_date`逐字复制；题型使用官方名称，并接受设计中的 `preference` / `temporal` 别名。
 
-题型来源由 `hint_mode` 决定（admem 里 attacker 侧现由 `type_policy` 单独控制，默认 `auto` 保持本段行为，`balanced` 不读官方题型，见第13节）。`configs/type_aware.json`（`target_type`）把**当前case的官方题型**交给 attacker/builder，属于有意的类型已知诊断基线，不是无标签设定；`configs/type_hidden.json`（`hidden`）按pack确定性随机抽题型，才是主结果设定。admem 中可用以下配置给 4B attacker 减负、抑制刷分：
+题型来源由 `hint_mode` 决定（admem 里 attacker 侧现由 `type_policy` 单独控制，默认 `auto` 保持本段行为，`balanced` 不读官方题型，见第13节）。`configs/type_aware.json`（`target_type`）把**当前case的官方题型**交给 attacker/builder，属于有意的类型已知诊断基线，不是无标签设定；`configs/type_hidden.json`（`hidden`）按pack确定性随机抽题型，才是主结果设定（现已与 `type_aware.json` 只差 `hint_mode`；旧的不匹配版本保留为 `type_hidden_legacy.json`，见第14.4节）。admem 中可用以下配置给 4B attacker 减负、抑制刷分：
 
 - `attacker_view: "compact"`：单session题型只给种子session；跨session题型给种子全文+邻居的user消息（`assistant_elided`），被隐去的round不允许作为E。
 - `attacker_type_filter: true`：SSA 要求种子有 assistant 回复；multi-session 只检查输入中有至少两个实际可见的 session，个人相关性和跨会话必要性由 gate 验证。其余题型保留 `seed_min_personal` 词表预筛。不能用人称词表未命中来证明 multi-session 不可出题，例如 `I bought…`、`It cost…` 都可能未命中。不可出时该 pack 记为 `type_infeasible`，不调用 attacker、不产生奖励。
@@ -593,3 +593,49 @@ python -m admem.cli bank --config configs/hidden_4b_nogate_v2.json \
 - `prepare_longmemeval_cases.py`：`--manifest data/prepared_longmemeval/manifest.json` 直接沿用 admem 的划分，与 admem 产物混用时必须这样做；不传时，完全相同的历史按组内字典序最小的 question_id 一起 hash（单例组的划分与旧版相同），`_abs` 等共享历史的变体不会跨 split。`--select-sessions all` 不用官方证据标签挑选 session（默认 `evidence` 仍是旧行为，报告中标 `label_informed_selection: true`）；`--no-question-meta` 去掉 prompt 中的官方题型/日期；`--max-history-sessions K` 只内联最近 K 个 session。
 - legacy pack 构建跳过的超长种子 session 写入 `pack_pool.json` 的 `skipped_sessions`；closed_loop 的 `ledger.json` 只记中性 `sN`，不再写原始 session ID。
 - `scripts/attacker_report.py` 单独统计 `over_budget`、`accepted_no_defect` 与 defect 类别；`audit_bank_packs.py` 把 prompt 阶段溢出的 pack 标为 `not_sent`。
+
+## 14. 奖励、提示词与其他修复（v2）
+
+三个开关 `attacker_reward`、`builder_reward`、`builder_prompt` 默认 `v1`（旧实现逐字不变，旧实验可复现）；`configs/hidden_4b_nogate_v2.json` 与它的题型已知对照 `configs/type_aware_4b_nogate_v2.json` 全部设为 `v2`。修改后环境指纹会变，状态和题库要重新生成到新目录。纯算术部分在 `admem/rewards.py`（不依赖 torch）。
+
+### 14.1 Attacker 奖励（`attacker_reward: v2`，`Environment._attacker_score_v2`）
+
+| 情况 | v1 | v2 |
+| --- | --- | --- |
+| 被 gate 拒绝 | -0.1~0.45（4道 closed-book 被拒得 +0.35，高于一道合格题） | ∈[-`attacker_reject_penalty`, 0)，按 gate 检查顺序越晚失败扣得越少，总是低于空列表（0） |
+| 整个输出非法 | -0.1 | -(penalty+0.1)，低于任何合法输出 |
+| 重复题 | 字面重复 0 | 字面或语义重复都给小的负值 |
+| novelty | 按 E 的平均使用次数衰减（往 E 里塞新 round 能拉回权重） | 按 E 中被问得最多的 round 衰减 |
+| 证据填充 | 无检查 | 新的 evidence-audit judge 返回 `necessary_rids`，权重乘以必要比例 |
+| “与用户无关”降权 | 一人称词表（"I bought…"判成0、"Fix my code"判成1） | 同一次 audit judge 的 `personal` 字段 |
+| gate 修补过的 E | 全额 | 乘 `attacker_repair_credit`（默认0.5） |
+| 空 M | 每题都算 missing（defect 项是常数），仍调用 reader | 跳过 defect 计算，value=1；M 非空时仍为 0.5+0.5×可修复 |
+| 某题 judge 预算溢出 | 抛错 | 该题记 `over_budget`、计 0 |
+
+v2 的 attacker 提示词末尾附加 `ATTACKER_SCORING_NOTE`，说明上面三条规则（少出题优于出错题、E 不加无关 round、换说法重复无分），使提示词与奖励一致。每道通过 gate 的题多一次 judge 调用（`EVIDENCE_AUDIT_SYSTEM`）。
+
+### 14.2 Builder 奖励（`builder_reward: v2`，`Environment._builder_score_v2`）
+
+- **跨 session 证据的前瞻题**：stream 窗口除旧条件（E 已读完且在窗口或旧条目 prov 内）外，E 与本窗口已读完 round 有交集的题也成为测试题，带 `context_rids`=E 中不在本窗口的 round。评分时这些 round 的原文在编辑前后都补进记忆，所以只衡量本窗口那部分证据是否被存下：之前漏存、或其余证据还在未来 session 里的题，也能给本窗口记分或扣分。SFT 示范的 `all_pass` 同样补 context。
+- **归一化**：gain/loss 除以“目标题数”（与 x 有证据交集的测试题，至少1），不再被回放题数稀释，二者都截断到[0,1]。同一个正确写入在1题和12题状态下得分相同；回放题被改错照样按 `builder_loss_weight` 扣。
+- **翻转复核**：k 下答案翻转时再用 2k 读取编辑前后各一次，取两次变化的平均；只是 top-k 排名被挤动的翻转只算一半。NOOP 仍不重新作答，合法 NOOP 仍为 0。
+- **覆盖率项**（`builder_coverage_weight`，默认0.5）：judge 列出 x 中值得存的原子事实（`SOURCE_INVENTORY`），排除编辑前 Builder 可见条目已覆盖的，奖励新事实被存下的比例；需全部写入忠实。它不依赖题库，题库没问到的事实也有信号；没有测试题但有 x 的 stream/patch 状态因此也能评分（state 标 `coverage_scorable`，训练、导出、probe 不再丢弃这些窗口）。
+- **冗余**：只对照 Builder 在 prompt 里看得到的条目（M_old 全文+目录摘要），最多计 `builder_redundancy_cap` 个操作。
+- **非法输出与 GRPO 尺度**：v2 的合法下界有界（loss、faith、retention 各≤1×权重，growth≤0.2，冗余≤cap），非法输出取下界再减1。`admem/train.py` 在该角色使用 v2 奖励时默认：组内非法样本改为“最低合法奖励−合法std”（`--shape-invalid`），优势归一化 std 下限 0.1（`--std-floor`），避免一个非法样本压扁合法样本间的差别、或只差长度项的组被放大。VERL 按样本独立打分，做不到组内整形，只能靠 SFT 先降低非法率。
+
+### 14.3 提示词（`builder_prompt: v2`）
+
+- `BUILDER_V2`：约为旧版的一半长度，规则合并成一份规格。无论有没有 `task_type`，具体的 assistant 产出（推荐、列表项、数量、链接、创作细节）都存，并标明归属；题型提示改为一句话的 `BUILDER_TYPE_GUIDANCE_V2`。hidden 设定下 single-session-assistant 题不再因提示词不存 assistant 内容而必然失败。
+- **卡片日期由 host 负责**：编辑时卡片按 prov 记录 `dates`（最早/最晚 session 日期），reader 看到 `[Source date: …] 文本`。Builder 只需把相对时间换成事件日期；v1 的 temporal 附加段与 patch 前言在 v2 下不再拼接。
+- 去掉 `write_required` 与“第一个窗口禁止 NOOP”的硬规则；漏存由覆盖率项衡量。
+- `stored_catalog` 先列与 x 相关的条目（不止 `old_entries` 个），其余最新优先，已在 M_old 里全文给出的不再重复（v1 是最旧的约30条）。
+- `prompt_hashes()` 记录 gate 实际使用的 `prompts.SCREEN`（之前误记为未使用的 `GATE_SCREEN_SYSTEM`），并加入 Builder/reader/grade/faith/audit 提示词。
+- 未改：attacker 题型指引是看过全部500道 LongMemEval 题后写的，生成的题会模仿测试集问法；需要新的、未参与设计的数据才能真正解决。
+
+### 14.4 其他
+
+- **配置配对**：`type_hidden.json` 现与 `type_aware.json` 只差 `hint_mode`（旧版在 embedding、Builder 预算、`old_entries`、`entry_tokens`、`max_ops` 上都不同，保留为 `type_hidden_legacy.json`）；`type_hidden_4b.json` 改用与 `type_aware_4b.json` 相同的本地 tokenizer 路径；新增 `type_hidden_4b_nogate.json`。测试检查每对配置只差 `hint_mode`。
+- **训练**：`admem/train.py` 的 `--max-prompt-tokens` 默认取该角色的输入预算+256（旧默认8192会悄悄丢掉大记忆状态），被跳过比例超过 `--max-skip-fraction`（默认5%）就报错；单个 group 的 judge/服务失败只跳过该组，连续 `--max-env-errors`（默认3）组失败才中止，预算溢出的状态不再抽取。`scripts/train_verl.sh` 设 `CONFIG=<config>` 时由输入预算推导 `max_prompt_length`。`admem/verl_reward.py`：`ADMEM_REWARD_ON_UNKNOWN=neutral` 时环境失败返回 0（两个角色的合法 NOOP/空列表奖励），写入日志，超过 `ADMEM_MAX_UNKNOWN` 次仍报错；默认仍为抛错。
+- **自己判自己**：BUILDER/ATTACKER 与 JUDGE/DEFENDER 解析到同一模型服务时，CLI 和 `probe_longmemeval.py` 打印警告，评测 summary 与 probe summary 记录 `self_judging`。
+- **测试集不独立**：评测 summary 加 `benchmark_informed` 说明。真正的独立评估需要另一个未参与提示词设计的基准，代码无法补救。
+- **对抗协同训练**：`--bank-rounds` 与针对 M 出题（第13.4节）实现了题库与记忆的交替，但 Builder 与 Attacker 的交替 RL 训练循环仍需另行编排。

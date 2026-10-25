@@ -20,7 +20,8 @@ import json
 import re
 from collections import Counter, defaultdict
 
-from .audit_prompts import (TYPE_GUIDANCE, TYPES, attacker_prompt, attacker_prompt_plan, build_payload)
+from .audit_prompts import (ATTACKER_SCORING_NOTE, TYPE_GUIDANCE, TYPES, attacker_prompt, attacker_prompt_plan,
+                            build_payload)
 from .common import messages
 from .data import resolve_type_policy
 
@@ -181,6 +182,8 @@ def worst_case_system(cfg, counter):
     if resolve_type_policy(cfg) == "balanced" and cfg.types_per_pack > 1:
         longest = sorted(TYPES, key=lambda t: -counter.count(TYPE_GUIDANCE[t]))
         candidates.append(attacker_prompt_plan({t: 1 for t in longest[:min(cfg.types_per_pack, len(TYPES))]}))
+    if getattr(cfg, "attacker_reward", "v1") == "v2":
+        candidates = [c + ATTACKER_SCORING_NOTE for c in candidates]
     return max(candidates, key=counter.count)
 
 

@@ -53,5 +53,12 @@
   "types_per_pack": 2,
   "type_weights": null,
   "screen_k": 30,
-  "bank_defects": true
+  "bank_defects": true,
+  "attacker_reward": "v2",
+  "attacker_reject_penalty": 0.1,
+  "attacker_repair_credit": 0.5,
+  "builder_reward": "v2",
+  "builder_coverage_weight": 0.5,
+  "builder_redundancy_cap": 10,
+  "builder_prompt": "v2"
 }

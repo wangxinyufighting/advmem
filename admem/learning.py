@@ -31,12 +31,15 @@ def completion_logp(model, prompt_ids, completion_ids, device):
     return logits.gather(-1, targets[:, None]).squeeze(-1) - logits.logsumexp(-1)
 
 
-def advantages(rewards):
+def advantages(rewards, std_floor=0.0):
+    """组内z分数。std_floor>0时按max(std, floor)归一化：组内奖励只差很小一点（例如只差长度项）时，
+    不会被放大成±1以上的优势。std_floor=0与旧实现相同。返回的std仍是真实组内std。"""
     x = torch.as_tensor(rewards, dtype=torch.float32)
     if len(x) < 2 or not torch.isfinite(x).all():
         raise ValueError("GRPO requires >=2 finite rewards")
     std = x.std(unbiased=False)
-    return (x - x.mean()) / (std + 1e-6), float(std)
+    scale = torch.clamp(std, min=float(std_floor)) if std_floor else std
+    return (x - x.mean()) / (scale + 1e-6), float(std)
 
 
 def grpo_loss(logp, old_logp, ref_logp, advantage, clip=0.2, beta=0.02):
@@ -52,7 +55,7 @@ def grpo_loss(logp, old_logp, ref_logp, advantage, clip=0.2, beta=0.02):
     return loss
 
 
-def optimize_groups(model, optimizer, groups, device, clip=0.2, beta=0.02):
+def optimize_groups(model, optimizer, groups, device, clip=0.2, beta=0.02, std_floor=0.0):
     """groups在更新前全部由同一old policy采样/打分；累积梯度后只step一次。"""
     if not groups:
         return 0.0
@@ -60,7 +63,7 @@ def optimize_groups(model, optimizer, groups, device, clip=0.2, beta=0.02):
     model.train()
     loss_sum = 0.0
     for group in groups:
-        adv, std = advantages([r.reward for r in group])
+        adv, std = advantages([r.reward for r in group], std_floor)
         if std <= 1e-8:
             raise ValueError("Zero-variance groups should have been skipped")
         for rollout, a in zip(group, adv):

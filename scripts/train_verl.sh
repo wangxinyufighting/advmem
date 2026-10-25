@@ -7,6 +7,12 @@ set -euo pipefail
 : "${OUT:?set OUT}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PYTHONPATH="$ROOT:${PYTHONPATH:-}"
+# 导出状态的prompt长度由config的输入预算决定。设CONFIG时据此推导PROMPT_TOKENS，避免默认8192在
+# truncation=error下让大记忆状态直接报错；仍可显式设PROMPT_TOKENS覆盖。
+if [[ -z "${PROMPT_TOKENS:-}" && -n "${CONFIG:-}" ]]; then
+  PROMPT_TOKENS=$(python -c "import json,sys; c=json.load(open(sys.argv[1])); print(max(c.get('builder_input_tokens',16384), c.get('attacker_input_tokens',16384))+256)" "$CONFIG")
+fi
+echo "max_prompt_length=${PROMPT_TOKENS:-8192} (set CONFIG=<admem config> to derive it from the input budgets)" >&2
 python -m verl.trainer.main_ppo \
   algorithm.adv_estimator=grpo algorithm.use_kl_in_reward=false \
   data.train_files="$TRAIN" data.val_files="$VAL" \

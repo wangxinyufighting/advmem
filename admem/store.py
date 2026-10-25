@@ -47,8 +47,23 @@ def augment(memory, raw):
     return result
 
 
-def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, limit, max_ops=16):
-    """并行语义：一次输出不能重复触碰同一旧ID，不能引用本次新建的未知ID。"""
+def round_dates(full):
+    """rid → 所属session的日期字符串，供卡片记录来源日期。"""
+    return {rid: full.sessions[r.session_id].date for rid, r in full.rounds.items()}
+
+
+def entry_dates(prov, dates):
+    """卡片来源日期：prov里最早和最晚的session日期（LongMemEval日期为YYYY/MM/DD开头，按字符串排序即时间序）。"""
+    values = sorted({dates[r] for r in prov if r in dates})
+    return values[:1] + values[-1:] if len(values) > 1 else values
+
+
+def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, limit, max_ops=16,
+          round_dates=None, forbid_initial_noop=True):
+    """并行语义：一次输出不能重复触碰同一旧ID，不能引用本次新建的未知ID。
+
+    round_dates（可选，rid→日期）：给写入的卡片加dates字段，reader渲染时显示来源日期（builder_prompt=v2）。
+    forbid_initial_noop=False（builder_prompt=v2）：允许第一个窗口NOOP；v2改用覆盖率奖励而不是硬规则。"""
     if mode not in {"stream", "patch", "refine"}:
         raise ValueError("Invalid edit mode")
     if not isinstance(action, dict) or set(action) != {"ops"} or not isinstance(action["ops"], list):
@@ -65,7 +80,7 @@ def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, l
     visible_prov = {r for i in visible_ids for r in index[i]["prov"]}
     # A first stream window must not silently turn the entire memory into a
     # vacuous no-op.  The caller can fall back to the raw window instead.
-    if mode == "stream" and not memory and source_ids and not action["ops"]:
+    if forbid_initial_noop and mode == "stream" and not memory and source_ids and not action["ops"]:
         raise InvalidAction("NOOP is not allowed for a nonempty source and empty stream memory")
     used, removed, created, replaced = set(), set(), [], {}
     for pos, op in enumerate(action["ops"]):
@@ -116,6 +131,8 @@ def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, l
             raise InvalidAction("Every written entry needs valid provenance")
         eid = op["id"] if typ == "UPDATE" else "m_" + digest([digest(memory), pos, op])[:20]
         entry = {"id": eid, "text": text, "prov": sorted(merged_prov), "kind": "card"}
+        if round_dates is not None:
+            entry["dates"] = entry_dates(merged_prov, round_dates)
         if typ == "UPDATE":
             replaced[eid] = entry
         else:

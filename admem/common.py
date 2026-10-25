@@ -257,6 +257,14 @@ class Config:
     type_weights: dict | None = None  # balanced：目标题型比例；None=六类均匀
     screen_k: int = 30              # gate宽检索候选数；装不进judge预算时按排名截断并记录
     bank_defects: bool = True       # bank针对非空M时，为通过gate的题记录defect类别
+    # ---- 奖励与提示词版本。v1=旧实现（默认，便于复现旧实验）；v2见README第14节 ----
+    attacker_reward: str = "v1"
+    attacker_reject_penalty: float = 0.1  # v2：被gate拒绝的题最多扣这么多（按gate阶段递减）
+    attacker_repair_credit: float = 0.5   # v2：gate修补过E的题只拿这个比例
+    builder_reward: str = "v1"
+    builder_coverage_weight: float = 0.5  # v2：x里新事实被存下的比例（不依赖题库）
+    builder_redundancy_cap: int = 10      # v2：冗余罚分最多计这么多个操作
+    builder_prompt: str = "v1"            # v2：精简Builder提示词+卡片日期+按相关性排序的目录
 
     @classmethod
     def load(cls, path):
@@ -294,6 +302,12 @@ class Config:
         if (min(c.neighbor_session_cap, c.fact_queries, c.fact_query_k, c.screen_k, c.types_per_pack) < 1
                 or c.neighbors < 0 or not 0 <= c.pack_neighbor_reserve < 1):
             raise ValueError("Invalid pack/neighbor/type settings")
+        if (c.attacker_reward not in {"v1", "v2"} or c.builder_reward not in {"v1", "v2"}
+                or c.builder_prompt not in {"v1", "v2"}):
+            raise ValueError("attacker_reward/builder_reward/builder_prompt must be v1 or v2")
+        if (not 0 <= c.attacker_reject_penalty <= 1 or not 0 <= c.attacker_repair_credit <= 1
+                or not 0 <= c.builder_coverage_weight <= 2 or c.builder_redundancy_cap < 1):
+            raise ValueError("Invalid v2 reward settings")
         if c.type_weights is not None:
             from .audit_prompts import TYPES  # 局部导入，避免循环依赖
             if (not isinstance(c.type_weights, dict) or not c.type_weights
@@ -309,6 +323,21 @@ class Config:
         value.pop("cache")
         value.pop("project")  # 挪到GPU机器不改变语义；源码仍由implementation_hash验证。
         return digest([value, implementation_hash(self.project)])
+
+
+def role_models(roles=("BUILDER", "ATTACKER", "DEFENDER", "JUDGE")):
+    """各角色实际使用的(模型名, 服务地址)，与Client.from_env的回落规则一致。"""
+    return {r: (os.getenv(f"{r}_MODEL", os.getenv("LLM_MODEL", "")),
+                os.getenv(f"{r}_BASE_URL", os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")).rstrip("/"))
+            for r in roles}
+
+
+def self_judging(models=None):
+    """被训练/评估的策略（BUILDER、ATTACKER）与给它打分的角色（JUDGE、DEFENDER）是同一个模型服务的组合。
+    同一模型自己判自己会让奖励偏向它自己的错误，正式实验应分开配置。"""
+    models = models or role_models()
+    return [f"{policy}={scorer}" for policy in ("BUILDER", "ATTACKER") for scorer in ("JUDGE", "DEFENDER")
+            if models[policy][0] and models[policy] == models[scorer]]
 
 
 def connect(project):

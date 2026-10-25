@@ -1,6 +1,7 @@
 """Build → Audit/Patch → Refine。纯模型提议与外部回退分开记录。"""
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -12,7 +13,7 @@ from .common import BudgetExceeded, InvalidAction, Progress, Unknown, digest, pa
 from .data import TypeScheduler, hint, policy_type, resolve_type_policy
 from .audit_prompts import TYPES, attacker_rids, feasible_types, plan_item_type, structural_types
 from .prompts import attacker_messages, attacker_view_type, builder_prompt, evidence_usage, source_view
-from .store import apply, augment, neutral_round, question_key, raw_chunks, text_size
+from .store import apply, augment, neutral_round, question_key, raw_chunks, round_dates, text_size
 
 # defect类别里，能靠把E原文补进M修复的那几类；none/unresolved不算当前M的缺陷。
 REPAIRABLE_DEFECTS = {"missing", "lossy_or_reasoning", "unretrievable", "retrieval_composition_candidate"}
@@ -89,14 +90,47 @@ def windows(full, counter, limit):
             yield current
 
 
-def related(memory, x, env):
+def related(memory, x, env, limit=None):
+    limit = env.cfg.old_entries if limit is None else limit
     if not memory:
         return []
     source_ids = {s["rid"] for s in x}
     overlap = [e["id"] for e in memory if set(e["prov"]) & source_ids]
     idx = env.memory_index(memory)
-    found = idx.search_many([s["text"] for s in x], env.cfg.old_entries) if x else []
-    return list(dict.fromkeys(overlap + [h.id for h in found]))[:env.cfg.old_entries]
+    found = idx.search_many([s["text"] for s in x], limit) if x else []
+    return list(dict.fromkeys(overlap + [h.id for h in found]))[:limit]
+
+
+def state_tests(tests):
+    """测试题按question_key去重；保留v2的context_rids（奖励时额外补进这些round的原文）。"""
+    kept = {}
+    for q in tests:
+        item = clean_question(q)
+        if q.get("context_rids"):
+            item["context_rids"] = list(q["context_rids"])
+        kept[question_key(q)] = item
+    return list(kept.values())
+
+
+def stream_tests(bank, x, visited, old, env):
+    """stream窗口的奖励测试题。
+
+    v1：E已读完，且全部落在当前窗口或待编辑旧条目的prov里（跨session题只在最后一块证据出现、
+    且之前的证据已被存进M时才会成为测试题）。
+    v2（builder_reward=v2）另加“前瞻”题：E与本窗口已读完的round有交集、但不满足上面条件的题。
+    评分时把E中不在本窗口的round原文补进编辑前后的记忆（context_rids），只衡量本窗口那部分
+    证据有没有被存下——之前漏存、或证据还在未来session里的跨session题也能给本窗口记分。"""
+    visible = {s["rid"] for s in x}
+    complete = visible & visited  # 调用前visited已加入本窗口读完的round
+    plain = [q for q in bank or [] if set(q["E"]) <= visited and set(q["E"]) <= visible | old]
+    tests = sorted(plain, key=lambda q: bool(set(q["E"]) & visible), reverse=True)
+    if env.cfg.builder_reward == "v2":
+        keys = {question_key(q) for q in plain}
+        ahead = [{**q, "context_rids": sorted(set(q["E"]) - visible)} for q in bank or []
+                 if question_key(q) not in keys and set(q["E"]) & complete]
+        overlapping = [q for q in tests if set(q["E"]) & visible]
+        tests = overlapping + ahead + [q for q in tests if not set(q["E"]) & visible]
+    return tests[:env.cfg.replay_questions]
 
 
 def replay(qbook, n, identity):
@@ -113,9 +147,10 @@ def clean_question(q):
 
 def builder_state(full, full_path, context, memory, x, mode, tests, env, old_ids=None):
     ids = related(memory, x, env) if old_ids is None else old_ids
+    v2_prompt = env.cfg.builder_prompt == "v2"
     visible_type = context.get("question_type") if env.cfg.hint_mode == "target_type" else None
     extra_system = ""
-    if visible_type == "temporal-reasoning":
+    if visible_type == "temporal-reasoning" and not v2_prompt:  # v2提示词的TIME一节对所有题型生效
         # Put temporal arithmetic in the single system message and count the
         # addition before selecting the old-entry subset. Small instruction
         # models often copy the report date when this rule is appended later.
@@ -130,15 +165,24 @@ def builder_state(full, full_path, context, memory, x, mode, tests, env, old_ids
             "6. Do not add first/only/no-other-event claims.\n"
             "7. Output exactly one JSON object; do not output a worked example, Markdown, or a thinking block."
         )
+    # v2：目录先列与x相关的条目（不止old_entries个），其余最新优先。
+    order = related(memory, x, env, limit=len(memory)) if v2_prompt and x else []
     prompt, visible, cap = builder_prompt(
         full, memory, ids, x, mode, hint(context, env.cfg), env.cfg, env.counter,
-        extra_system=extra_system,
+        extra_system=extra_system, catalog_order=order,
     )
-    tests = list({question_key(q): clean_question(q) for q in tests}.values())
-    return {"role": "builder", "mode": mode, "split": context["split"], "case_key": context["key"],
-            "full_path": str(Path(full_path).resolve()), "full_hash": full.fingerprint,
-            "hint_mode": env.cfg.hint_mode, "environment_fingerprint": env.cfg.fingerprint(), "M": deepcopy(memory), "old_ids": visible,
-            "x": deepcopy(x), "entry_limit": cap, "tests": tests, "prompt": prompt}
+    tests = state_tests(tests)
+    state = {"role": "builder", "mode": mode, "split": context["split"], "case_key": context["key"],
+             "full_path": str(Path(full_path).resolve()), "full_hash": full.fingerprint,
+             "hint_mode": env.cfg.hint_mode, "environment_fingerprint": env.cfg.fingerprint(), "M": deepcopy(memory), "old_ids": visible,
+             "x": deepcopy(x), "entry_limit": cap, "tests": tests, "prompt": prompt}
+    if env.cfg.builder_reward == "v2":
+        # 冗余只对照Builder看得到的条目（M_old全文+目录摘要）；有x时没有测试题也能按覆盖率评分。
+        payload = json.loads(prompt[-1]["content"])
+        state["catalog_ids"] = [item["id"] for item in payload.get("stored_catalog", [])]
+        state["reward_version"] = "v2"
+        state["coverage_scorable"] = bool(x) and mode in {"stream", "patch"} and env.cfg.builder_coverage_weight > 0
+    return state
 
 
 def _sessions(full, rids):
@@ -204,6 +248,10 @@ def attacker_state(full, full_path, context, memory, pack, accepted, env, identi
              "type_policy": policy}
     if plan:
         state["type_plan"] = dict(plan)
+    if cfg.attacker_reward == "v2":
+        # v2奖励的语义去重需要已接受题的题面（只取与可见round有交集的最近若干条）。
+        overlap = [{"q": q["q"], "E": list(q["E"])} for q in accepted if set(q["E"]) & set(visible)]
+        state["prior_questions"] = overlap[-max(1, cfg.attacker_context_items):]
     if budget_dropped:
         state["budget_dropped_rids"] = budget_dropped
     return state
@@ -229,11 +277,19 @@ def propose(state, env, role, nonce):
     return env.policy(role).complete(state["prompt"], nonce, temperature=temperature)
 
 
+def apply_options(full, cfg):
+    """builder_prompt=v2：卡片记来源日期，第一个窗口允许NOOP。v1：与旧实现相同。"""
+    if cfg.builder_prompt == "v2":
+        return {"round_dates": round_dates(full), "forbid_initial_noop": False}
+    return {}
+
+
 def edit(full, state, raw, env):
     try:
         proposal, changed = apply(state["M"], parse(raw), mode=state["mode"], visible_ids=state["old_ids"],
             source_ids=[s["rid"] for s in state["x"]], full_ids=full.rounds,
-            counter=env.counter, limit=state["entry_limit"], max_ops=env.cfg.max_ops)
+            counter=env.counter, limit=state["entry_limit"], max_ops=env.cfg.max_ops,
+            **apply_options(full, env.cfg))
     except InvalidAction as exc:
         return None, {"legal": False, "reason": str(exc)}
     if env.cfg.faith_gate:
@@ -256,8 +312,18 @@ def raw_from_window(x, env):
     return items
 
 
-def all_pass(memory, questions, env):
-    return all(env.answer(memory, q)["correct"] for q in questions)
+def with_context(memory, q, full, env):
+    """v2前瞻测试题：把E中不在当前窗口的round原文补进记忆再答。"""
+    rids = q.get("context_rids") or []
+    if not rids:
+        return memory
+    return augment(memory, raw_chunks(full, rids, env.counter, env.cfg.timeline_tokens))
+
+
+def all_pass(memory, questions, env, full=None):
+    if full is None and any(q.get("context_rids") for q in questions):
+        raise ValueError("context_rids tests need the full memory to supply context")
+    return all(env.answer(with_context(memory, q, full, env), q)["correct"] for q in questions)
 
 
 def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=None,
@@ -283,13 +349,11 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
         for wi, x in enumerate(windows(full, env.counter, env.cfg.window_tokens)):
             # long round尚未读完时，不能把整条rid的未来事实当成本窗口可答测试。
             visited.update(s["rid"] for s in x if s["span"][1] == len(neutral_round(full, s["rid"])["text"]))
-            visible = set(s["rid"] for s in x)
             ids = related(memory, x, env)
             old = {r for e in memory if e["id"] in ids for r in e["prov"]}
             # Δ可答性测试：证据已读全、落在当前窗口或待编辑条目prov的题；新题优先，历史题防遗忘。
-            tests = [q for q in bank or [] if set(q["E"]) <= visited and set(q["E"]) <= visible | old]
-            tests = sorted(tests, key=lambda q: bool(set(q["E"]) & visible), reverse=True)
-            tests = tests[:env.cfg.replay_questions]
+            # builder_reward=v2时另加跨session的前瞻题（见stream_tests）。
+            tests = stream_tests(bank, x, visited, old, env)
             state = builder_state(full, full_path, context, memory, x, "stream", tests, env, ids)
             raw = propose(state, env, builder_role, f"{namespace}:build:{wi}")
             proposal, checks = edit(full, state, raw, env)
@@ -301,7 +365,8 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
                 fallback = True
             if collect:
                 # 不把逐字fallback当作模型的SFT目标。无tests只用于faith+格式示范。
-                useful_demo = proposal is not None and (all_pass(proposal, tests, env) if tests else bool(parse(raw)["ops"]))
+                useful_demo = proposal is not None and (all_pass(proposal, state["tests"], env, full) if tests
+                                                        else bool(parse(raw)["ops"]))
                 collect.save(state, raw if useful_demo else None,
                              {"faith": proposal is not None, "tests_verified": bool(tests) and useful_demo, "semantic_imitation": True})
             checkpoint({"stage": "build", "window": wi, "checks": checks, "fallback": fallback,

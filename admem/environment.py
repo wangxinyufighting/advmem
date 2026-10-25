@@ -9,10 +9,12 @@ from pathlib import Path
 
 from .common import BudgetExceeded, Remote, Unknown, InvalidAction, digest, messages, parse
 from . import prompts
-from .audit_prompts import (SINGLE_SESSION, TYPES, GATE_ORACLE_SYSTEM, GATE_SUPPORT_SYSTEM,
-                            personal_score, plan_item_type)
+from .audit_prompts import (EVIDENCE_AUDIT_SYSTEM, SINGLE_SESSION, TYPES, GATE_ORACLE_SYSTEM,
+                            GATE_SUPPORT_SYSTEM, personal_score, plan_item_type)
+from . import rewards as rv2
 from .store import apply, augment, question_key, raw_chunks, text_size
-from .edit_checks import assess_edits
+from .edit_checks import assess_edits, source_coverage
+from .store import round_dates
 
 
 def boolean(value, field):
@@ -129,35 +131,46 @@ class Environment:
             "prediction": answer, "type": q["type"], "abstention": abstention}, "grade:" + key)
         return boolean(value, "correct")
 
-    def context(self, memory, q, all_memory=False):
+    def render_entry(self, entry):
+        """reader看到的条目文本。builder_prompt=v2时，模型卡片前加host记录的来源日期；
+        raw块本身已有“Recorded on”。v1与旧实现逐字相同。"""
+        if self.cfg.builder_prompt != "v2" or entry.get("kind") == "raw" or not entry.get("dates"):
+            return entry["text"]
+        dates = entry["dates"]
+        label = f"Source date: {dates[0]}" if len(dates) == 1 else f"Source dates: {dates[0]} to {dates[-1]}"
+        return f"[{label}] {entry['text']}"
+
+    def context(self, memory, q, all_memory=False, k=None):
         if all_memory:
             chosen = memory
         else:
             index = self.memory_index(memory)
-            hits = index.search(q["q"], self.cfg.reader_k) if index else []
+            hits = index.search(q["q"], k or self.cfg.reader_k) if index else []
             mapping = {e["id"]: e for e in memory}
             chosen = [mapping[h.id] for h in hits]
         kept, chunks = [], []
         for entry in chosen:
-            new = "\n\n".join(chunks + [entry["text"]])
+            text = self.render_entry(entry)
+            new = "\n\n".join(chunks + [text])
             if self.counter.count(new) > self.cfg.reader_tokens:
                 if all_memory:
                     raise BudgetExceeded("All-M condition cannot fit; do not report truncated M as all-M",
                                          stage="reader_all_memory", limit=self.cfg.reader_tokens)
                 continue
-            chunks.append(entry["text"])
+            chunks.append(text)
             kept.append(entry["id"])
         return "\n\n".join(chunks), kept
 
-    def answer(self, memory, q, *, all_memory=False, abstention=False, type_hint=None):
+    def answer(self, memory, q, *, all_memory=False, abstention=False, type_hint=None, k=None):
         if type_hint is None:
             type_hint = self.cfg.hint_mode == "target_type"
         cache = self._answer_cache
-        cache_key = digest([memory, q, all_memory, abstention, type_hint]) if cache is not None else None
+        identity = [memory, q, all_memory, abstention, type_hint] + ([k] if k else [])
+        cache_key = digest(identity) if cache is not None else None
         if cache is not None and cache_key in cache[0]:
             cache[0].move_to_end(cache_key)
             return deepcopy(cache[0][cache_key])
-        context, ids = self.context(memory, q, all_memory)
+        context, ids = self.context(memory, q, all_memory, k) if k else self.context(memory, q, all_memory)
         # cache身份包含实际文本、日期、模型配置和完整问答；服务客户端还会hash完整request。
         key = digest([context, q, all_memory, abstention, type_hint])
         answer = self.reader(q, context, key, task_type=q["type"] if type_hint else None)
@@ -317,6 +330,8 @@ class Environment:
         正向答题奖励要求所有写入忠实；压缩还要求没有已答对题目退化，
         并通过被编辑旧条目的事实保留检查。合法 NOOP 的奖励恒为 0。
         """
+        if self.cfg.builder_reward == "v2":
+            return self._builder_score_v2(full, state, completion)
         cfg = self.cfg
         # 每项负奖励有界；非法输出严格低于合法输出的理论下界，避免
         # 学到用坏 JSON 逃避信息损失/忠实度惩罚。
@@ -384,7 +399,111 @@ class Environment:
                 "compression_eligible": compression_eligible, "safe_compression": safe_compression,
                 "noop": not action["ops"], **checks, "proposed": proposed}
 
+    def _test_memory(self, full, memory, q):
+        rids = q.get("context_rids") or []
+        return augment(memory, raw_chunks(full, rids, self.counter, self.cfg.timeline_tokens)) if rids else memory
+
+    def _builder_score_v2(self, full, state, completion):
+        """v2 Builder奖励（README第14.2节）。与v1的区别：
+        - gain/loss按“目标题数”归一化（与当前x有证据交集的测试题，至少1），不再被回放题数稀释；
+          两者都截断到[0,1]，回放题被改错照样扣分；
+        - 前瞻题（context_rids）在编辑前后都补进其余证据的原文，只衡量本窗口的那部分；
+        - k下答案翻转时用2k复核，仅检索排名被挤动的翻转只算一半（NOOP仍不重新作答）；
+        - 新增覆盖率项：x里Builder可见范围内尚未存过的事实被存下的比例（不依赖题库，需忠实）；
+        - 冗余只对照Builder看得到的条目，且最多计builder_redundancy_cap个；
+        - 没有测试题但有x的stream/patch状态也能评分（只有覆盖率/忠实/保留/长度/冗余项）。
+        合法NOOP仍为0；非法输出低于合法下界（rewards.builder_invalid_reward_v2）。"""
+        cfg = self.cfg
+        invalid_reward = rv2.builder_invalid_reward_v2(cfg)
+        try:
+            action = parse(completion)
+            proposed, changed = apply(state["M"], action, mode=state["mode"], visible_ids=state["old_ids"],
+                source_ids=[x["rid"] for x in state["x"]], full_ids=full.rounds, counter=self.counter,
+                limit=state["entry_limit"], max_ops=cfg.max_ops,
+                **({"round_dates": round_dates(full), "forbid_initial_noop": False}
+                   if cfg.builder_prompt == "v2" else {}))
+        except InvalidAction as exc:
+            return {"reward": invalid_reward, "effective_reward": invalid_reward,
+                    "legal": False, "edit_quality_pass": None, "reward_version": "v2",
+                    "legal_reason": str(exc), "reason": str(exc)}
+        tests = state["tests"]
+        coverage_on = cfg.builder_coverage_weight > 0 and bool(state["x"]) and state["mode"] in {"stream", "patch"}
+        if not tests and not coverage_on:
+            raise Unknown("Empty test set and no source window: no reward is defined")
+        noop = not action["ops"]
+        faith_scores = self.faith_scores(full, changed)
+        faithful = all(faith_scores)
+        faith_ratio = sum(faith_scores) / len(faith_scores) if faith_scores else 1.0
+
+        x_rids = {s["rid"] for s in state["x"]}
+        targets = [bool(set(q["E"]) & x_rids) for q in tests]
+        denom = max(1, sum(targets))
+        before_scores, after_scores, deltas, confirmed = [], [], [], 0
+        for q in tests:
+            before_memory = self._test_memory(full, state["M"], q)
+            before = self.answer(before_memory, q)["correct"]
+            if noop:
+                after, delta = before, 0.0
+            else:
+                after_memory = self._test_memory(full, proposed, q)
+                after = self.answer(after_memory, q)["correct"]
+                if after != before:
+                    confirmed += 1
+                    k2 = 2 * cfg.reader_k
+                    delta = rv2.flip_delta(before, after, self.answer(before_memory, q, k=k2)["correct"],
+                                           self.answer(after_memory, q, k=k2)["correct"])
+                else:
+                    delta = 0.0
+            before_scores.append(before)
+            after_scores.append(after)
+            deltas.append(delta)
+        gain = min(1.0, sum(d for d in deltas if d > 0) / denom)
+        loss = min(1.0, -sum(d for d in deltas if d < 0) / denom)
+        scope = set(state["old_ids"]) | set(state.get("catalog_ids", []))
+        checks = assess_edits(self, full, state, action, proposed, changed, scope_ids=scope)
+        coverage = (source_coverage(self, state, proposed, changed) if coverage_on and not noop
+                    else {"facts": None, "new": None, "stored": 0, "ratio": None})
+
+        before_size = text_size(state["M"], self.counter)
+        after_size = text_size(proposed, self.counter)
+        source_size = sum(self.counter.count(x["text"]) for x in state["x"])
+        editable_size = text_size([e for e in state["M"] if e["id"] in state["old_ids"]], self.counter)
+        growth_ratio = min(1.0, max(0.0, (after_size - before_size) / max(1, source_size, editable_size)))
+        shrink_ratio = max(0.0, (before_size - after_size) / max(1, before_size))
+        compression_eligible = faithful and loss == 0 and checks["retention_pass"]
+        safe_compression = compression_eligible and shrink_ratio > 0
+        redundant = min(len(checks["redundant_ops"]), cfg.builder_redundancy_cap)
+        components = {
+            "gain": cfg.builder_gain_weight * gain if faithful else 0.0,
+            "loss": -cfg.builder_loss_weight * loss,
+            "faith": -cfg.builder_faith_weight * (1.0 - faith_ratio),
+            "retention": -cfg.builder_retention_weight * checks["information_loss"],
+            "coverage": (cfg.builder_coverage_weight * coverage["ratio"]
+                         if faithful and coverage["ratio"] is not None else 0.0),
+            "compression": cfg.size_weight * shrink_ratio if safe_compression else 0.0,
+            "growth": -cfg.size_weight * growth_ratio,
+            "redundancy": -cfg.builder_redundancy_weight * redundant,
+        }
+        reward = sum(components.values())
+        quality_ok = faithful and loss == 0 and checks["retention_pass"] and not checks["redundant_ops"]
+        return {"reward": reward, "effective_reward": reward, "reward_components": components,
+                "reward_version": "v2", "edit_quality_pass": quality_ok, "legal": True, "faith": faithful,
+                "faith_reason": ("No written entry" if not faith_scores else "All written entries supported"
+                                 if faithful else f"{len(faith_scores) - sum(faith_scores)} of "
+                                 f"{len(faith_scores)} written entries unsupported"),
+                "faith_ratio": faith_ratio, "faith_scores": faith_scores,
+                "accuracy": sum(after_scores) / len(tests) if tests else None,
+                "before_accuracy": sum(before_scores) / len(tests) if tests else None,
+                "gain": gain, "loss": loss, "test_scores": after_scores, "before_scores": before_scores,
+                "test_deltas": deltas, "target_tests": sum(targets), "confirmed_flips": confirmed,
+                "coverage": coverage, "before_tokens": before_size, "after_tokens": after_size,
+                "growth_ratio": growth_ratio, "shrink_ratio": shrink_ratio,
+                "compression_eligible": compression_eligible, "safe_compression": safe_compression,
+                "noop": noop, **checks, "proposed": proposed}
+
     def attacker_score(self, full, state, completion):
+        if self.cfg.attacker_reward == "v2":
+            return self._attacker_score_v2(full, state, completion)
         try:
             value = parse(completion)
             if set(value) != {"items"} or not isinstance(value["items"], list) or len(value["items"]) > self.cfg.questions_per_pack:
@@ -432,6 +551,107 @@ class Environment:
         # builder path so every training entry point optimizes one field.
         return {"reward": reward, "effective_reward": reward,
                 "legal": True, "items": details}
+
+    def evidence_audit(self, full, q, prior):
+        """v2：一次judge调用判断E里哪些round是必要的、证据是否关于这个用户、是否与已有题语义重复。"""
+        payload = {"q": q["q"], "a": q["a"], "type": q["type"],
+                   "E_history": prompts.source_view(full, q["E"]),
+                   "prior_questions": [{"index": i, "q": p["q"]} for i, p in enumerate(prior)]}
+        value = self.judge(EVIDENCE_AUDIT_SYSTEM, payload, "audit:" + digest([full.fingerprint, q, prior]))
+        needed = value.get("necessary_rids")
+        if (not isinstance(needed, list) or not needed or any(not isinstance(r, str) for r in needed)
+                or not set(needed) <= set(q["E"])):
+            raise Unknown("Evidence audit returned invalid necessary_rids")
+        duplicate = value.get("duplicate_of")
+        if duplicate is not None and (type(duplicate) is not int or not 0 <= duplicate < len(prior)):
+            raise Unknown("Evidence audit returned invalid duplicate_of")
+        return {"necessary_rids": sorted(set(needed)), "personal": boolean(value, "personal"),
+                "duplicate_of": duplicate, "reason": value.get("reason")}
+
+    def _attacker_score_v2(self, full, state, completion):
+        """v2 attacker奖励（README第14.1节）。每题：
+        accepted → value × novelty(max) × 必要证据比例 × (impersonal_weight若证据与用户无关) × (repair_credit若E被修补)，
+        value = 1（M为空，不计算defect）或 0.5+0.5×可修复（M非空）；
+        rejected → ∈[-penalty,0)，按gate阶段递减；重复（字面或语义）→ 小的负值；
+        judge预算溢出 → 0且记over_budget（环境原因，不惩罚策略）。
+        总奖励 = Σ / questions_per_pack；空列表 = 0；非法输出 = -(penalty+0.1)，低于任何合法输出。"""
+        cfg = self.cfg
+        penalty = cfg.attacker_reject_penalty
+        try:
+            value = parse(completion)
+            if set(value) != {"items"} or not isinstance(value["items"], list) or len(value["items"]) > cfg.questions_per_pack:
+                raise InvalidAction("items schema/budget violation")
+        except InvalidAction as exc:
+            reward = rv2.attacker_invalid_reward_v2(penalty)
+            return {"reward": reward, "effective_reward": reward, "reason": str(exc), "legal": False,
+                    "reward_version": "v2"}
+        pack = self.pack_module.Pack(**state["pack"])
+        seen = set(state.get("seen_keys", []))
+        usage = dict(state.get("evidence_usage", {}))
+        prior = [dict(p) for p in state.get("prior_questions", [])]
+        rewards, details = [], []
+        plan, used = state.get("type_plan"), Counter()
+        for q in value["items"]:
+            qtype = plan_item_type(state, q, used)
+            try:
+                gate = (self.gate(full, pack, q, state["date"], qtype, seed_only=True) if plan
+                        else self.gate(full, pack, q, state["date"], qtype))
+            except BudgetExceeded as exc:
+                rewards.append(0.0)
+                details.append({"status": "over_budget", "item": q, "reward": 0.0, **exc.details()})
+                continue
+            if gate["status"] != "accepted":
+                r = rv2.rejection_reward_v2(gate, penalty)
+                rewards.append(r)
+                details.append({**gate, "reward": r, "stage": rv2.rejection_stage(gate)})
+                continue
+            q = gate["item"]
+            key = question_key(q)
+            if key in seen:
+                r = rv2.duplicate_reward_v2(penalty)
+                rewards.append(r)
+                details.append({"status": "duplicate", "item": q, "reward": r, "duplicate": "exact"})
+                continue
+            related = [p for p in prior if set(p["E"]) & set(q["E"])][-8:]
+            try:
+                audit = self.evidence_audit(full, q, related)
+            except BudgetExceeded as exc:
+                rewards.append(0.0)
+                details.append({"status": "over_budget", "item": q, "reward": 0.0, **exc.details()})
+                continue
+            if audit["duplicate_of"] is not None:
+                r = rv2.duplicate_reward_v2(penalty)
+                rewards.append(r)
+                details.append({"status": "duplicate", "item": q, "reward": r, "duplicate": "semantic",
+                                "duplicate_of": related[audit["duplicate_of"]]["q"], "audit": audit})
+                continue
+            seen.add(key)
+            weight = 1.0
+            if cfg.evidence_novelty:
+                weight *= rv2.novelty_weight_v2(usage, q["E"])
+            necessity = len(audit["necessary_rids"]) / len(q["E"])
+            weight *= necessity
+            if q["type"] != "single-session-assistant" and not audit["personal"]:
+                weight *= cfg.impersonal_weight
+            if gate.get("repaired"):
+                weight *= cfg.attacker_repair_credit
+            if state["M"]:
+                defect = self.defect(full, state["M"], q)
+                value_ = 0.5 + 0.5 * (defect["kind"] not in {"none", "unresolved"})
+            else:
+                # 空M下每道通过gate的题都是“missing”，defect项是常数；跳过它省下reader调用。
+                defect, value_ = {"kind": "skipped_empty_memory"}, 1.0
+            for rid in q["E"]:
+                usage[rid] = usage.get(rid, 0) + 1
+            prior.append({"q": q["q"], "E": list(q["E"])})
+            r = value_ * weight
+            rewards.append(r)
+            details.append({"status": "accepted", "item": q, "defect": defect, "weight": weight,
+                            "necessity": necessity, "audit": audit, "reward": r,
+                            "repaired": gate.get("repaired", False)})
+        reward = sum(rewards) / cfg.questions_per_pack
+        return {"reward": reward, "effective_reward": reward, "legal": True, "items": details,
+                "reward_version": "v2"}
 
     def evidence_weight(self, full, q, usage):
         """同一round被反复出题时边际收益递减；非SSA题证据里没有一人称个人陈述时降权。

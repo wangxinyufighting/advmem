@@ -5,13 +5,22 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 
-from .common import Config, Progress, TokenBudget, Unknown, connect, digest, read, rows, write, write_rows
+import sys
+
+from .common import (Config, Progress, TokenBudget, Unknown, connect, digest, read, rows, self_judging, write,
+                     write_rows)
 from .data import contexts, history_for_builder, prepare
 from .environment import Environment
 from .pipeline import Collector, generate_bank, run_case
 from .probes import make_suite, run_attacker_probe, run_probe
+from .rewards import builder_state_scorable
 from .bootstrap import bootstrap
 from .store import neutral_round, text_size
+
+
+# 见memory_prompt_v2/corpus_profile.json：提示词是在看过全部500道LongMemEval题与答案后写的。
+BENCHMARK_NOTE = ("Prompts were developed with all 500 LongMemEval questions and answers visible; "
+                  "LongMemEval results (any split) are benchmark-informed, not a held-out evaluation.")
 
 
 def export_states(collected, output, role, split, config_path, parquet=False):
@@ -31,7 +40,7 @@ def export_states(collected, output, role, split, config_path, parquet=False):
         records = []
         for row in selected:
             state = row["state"]
-            if role == "builder" and not state["tests"]:
+            if role == "builder" and not builder_state_scorable(state):
                 continue
             records.append({"data_source": "admem_" + role, "ability": "memory_editing",
                 "prompt": row["prompt"], "reward_model": {"style": "rule", "ground_truth": ""},
@@ -126,7 +135,8 @@ def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memo
             "lower_all": correct / len(cases), "upper_all": (correct + unknown) / len(cases),
             "mean_M_tokens": sum(r["M_tokens"] for r in judged) / len(judged) if judged else None})
     write(Path(out) / "summary.json", {"hint_mode": env.cfg.hint_mode, "snapshot": snapshot,
-          "all_memory": all_memory, "judge": "admem diagnostic; not official execution", "groups": summary})
+          "all_memory": all_memory, "judge": "admem diagnostic; not official execution",
+          "self_judging": self_judging(), "benchmark_informed": BENCHMARK_NOTE, "groups": summary})
     write_rows(Path(out) / "predictions.jsonl", [{"question_id": r["question_id"], "hypothesis": r["answer"]}
                                                 for r in details if r["status"] == "ok"])
     return summary
@@ -275,7 +285,8 @@ def _evaluate_external(cases, labels, run_dir, snapshot, env, out, all_memory=Fa
             "lower_all": correct / len(group), "upper_all": (correct + unknown) / len(group),
             "mean_M_tokens": sum(row["M_tokens"] for row in judged) / len(judged) if judged else None})
     write(out / "summary.json", {"snapshot": snapshot, "all_memory": all_memory,
-          "judge": "admem diagnostic; not official execution", "groups": summary})
+          "judge": "admem diagnostic; not official execution",
+          "self_judging": self_judging(), "benchmark_informed": BENCHMARK_NOTE, "groups": summary})
     write_rows(out / "predictions.jsonl", [{"question_id": row["question_id"],
                                              "hypothesis": row["answer"]}
                                             for row in details if row["status"] == "ok"])
@@ -603,6 +614,10 @@ def main(argv=None):
             p.error("export requires --states collector root")
         print(export_states(a.states, a.out, a.role, a.split, a.config, a.parquet))
         return
+    overlap = self_judging()
+    if overlap:
+        print("[admem] WARNING: policy and scorer share a model (" + ", ".join(overlap) + "); set separate "
+              "JUDGE_MODEL/DEFENDER_MODEL for reported results", file=sys.stderr, flush=True)
     counter = TokenBudget(cfg.tokenizer, cfg.tokenizer_revision)
     env = Environment(cfg, counter, legacy)
     if a.command == "probe-suite":

@@ -13,6 +13,7 @@ from time import perf_counter
 
 from .common import BudgetExceeded, Progress, Unknown, digest, read, write, write_rows, parse
 from .data import TypeScheduler, resolve_type_policy
+from .rewards import builder_state_scorable
 from .pipeline import attacker_state, builder_state, make_pool
 from .store import neutral_round
 
@@ -300,8 +301,8 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
     records = list(rows(records))
     if not records:
         raise ValueError("No probe states")
-    empty_test = sum(1 for r in records if not r["state"].get("tests"))
-    records = [r for r in records if r["state"].get("tests")]
+    empty_test = sum(1 for r in records if not builder_state_scorable(r["state"]))
+    records = [r for r in records if builder_state_scorable(r["state"])]
     if not records:
         raise ValueError(
             "No probe states with non-empty tests; the answer-retention reward "

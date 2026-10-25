@@ -145,6 +145,11 @@ class FakeRemote:
             return {'answerable':True,'answer':'Milo','user_relevant':True,'type_valid':True,'no_answer_leak':True}
         if system==GATE_SUPPORT_SYSTEM:
             return {'correct':p['a']=='Milo','reason':'stub'}
+        from admem.audit_prompts import EVIDENCE_AUDIT_SYSTEM
+        if system==EVIDENCE_AUDIT_SYSTEM:
+            text=' '.join(r['text'] for r in p['E_history'])
+            return {'necessary_rids':[r['rid'] for r in p['E_history']],
+                    'personal':bool(re.search(r"\b(I|my|My)\b",text)),'duplicate_of':None,'reason':'stub'}
         if system==prompts.SCREEN:
             return {'stable':not self.control.get('unstable'), 'additional_rids':[],'reason':'stub'}
         raise AssertionError(system[:80])
