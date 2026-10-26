@@ -33,7 +33,7 @@ def _clear_llm_env(monkeypatch):
     for name in [
         "JUDGE_MAX_TOKENS", "LLM_MAX_TOKENS", "JUDGE_EXTRA_BODY",
         "LLM_EXTRA_BODY", "JUDGE_JSON_RETRY_MAX_TOKENS",
-        "LLM_JSON_RETRY_MAX_TOKENS",
+        "LLM_JSON_RETRY_MAX_TOKENS", "LLM_JSON_MODE",
     ]:
         monkeypatch.delenv(name, raising=False)
 
@@ -76,11 +76,34 @@ def test_trace_request_uses_effective_body_and_clears_stale_request(tmp_path, mo
     remote = Remote("JUDGE", _FakeCore, tmp_path / "api")
     remote.complete([{"role": "user", "content": "original input"}], "first")
     assert remote.last_request == client.requests[0][1]
-    assert remote.last_request["messages"] == effective
+    assert remote.last_request["messages"][1:] == effective
+    assert "JSON" in remote.last_request["messages"][0]["content"]
     client.calls = client.max_calls
     with pytest.raises(Unknown, match="MAX_API_CALLS"):
         remote.complete([], "second")
     assert remote.last_request is None
+
+
+@pytest.mark.parametrize("extra,prompt_text,adds_reminder", [
+    ({}, "Judge the answer.", True),
+    ({}, "Return Json.", False),
+    ({"response_format": None}, "Judge the answer.", False),
+])
+def test_json_mode_message_requirement(tmp_path, monkeypatch, extra, prompt_text, adds_reminder):
+    _clear_llm_env(monkeypatch)
+    monkeypatch.setenv("JUDGE_EXTRA_BODY", json.dumps(extra))
+    client = _FakeClient([{"choices": [{"finish_reason": "stop", "message": {"content": "{}"}}]}])
+    _FakeCore.client = client
+    prompt = [{"role": "user", "content": prompt_text}]
+    Remote("JUDGE", _FakeCore, tmp_path / "api").complete(prompt, "case")
+    sent = client.requests[0][1]["messages"]
+    assert prompt == [{"role": "user", "content": prompt_text}]
+    assert len(sent) == len(prompt) + int(adds_reminder)
+    if adds_reminder:
+        assert "JSON" in sent[0]["content"]
+        assert sent[1:] == prompt
+    else:
+        assert sent == prompt
 
 
 def test_json_retry_when_reasoning_returns_null_content(tmp_path, monkeypatch):

@@ -392,7 +392,8 @@ class Remote:
         is applied after role-specific ``*_EXTRA_BODY`` overrides so that
         services using ``max_completion_tokens`` (rather than the legacy
         ``max_tokens``) receive the larger retry budget as well.  The initial
-        request remains byte-for-byte compatible with the configured body.
+        request keeps the configured budget; JSON mode adds a format reminder
+        when the messages do not already mention JSON.
         """
         self.last_request = None
         if max_tokens is None:
@@ -409,6 +410,16 @@ class Remote:
                 body.pop(key, None)
             else:
                 body[key] = value
+        # 部分接口要求 JSON 模式的提示词显式包含 JSON；不修改调用方保存的 prompt。
+        response_format = body.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+            request_messages = body.get("messages", [])
+            if not any("json" in str(message.get("content", "")).lower()
+                       for message in request_messages):
+                body["messages"] = [
+                    {"role": "system", "content": "Return exactly one valid JSON object."},
+                    *request_messages,
+                ]
         if output_tokens is not None:
             # Keep the caller's chosen parameter spelling.  A few compatible
             # APIs reject a request containing both spellings, so do not add a
