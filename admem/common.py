@@ -183,9 +183,14 @@ def parse_json_object(text):
     raise InvalidAction("Model response does not contain one JSON object")
 
 
+# 不影响状态构造与奖励计算的模块（训练/验证/启动工具）不进入环境指纹：更新它们不应让已导出的状态失效。
+_FINGERPRINT_EXCLUDED = {"validation.py", "verl_launch.py", "verl_adv.py", "train.py", "learning.py"}
+
+
 @lru_cache(maxsize=8)
 def implementation_hash(project):
-    sources = {"admem/" + p.name: p for p in Path(__file__).parent.glob("*.py")}
+    sources = {"admem/" + p.name: p for p in Path(__file__).parent.glob("*.py")
+               if p.name not in _FINGERPRINT_EXCLUDED}
     sources.update({"legacy/" + n: Path(project) / n for n in ["memory.py", "packs.py", "retrieve.py", "llm.py"]})
     return digest({name: hashlib.sha256(p.read_bytes()).hexdigest() for name, p in sources.items() if p.is_file()})
 

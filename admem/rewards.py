@@ -102,3 +102,40 @@ def normalized_advantages(rewards, std_floor=0.0, eps=1e-6):
     std = pstdev(rewards)
     scale = max(std, std_floor) + eps
     return [(r - mean) / scale for r in rewards], std
+
+
+def invalid_threshold(cfg, role):
+    """区分“非法输出”和合法输出的奖励阈值：低于它的样本按非法处理（组内整形）。
+
+    v2 builder：非法 = 合法下界 − 1，阈值取中点。v1 builder同理（v1非法奖励也比合法下界低1）。
+    v2 attacker：非法 = −(penalty+0.1)，合法下界 = −penalty，阈值取中点。
+    v1 attacker：非法(−0.1)与合法下界(−0.1)重合，无法区分，返回None（不整形）。"""
+    if role == "builder":
+        if cfg.builder_reward == "v2":
+            return builder_invalid_reward_v2(cfg) + 0.5
+        invalid = -(cfg.builder_loss_weight + cfg.builder_faith_weight + cfg.builder_retention_weight
+                    + cfg.size_weight + cfg.builder_redundancy_weight * cfg.max_ops + 1.0)
+        return invalid + 0.5
+    if role == "attacker":
+        if cfg.attacker_reward == "v2":
+            return attacker_invalid_reward_v2(cfg.attacker_reject_penalty) + 0.05
+        return None
+    raise ValueError(f"Unknown role {role!r}")
+
+
+def group_advantages(scores, index, threshold=None, std_floor=0.0, eps=1e-6):
+    """GRPO组内优势（admem版）：按index分组；低于threshold的样本先整形（shape_group），
+    再用max(std, std_floor)归一化。单样本组优势为0。纯Python，verl_adv与测试共用。"""
+    groups = {}
+    for i, key in enumerate(index):
+        groups.setdefault(key, []).append(i)
+    advantages = [0.0] * len(scores)
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        raw = [float(scores[i]) for i in members]
+        legal = [True] * len(raw) if threshold is None else [r > threshold for r in raw]
+        values, _ = normalized_advantages(shape_group(raw, legal), std_floor, eps)
+        for i, value in zip(members, values):
+            advantages[i] = value
+    return advantages

@@ -704,7 +704,8 @@ def main(argv=None):
                 source = f"{Path(a.memory_run).resolve()}/{key}/{a.memory_snapshot}.json" if a.memory_run else None
                 n = generate_bank(full, full_path, context, env, Path(a.out) / key, a.attacker_role,
                                   memory=memory, base_bank=base, memory_source=source,
-                                  defects_only=a.defects_only)
+                                  defects_only=a.defects_only,
+                                  collect=Collector(a.collect) if a.collect else None)
                 result = {"status": "ok", "questions": n}
             else:
                 bank = read(Path(a.bank) / key / "bank.json") if a.bank else []

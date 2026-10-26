@@ -639,3 +639,10 @@ v2 的 attacker 提示词末尾附加 `ATTACKER_SCORING_NOTE`，说明上面三�
 - **自己判自己**：BUILDER/ATTACKER 与 JUDGE/DEFENDER 解析到同一模型服务时，CLI 和 `probe_longmemeval.py` 打印警告，评测 summary 与 probe summary 记录 `self_judging`。
 - **测试集不独立**：评测 summary 加 `benchmark_informed` 说明。真正的独立评估需要另一个未参与提示词设计的基准，代码无法补救。
 - **对抗协同训练**：`--bank-rounds` 与针对 M 出题（第13.4节）实现了题库与记忆的交替，但 Builder 与 Attacker 的交替 RL 训练循环仍需另行编排。
+
+## 15. GRPO 训练（verl）
+
+完整流程（数据准备、可选SFT、带验证与早停的verl GRPO、Attacker训练、交替训练、最终测试）见
+[`TRAINING.md`](TRAINING.md)。要点：当前verl从 `reward.custom_reward_function.*` 读取奖励函数，旧的
+顶层键不再生效，请用 `admem/verl_launch.py` / `scripts/train_verl.sh` / `scripts/rl_loop.py` 启动；
+checkpoint只在val split上选择（冻结题库的配对bootstrap + 护栏 + patience），不使用测试集或训练奖励。

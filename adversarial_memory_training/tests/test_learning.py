@@ -172,9 +172,8 @@ def test_verl_reward_uses_effective_reward(monkeypatch,tmp_path):
         },
     )
     monkeypatch.setattr(verl_reward, 'environment', lambda path: fake_env)
-    score=verl_reward.compute_score(
-        'admem_builder', '{}', ground_truth='',
-        extra_info={'split':'train','state_path':str(state_path),
-                    'config':'config.json'},
-    )
-    assert score == 0.0
+    extra={'split':'train','state_path':str(state_path),'config':'config.json'}
+    score=verl_reward.compute_score('admem_builder', '{}', ground_truth='', extra_info=extra)
+    assert score['score'] == 0.0  # 默认返回带诊断字段的dict，score取effective_reward
+    monkeypatch.setenv('ADMEM_VERL_RETURN_DICT','0')
+    assert verl_reward.compute_score('admem_builder', '{}', ground_truth='', extra_info=extra) == 0.0

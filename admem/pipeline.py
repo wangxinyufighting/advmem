@@ -369,7 +369,11 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
                                                         else bool(parse(raw)["ops"]))
                 collect.save(state, raw if useful_demo else None,
                              {"faith": proposal is not None, "tests_verified": bool(tests) and useful_demo, "semantic_imitation": True})
-            checkpoint({"stage": "build", "window": wi, "checks": checks, "fallback": fallback,
+            try:
+                n_ops = len(parse(raw)["ops"])
+            except (InvalidAction, KeyError, TypeError):
+                n_ops = None  # 非法输出：checks.legal已记为False
+            checkpoint({"stage": "build", "window": wi, "checks": checks, "fallback": fallback, "ops": n_ops,
                         "M_tokens": text_size(memory, env.counter)})
         write(out / "M_build.json", memory)
         if mode == "build":
@@ -494,7 +498,7 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
 
 
 def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_path=None, attempt=0,
-               memory=None, scheduler=None, defects_only=False):
+               memory=None, scheduler=None, defects_only=False, collect=None):
     """Run one pack (attacker propose + gate). Raises Unknown on API/service failure.
 
     Pure with respect to the caller's ``accepted``/``logs`` so a failed pack can
@@ -607,6 +611,11 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
             logs.append(row)
             snapshot("gating", logs=logs, added_items=new_items)
         snapshot("complete", logs=logs, added_items=new_items)
+        if collect is not None:
+            # attacker GRPO状态（与closed_loop相同的规则）：只有每题都原样通过gate时才保存为SFT示范。
+            all_valid = bool(data["items"]) and all(
+                row.get("status") == "accepted" and not row.get("repaired") for row in logs)
+            collect.save(state, raw if all_valid else None, {"gate": all_valid})
         return info, logs, new_items
     except Unknown as exc:
         # Preserve response and completed judgments even if a later gate request
@@ -616,7 +625,7 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
 
 
 def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory=None, base_bank=None,
-                  memory_source=None, defects_only=False):
+                  memory_source=None, defects_only=False, collect=None):
     """为一个case生成题库。
 
     memory：attacker针对的当前M（默认空M，即旧行为的冷启动题库）。base_bank：已有题库，作为
@@ -665,7 +674,7 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory
                 info, pack_logs, new_items = _bank_pack(
                     full, full_path, context, pack, pi, accepted, env, role,
                     trace_path=trace_path, attempt=attempt, memory=memory, scheduler=scheduler,
-                    defects_only=defects_only)
+                    defects_only=defects_only, collect=collect)
                 break
             except BudgetExceeded as exc:  # 兜底：_bank_pack之外的确定性溢出
                 pack_logs, new_items = [{"pack": pi, "status": "over_budget", **exc.details(),

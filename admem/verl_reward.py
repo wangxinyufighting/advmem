@@ -1,4 +1,5 @@
 """标准VERL custom_reward_function接口；不依赖Code-A1定制的代码执行reward manager。"""
+import os
 from functools import lru_cache
 
 from admem.common import Config, TokenBudget, Unknown, connect, read
@@ -11,7 +12,49 @@ def environment(config_path):
     return Environment(cfg, TokenBudget(cfg.tokenizer, cfg.tokenizer_revision), connect(cfg.project))
 
 
-def compute_score(data_source, solution_str, ground_truth, extra_info=None):
+# 作为reward_extra_info一起返回、由verl汇总进训练日志的数值字段。每个角色字段固定，缺失补0。
+_EXTRA_FIELDS = {
+    "builder": ("legal", "noop", "faith_ratio", "gain", "loss", "information_loss", "growth_ratio"),
+    "attacker": ("legal", "accepted", "rejected", "duplicates", "over_budget"),
+}
+
+
+def _details(role, detail):
+    if role == "attacker":
+        items = detail.get("items") or []
+        status = [item.get("status") for item in items]
+        values = {"legal": float(bool(detail.get("legal"))), "accepted": float(status.count("accepted")),
+                  "rejected": float(status.count("rejected")), "duplicates": float(status.count("duplicate")),
+                  "over_budget": float(status.count("over_budget"))}
+    else:
+        values = {key: float(detail.get(key) or 0.0) for key in _EXTRA_FIELDS["builder"]}
+        values["legal"] = float(bool(detail.get("legal")))
+        for name, value in (detail.get("reward_components") or {}).items():
+            values["component_" + name] = float(value)
+    return values
+
+
+def _result(role, score, detail):
+    """ADMEM_VERL_RETURN_DICT=1（默认）返回{"score", ...诊断字段}，verl会把诊断字段记进日志；=0只返回float。"""
+    if os.getenv("ADMEM_VERL_RETURN_DICT", "1") != "1":
+        return float(score)
+    values = {key: 0.0 for key in _EXTRA_FIELDS[role]}
+    if role == "builder":
+        values.update({"component_" + k: 0.0 for k in ("gain", "loss", "faith", "retention", "coverage",
+                                                         "compression", "growth", "redundancy")})
+    values.update(_details(role, detail or {}))
+    return {"score": float(score), **values}
+
+
+def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
+    role = str(data_source).removeprefix("admem_")
+    detail = _compute(data_source, solution_str, extra_info)
+    if detail is None:  # 环境失败且ADMEM_REWARD_ON_UNKNOWN=neutral
+        return _result(role, 0.0, {"legal": True})
+    return _result(role, detail["effective_reward"], detail)
+
+
+def _compute(data_source, solution_str, extra_info=None):
     if not extra_info or extra_info.get("split") not in {"train", "val"}:
         raise ValueError("VERL reward requires train/val environment metadata")
     row = read(extra_info["state_path"])
@@ -28,12 +71,13 @@ def compute_score(data_source, solution_str, ground_truth, extra_info=None):
     try:
         detail = env.score(full, state, solution_str)
     except Unknown as exc:
-        return _unknown_reward(exc, extra_info)
+        _unknown_reward(exc, extra_info)
+        return None
     # Both fields use the same generic scoring rules as probe. Keep the
     # effective_reward interface for existing VERL exports and callers.
     if "effective_reward" not in detail:
         raise Unknown("Reward detail missing effective_reward")
-    return float(detail["effective_reward"])
+    return detail
 
 
 _UNKNOWN = {"count": 0}
