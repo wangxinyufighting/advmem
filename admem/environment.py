@@ -403,6 +403,28 @@ class Environment:
         rids = q.get("context_rids") or []
         return augment(memory, raw_chunks(full, rids, self.counter, self.cfg.timeline_tokens)) if rids else memory
 
+    def reader_answerable(self, full, q):
+        """DEFENDER只看E的原文能否答对（全部放进上下文；放不下时退回检索）。"""
+        raw = raw_chunks(full, q["E"], self.counter, self.cfg.timeline_tokens)
+        try:
+            return self.answer(raw, q, all_memory=True)["correct"]
+        except BudgetExceeded:
+            return self.answer(raw, q)["correct"]
+
+    def validity_defect(self, full, memory, q):
+        """require_reader_answerable下的defect：返回(defect, valid)。
+        M非空：先算defect；unresolved（M+原文都答不对）时再看只给原文能否答对——能答对说明是M里的噪声
+        挤掉了证据（Builder可修，记为retrieval_composition_candidate），答不对则题目无效。
+        M为空：只检查原文可答性，defect记为skipped_empty_memory。"""
+        if memory:
+            defect = self.defect(full, memory, q)
+            if defect["kind"] != "unresolved":
+                return defect, True
+            if self.reader_answerable(full, q):
+                return dict(defect, kind="retrieval_composition_candidate"), True
+            return defect, False
+        return {"kind": "skipped_empty_memory"}, self.reader_answerable(full, q)
+
     def _builder_score_v2(self, full, state, completion):
         """v2 Builder奖励（README第14.2节）。与v1的区别：
         - gain/loss按“目标题数”归一化（与当前x有证据交集的测试题，至少1），不再被回放题数稀释；
@@ -635,7 +657,17 @@ class Environment:
                 weight *= cfg.impersonal_weight
             if gate.get("repaired"):
                 weight *= cfg.attacker_repair_credit
-            if state["M"]:
+            if cfg.require_reader_answerable:
+                # 有效性包含“reader仅凭原文可答”：否则Builder永远修不好这道题，对抗训练会漂向这类题。
+                defect, valid = self.validity_defect(full, state["M"], q)
+                if not valid:
+                    r = rv2.rejection_reward_v2({"reason": "reader_unanswerable"}, penalty)
+                    rewards.append(r)
+                    details.append({"status": "rejected", "reason": "reader_unanswerable", "item": q,
+                                    "defect": defect, "reward": r, "stage": "reader_unanswerable"})
+                    continue
+                value_ = (0.5 + 0.5 * (defect["kind"] not in {"none", "unresolved"})) if state["M"] else 1.0
+            elif state["M"]:
                 defect = self.defect(full, state["M"], q)
                 value_ = 0.5 + 0.5 * (defect["kind"] not in {"none", "unresolved"})
             else:

@@ -24,12 +24,13 @@ REJECTION_PROGRESS = {
     "scope_or_completeness": 0.65,
     "closed_book": 0.8,
     "duplicate": 0.8,
+    "reader_unanswerable": 0.85,  # 通过了gate，但DEFENDER连E的原文都答不对（require_reader_answerable）
 }
 
 
 def rejection_stage(gate):
     reason = gate.get("reason")
-    if reason in {"unsupported_answer", "scope_or_completeness", "closed_book"}:
+    if reason in {"unsupported_answer", "scope_or_completeness", "closed_book", "reader_unanswerable"}:
         return reason
     if reason == "oracle_or_type":
         oracle = gate.get("oracle") or {}

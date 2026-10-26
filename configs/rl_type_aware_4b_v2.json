@@ -60,5 +60,6 @@
   "builder_reward": "v2",
   "builder_coverage_weight": 0.5,
   "builder_redundancy_cap": 10,
-  "builder_prompt": "v2"
+  "builder_prompt": "v2",
+  "require_reader_answerable": true
 }

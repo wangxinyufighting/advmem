@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
@@ -129,7 +130,8 @@ class Loop:
         if (eval_dir / "metrics.json").exists():
             return read(eval_dir / "metrics.json")
         role = "BUILDER_EVAL" if self.a.role == "builder" else "ATTACKER_EVAL"
-        name = f"{self.out.name}-{tag}"  # 每个checkpoint唯一的服务名：API缓存不会混用不同权重
+        # 服务名含权重路径的hash：不同权重绝不同名（API缓存按模型名区分），同一权重重跑可复用缓存。
+        name = f"{self.out.name}-{tag}-{hashlib.sha256(str(Path(model).resolve()).encode()).hexdigest()[:10]}"
         command = [sys.executable, "-m", "admem.validation", self.a.role, "--config", self.a.config,
                    "--prepared", self.a.prepared, "--split", "val", "--out", str(eval_dir), "--role", role]
         if self.a.role == "builder":

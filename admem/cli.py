@@ -540,6 +540,10 @@ def main(argv=None):
                    help="与--memory-run配合：M_build / M_final / M_audit_0（默认M_build）")
     p.add_argument("--base-bank", help="bank：在该已有bank目录的基础上追加；旧题参与去重/novelty/audit_context，"
                    "输出合并后的bank.json")
+    p.add_argument("--memory-pool", nargs="+",
+                   help="bank+--memory-run：较早轮次的run目录（同一snapshot），与最新记忆组成记忆池")
+    p.add_argument("--memory-latest-share", type=float, default=0.5,
+                   help="记忆池中用--memory-run（最新）记忆的pack比例，其余在--memory-pool间均匀")
     p.add_argument("--defects-only", action="store_true",
                    help="bank+--memory-run：新题只保留暴露当前M缺陷（missing/lossy/unretrievable）的题")
     p.add_argument("--role", choices=["builder", "attacker"], default="builder")
@@ -674,7 +678,7 @@ def main(argv=None):
         return
     reports = []
     entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
-    if a.command != "bank" and (a.memory_run or a.base_bank or a.defects_only):
+    if a.command != "bank" and (a.memory_run or a.base_bank or a.defects_only or a.memory_pool):
         p.error("--memory-run/--base-bank/--defects-only apply to bank (and --memory-run to attacker-probe)")
     if a.defects_only and not a.memory_run:
         p.error("--defects-only needs --memory-run: defects are measured against a built memory")
@@ -682,6 +686,10 @@ def main(argv=None):
         # 先检查全部输入，避免跑了一半才发现某个case缺快照。
         if a.memory_run:
             _require_case_files(a.memory_run, [c["key"] for c, _ in entries], a.memory_snapshot + ".json", "--memory-run")
+        if a.memory_pool and not a.memory_run:
+            p.error("--memory-pool needs --memory-run (the latest memories)")
+        for run in a.memory_pool or []:
+            _require_case_files(run, [c["key"] for c, _ in entries], a.memory_snapshot + ".json", "--memory-pool")
         if a.base_bank:
             _require_case_files(a.base_bank, [c["key"] for c, _ in entries], "bank.json", "--base-bank")
     # 带输出目录名，PARALLEL=1 时各进程的进度条才能区分。
@@ -702,10 +710,13 @@ def main(argv=None):
                 memory = read(Path(a.memory_run) / key / (a.memory_snapshot + ".json")) if a.memory_run else None
                 base = read(Path(a.base_bank) / key / "bank.json") if a.base_bank else None
                 source = f"{Path(a.memory_run).resolve()}/{key}/{a.memory_snapshot}.json" if a.memory_run else None
+                pool = [(f"{Path(run).resolve()}/{key}/{a.memory_snapshot}.json",
+                         read(Path(run) / key / (a.memory_snapshot + ".json"))) for run in a.memory_pool or []]
                 n = generate_bank(full, full_path, context, env, Path(a.out) / key, a.attacker_role,
                                   memory=memory, base_bank=base, memory_source=source,
                                   defects_only=a.defects_only,
-                                  collect=Collector(a.collect) if a.collect else None)
+                                  collect=Collector(a.collect) if a.collect else None,
+                                  memory_pool=pool, latest_share=a.memory_latest_share)
                 result = {"status": "ok", "questions": n}
             else:
                 bank = read(Path(a.bank) / key / "bank.json") if a.bank else []

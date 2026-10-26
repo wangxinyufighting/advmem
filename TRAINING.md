@@ -247,18 +247,58 @@ the state was collected against.
 
 ## 9. Alternating Builder and Attacker
 
-The loop above trains one role against a frozen opponent. A simple alternation:
+`scripts/alternate.py` trains the two roles in turns, each against a frozen opponent. This differs from
+Code-A1, which updates both models every step from one shared rollout. In advmem the Attacker attacks a
+*whole memory* built over hundreds of Builder steps, and the rewards come from slow judge calls. So the
+opponent has to be frozen for a phase, and memories are rebuilt between phases.
 
-1. Train the Builder (§6) on states from the current banks → best Builder `B1`.
-2. Rebuild reference memories with `B1` (serve it as `BUILDER`, rerun `STAGES="attacker_states"` into a
-   new `OUT`) and train the Attacker against them (§8) → `A1`.
-3. Generate adversarial banks with `A1` against `B1`'s memories (`admem.cli bank --memory-run ...
-   --base-bank ... --defects-only`, or `scripts/probe_longmemeval.py --bank-rounds 2`), re-collect Builder
-   states, train the Builder again.
+```bash
+python scripts/alternate.py --config configs/rl_hidden_4b_v2.json --prepared data/prepared_longmemeval \
+  --builder /models/builder_sft --attacker /models/attacker_sft --val-bank data/rl/val_bank \
+  --out runs/alternate --rounds 4 --phase-steps 60 --eval-every 20 --patience 2 --gpus 4 \
+  --train-per-type 10 --val-per-type 2 --rl-args "--batch 8 --group 8 --lr 1e-6" --dry-run
+```
 
-Stop alternating when `A_k` no longer raises `defects_per_pack` against the current Builder and the
-Builder's `bank_accuracy` on the frozen val bank has plateaued. The frozen val bank (§4) never changes
-across rounds, so all Builders stay comparable.
+Each round, with current Builder `B` and Attacker `A`:
+
+| Step | What happens | Output in `runs/alternate/round_k/` |
+| --- | --- | --- |
+| `memories` | serve `B`; build train and val memories | `build_{train,val}/` |
+| `attacker_states` | serve `A`; bank against a **memory pool** with `--collect`, then export: `--pool-share` (0.5) of the packs use `B`'s memories, the rest are spread over up to `--pool-size` (3) earlier rounds' memories | `collected_attacker/`, `attacker_train.jsonl.parquet` |
+| `attacker_phase` | `rl_loop.py --role attacker`, validated against `B`'s val memories → `A'` | `rl_attacker/` |
+| `adversarial_bank` | serve `A'`; bank against `B`'s train memories with `--defects-only`, merged into the cumulative bank (`--base-bank`) | `bank/` |
+| `builder_states` | serve `B`; rebuild with the new bank and `--collect`. Builder calls hit the API cache (build nonces don't depend on the bank), so only the tests are recomputed | `collected_builder/`, `builder_train.jsonl.parquet` |
+| `builder_phase` | `rl_loop.py --role builder` with the frozen `--val-bank` → `B'` | `rl_builder/` |
+
+How this maps to the risks of alternating training:
+
+* **Forgetting.** The cumulative bank is the Mistake Book: questions from every round stay in the bank
+  and come back as replay tests.
+* **The Attacker overfitting one Builder.** The memory pool keeps earlier Builders' weaknesses in the
+  Attacker's training data. Each pack's memory is chosen deterministically and stored in the state, so the
+  defect reward uses the memory the question was written against (`memory_pool_index` in `bank_log.json`).
+* **Unfixable "attacks".** With `require_reader_answerable: true` (on in the `rl_*` configs), a question
+  is valid only if the actual reader (`DEFENDER`) answers it from the raw evidence. This is the analogue of
+  Code-A1 checking tests against reference code. The v2 Attacker reward rejects other questions (stage
+  `reader_unanswerable`, just below zero) and banks drop them. If the memory plus evidence fails but the
+  evidence alone works, the question stays valid as `retrieval_composition_candidate`: noise in the
+  memory crowded the evidence out, which the Builder can fix.
+* **Overfitting a frozen opponent.** Phases are short (`--phase-steps`, `--patience 2`). Each phase starts
+  from the previous best and stops at its own early-stopping rule (§7).
+* **Measuring progress.** The Builder is always selected on the frozen val bank written by
+  `VAL_ATTACKER`, which is never trained, so its score doesn't move just because the Attacker changed.
+  The Attacker is selected on defects found in the *current* Builder's val memories.
+
+**Stopping.** The run stops after a round in which neither phase selected a checkpoint better than its
+starting model: the new Attacker found no more defects in the current Builder's memories, and the Builder
+did not improve significantly on the frozen val bank. It also stops after `--rounds`. `--start builder`
+skips the first Attacker phase. Every finished step is recorded in `alternate_state.json`, and re-running
+the same command resumes. `runs/alternate/summary.json` lists the final models and each round's phase
+results. In `--dry-run` no phase produces a checkpoint, so the dry run stops after round 1.
+
+The orchestrator serves models on `--serve-port` (8200) for data steps; `rl_loop` validation uses the next
+port. Served names include a hash of the weights path, so cached API responses are never shared between
+different weights.
 
 ## 10. Final test evaluation (once)
 
@@ -313,6 +353,8 @@ Offline (no GPU, no verl install): the launcher's override keys against verl `3c
 trainer config; the `admem_grpo` estimator's registration and masking with stand-ins for torch/verl;
 `compute_score` on exported Builder and Attacker states through a fake OpenAI-compatible server;
 `prepare_rl_data.sh`, both `admem.validation` modes and a dry run of `rl_loop.py` end to end; the
-stopping rules and the loop's stop/resume behaviour in unit tests. Not yet run: an actual verl GRPO
-job, the model merger and vLLM serving on GPUs — do a short run (`--max-steps 2 --eval-every 1` on a
-handful of states) before the real one.
+stopping rules and the loop's stop/resume behaviour in unit tests; a pooled adversarial bank with
+`require_reader_answerable` through the real CLI; `alternate.py`'s round order, memory pool, cumulative
+bank, stopping rule and resume in unit tests, plus its dry run. Not yet run: an actual verl GRPO job, the
+model merger and vLLM serving on GPUs. Do a short run (`--max-steps 2 --eval-every 1` on a handful of
+states; for `alternate.py`, `--rounds 1 --phase-steps 2 --eval-every 1`) before the real one.

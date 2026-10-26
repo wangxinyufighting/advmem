@@ -340,6 +340,9 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
     write(cfg_path, signature)
     memory, qbook, accepted, events = [], [], [], []
     namespace = digest(signature)
+    # 建记忆时Builder的动作与题库无关（题库只决定收集状态的测试题），nonce不含bank：
+    # 用新题库重建同一Builder的记忆时命中API缓存，记忆不变、只更新测试题。
+    build_namespace = digest({**signature, "bank_hash": None})
     visited = set()
     def checkpoint(event):
         events.append(event)
@@ -355,7 +358,7 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
             # builder_reward=v2时另加跨session的前瞻题（见stream_tests）。
             tests = stream_tests(bank, x, visited, old, env)
             state = builder_state(full, full_path, context, memory, x, "stream", tests, env, ids)
-            raw = propose(state, env, builder_role, f"{namespace}:build:{wi}")
+            raw = propose(state, env, builder_role, f"{build_namespace}:build:{wi}")
             proposal, checks = edit(full, state, raw, env)
             fallback = False
             if proposal is not None:
@@ -598,7 +601,19 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
                 row["qtype"] = q["type"]
             if result["status"] == "accepted":
                 checked = result["item"]
-                if memory and env.cfg.bank_defects:
+                if env.cfg.require_reader_answerable:
+                    try:
+                        defect, valid = env.validity_defect(full, memory, checked)
+                    except BudgetExceeded as exc:
+                        defect, valid = {"kind": "over_budget"}, True
+                        row["defect_budget"] = exc.details()
+                    if memory:
+                        row["defect"] = defect["kind"]
+                    if not valid:
+                        row.update(status="rejected", reason="reader_unanswerable")
+                    elif defects_only and row.get("defect") not in REPAIRABLE_DEFECTS:
+                        row["status"] = "accepted_no_defect"
+                elif memory and env.cfg.bank_defects:
                     try:
                         row["defect"] = env.defect(full, memory, checked)["kind"]
                     except BudgetExceeded as exc:
@@ -624,8 +639,18 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
         raise
 
 
+def pool_index(cfg, key, pi, size, latest_share):
+    """记忆池里第pi个pack用哪份记忆：概率latest_share用最新（下标0），其余在旧记忆间均匀；按hash确定。"""
+    if size <= 1:
+        return 0
+    u = int(digest([cfg.seed, key, pi, "memory-pool"]), 16) / float(16 ** 64)
+    if u < latest_share:
+        return 0
+    return 1 + min(size - 2, int((u - latest_share) / max(1e-12, 1 - latest_share) * (size - 1)))
+
+
 def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory=None, base_bank=None,
-                  memory_source=None, defects_only=False, collect=None):
+                  memory_source=None, defects_only=False, collect=None, memory_pool=None, latest_share=0.5):
     """为一个case生成题库。
 
     memory：attacker针对的当前M（默认空M，即旧行为的冷启动题库）。base_bank：已有题库，作为
@@ -634,6 +659,13 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory
     记忆快照与基础题库的hash。"""
     out = Path(out)
     memory = list(memory or [])
+    # memory_pool：[(来源, 记忆), ...]，较早轮次Builder的记忆。attacker针对一个记忆池出题，避免只过拟合
+    # 最新Builder的特点；每个pack用哪份由pool_index决定，记在日志的memory_pool_index里。
+    memories = [(memory_source, memory)] + [(src, list(m)) for src, m in (memory_pool or [])]
+    if memory_pool and not memory:
+        raise ValueError("memory_pool needs the latest memory as well")
+    if not 0 <= latest_share <= 1:
+        raise ValueError("latest_share must be in [0, 1]")
     accepted, keys = [], set()
     for q in base_bank or []:
         if question_key(q) not in keys:
@@ -652,6 +684,8 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory
         "pack_builder": getattr(env.cfg, "pack_builder", "legacy"),
         "neighbor_mode": getattr(env.cfg, "neighbor_mode", "topical"),
         "memory": {"entries": len(memory), "hash": digest(memory) if memory else None, "source": memory_source},
+        "memory_pool": [{"source": src, "entries": len(m), "hash": digest(m)} for src, m in memories[1:]],
+        "memory_latest_share": latest_share if len(memories) > 1 else None,
         "base_bank": {"questions": base_size, "hash": digest(accepted) if accepted else None},
         "defects_only": bool(defects_only), "environment_fingerprint": env.cfg.fingerprint()})
     if policy == "official":
@@ -671,10 +705,14 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory
         for attempt in range(retries):
             trace_path = out / "pack_traces" / f"pack_{pi:05d}_attempt_{attempt:02d}.json"
             try:
+                chosen = pool_index(env.cfg, context["key"], pi, len(memories), latest_share)
                 info, pack_logs, new_items = _bank_pack(
                     full, full_path, context, pack, pi, accepted, env, role,
-                    trace_path=trace_path, attempt=attempt, memory=memory, scheduler=scheduler,
+                    trace_path=trace_path, attempt=attempt, memory=memories[chosen][1], scheduler=scheduler,
                     defects_only=defects_only, collect=collect)
+                if len(memories) > 1:
+                    for row in pack_logs:
+                        row["memory_pool_index"] = chosen
                 break
             except BudgetExceeded as exc:  # 兜底：_bank_pack之外的确定性溢出
                 pack_logs, new_items = [{"pack": pi, "status": "over_budget", **exc.details(),

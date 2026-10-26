@@ -270,6 +270,9 @@ class Config:
     builder_coverage_weight: float = 0.5  # v2：x里新事实被存下的比例（不依赖题库）
     builder_redundancy_cap: int = 10      # v2：冗余罚分最多计这么多个操作
     builder_prompt: str = "v1"            # v2：精简Builder提示词+卡片日期+按相关性排序的目录
+    # 题目有效性需包含“DEFENDER仅凭E的原文能答对”（类比Code-A1用参考解校验测试）：v2 attacker奖励把
+    # 答不出的题当作被拒绝，bank不收这些题。默认关闭（旧行为）；rl_*配置打开。
+    require_reader_answerable: bool = False
 
     @classmethod
     def load(cls, path):
