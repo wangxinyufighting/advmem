@@ -467,6 +467,8 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
                         "shrink_ratio", "compression_eligible", "safe_compression", "reward_components", "retention_pass",
                         "information_loss", "retention_checks", "redundancy_ratio", "redundant_ops",
                         "edit_quality_pass", "edit_quality_reason", "noop", "compression_success", "answer_checks",
+                        # v2诊断字段（v1结果里没有，会被跳过）
+                        "reward_version", "test_deltas", "target_tests", "confirmed_flips", "coverage",
                     ):
                         if key in result:
                             record[key] = result[key]
