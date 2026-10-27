@@ -22,4 +22,6 @@ data/longmemeval_splits/
 __pycache__/
 *.pyc
 *.txt
+# 依赖清单需要入库（*.txt 规则曾把 requirements-train.txt 漏掉）
+!requirements*.txt
 md/

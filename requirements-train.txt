@@ -1,0 +1,10 @@
+# admem + verl GRPO training environment (see TRAINING.md §2).
+# Install verl itself from source at the pinned commit first; it brings torch, vllm, ray, transformers.
+#   git clone https://github.com/volcengine/verl.git && cd verl && git checkout 3c6d9b4 && pip install -e .
+numpy
+python-dateutil
+ijson            # streaming the large LongMemEval JSON in `admem.cli prepare`
+pyarrow          # parquet export for verl (`admem.cli export --parquet`)
+sentence-transformers   # embedding=local (bge-m3 etc.); not needed with embedding=none/api
+peft             # optional SFT warm start (admem.train --method sft) and LoRA merge
+pytest           # offline test suite
