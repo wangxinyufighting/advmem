@@ -299,6 +299,150 @@ def edit(full, state, raw, env):
     return proposal, {"legal": True, "faith": None, "faith_gated": False}
 
 
+_OP_FIELDS = {"ADD": {"op", "text", "prov"}, "UPDATE": {"op", "id", "text", "prov"},
+              "MERGE": {"op", "ids", "text", "prov"}, "DELETE": {"op", "id"}}
+
+
+def _normalize_op(op, allowed, window):
+    """salvage的确定性修复（只用于建记忆；奖励看原始输出）：操作名大小写、多余字段、prov里重复/
+    不可引用的rid、字符串形式的prov。ADD修复后没有可用rid时先挂到整个窗口，交给faith复核定位。"""
+    if not isinstance(op, dict):
+        return op, []
+    repairs = []
+    name = op.get("op")
+    if isinstance(name, str) and name.strip().upper() in _OP_FIELDS and name != name.strip().upper():
+        op = {**op, "op": name.strip().upper()}
+        repairs.append("op_name")
+    fields = _OP_FIELDS.get(op.get("op"))
+    if fields is None:
+        return op, repairs
+    if set(op) - fields:
+        op = {k: v for k, v in op.items() if k in fields}
+        repairs.append("extra_fields")
+    if "prov" in fields:
+        prov = op.get("prov")
+        prov = [prov] if isinstance(prov, str) else prov if isinstance(prov, list) else []
+        cleaned = list(dict.fromkeys(r for r in prov if isinstance(r, str) and r in allowed))
+        if op["op"] == "ADD" and not cleaned:
+            cleaned = list(dict.fromkeys(window))
+            repairs.append("prov_window")
+        elif cleaned != op.get("prov"):
+            repairs.append("prov")
+        op = {**op, "prov": cleaned}
+    return op, repairs
+
+
+def _op_rids(op, window):
+    """被丢弃操作需要回退原文的窗口round：它引用的窗口rid；引用不出来就回退整个窗口。"""
+    prov = op.get("prov") if isinstance(op, dict) else None
+    prov = [prov] if isinstance(prov, str) else prov if isinstance(prov, list) else []
+    rids = [r for r in prov if r in set(window)]
+    return set(rids) if rids else set(window)
+
+
+def salvage_edit(full, state, raw, env):
+    """salvage=true时stream窗口的编辑，按操作取舍。返回(memory, checks, fallback_rids)。
+
+    1. 原始输出逐字合法吗（checks.legal/reason，与旧指标可比）；不可解析→整窗口回退。
+    2. 逐个操作做确定性修复并累积校验，非法的单独丢弃。
+    3. 每个写操作单独过faith；不成立时在“窗口+父条目来源”上复核并改正prov（relocated）。
+    4. 只要有写操作被丢弃，DELETE也全部丢弃（避免“删旧+加新”只执行了删）。
+    5. 被丢弃写操作引用的窗口round回退原文；没被丢弃的照常写入。
+    checks.clean=True当且仅当原始输出无需任何修复就全部通过——只有这种输出能当示范。"""
+    window = list(dict.fromkeys(s["rid"] for s in state["x"]))
+    kwargs = dict(mode=state["mode"], visible_ids=state["old_ids"], source_ids=window, full_ids=full.rounds,
+                  counter=env.counter, limit=state["entry_limit"], max_ops=env.cfg.max_ops,
+                  **apply_options(full, env.cfg))
+    try:
+        action = parse(raw)
+    except InvalidAction as exc:
+        return deepcopy(state["M"]), {"legal": False, "reason": str(exc), "clean": False,
+                                      "salvage": {"unparsed": True}}, set(window)
+    try:
+        apply(state["M"], action, **kwargs)
+        checks = {"legal": True}
+    except InvalidAction as exc:
+        checks = {"legal": False, "reason": str(exc)}
+    ops = action.get("ops")
+    if not isinstance(ops, list):
+        checks.update(clean=False, salvage={"unparsed": True})
+        return deepcopy(state["M"]), checks, set(window)
+    if not ops:  # 模型自己给的NOOP：v1首窗口不允许NOOP时按旧规则回退整窗口
+        checks["clean"] = checks["legal"]
+        checks["faith"] = {"faithful": True, "reason": "No written entry"} if checks["legal"] else None
+        checks["salvage"] = {"kept": 0, "dropped": [], "repairs": {}, "relocated": 0}
+        return deepcopy(state["M"]), checks, (set() if checks["legal"] else set(window))
+    index = {e["id"]: e for e in state["M"]}
+    allowed = set(window) | {r for i in state["old_ids"] for r in index[i]["prov"]}
+    kept, dropped, repairs = [], [], Counter()
+    for op in ops:
+        fixed, fixes = _normalize_op(op, allowed, window)
+        try:
+            if len(kept) >= env.cfg.max_ops:
+                raise InvalidAction("Too many operations")
+            apply(state["M"], {"ops": kept + [fixed]}, **kwargs)
+        except InvalidAction as exc:
+            dropped.append({"op": op, "reason": str(exc), "stage": "schema"})
+            continue
+        kept.append(fixed)
+        repairs.update(fixes)
+        if "prov_window" in fixes:
+            fixed["_coarse"] = True  # 内部标记，写入前去掉
+    final, relocated, first_pass = [], 0, True
+    for op in kept:
+        coarse = op.pop("_coarse", False)
+        if op["op"] == "DELETE" or not env.cfg.faith_gate:
+            final.append(op)
+            continue
+        _, changed = apply(state["M"], {"ops": [op]}, **kwargs)
+        entry = changed[0]
+        parents = [op["id"]] if op["op"] == "UPDATE" else op.get("ids", [])
+        ok, reason = False, None
+        try:
+            if not coarse:
+                verdict = env.faith(full, [entry])
+                ok, reason = verdict["faithful"], verdict.get("reason")
+            if not ok:
+                first_pass = False
+                scope = set(window) | {r for i in parents for r in index[i]["prov"]}
+                ok, support, value = env.faith_locate(full, entry, scope)
+                reason = value.get("reason", reason)
+                if ok:
+                    op = {**op, "prov": [r for r in support if r in allowed]}
+                    relocated += 1
+        except BudgetExceeded as exc:
+            first_pass, ok, reason = False, False, f"faith budget: {exc}"
+        if ok:
+            final.append(op)
+        else:
+            dropped.append({"op": op, "reason": reason or "unfaithful", "stage": "faith"})
+    lost = set()
+    if dropped:
+        write_dropped = [d for d in dropped if not (isinstance(d["op"], dict) and d["op"].get("op") == "DELETE")]
+        if write_dropped:
+            deletes = [op for op in final if op["op"] == "DELETE"]
+            final = [op for op in final if op["op"] != "DELETE"]
+            dropped += [{"op": op, "reason": "dropped with a failed write", "stage": "delete_guard"}
+                        for op in deletes]
+        for d in write_dropped:
+            lost |= _op_rids(d["op"], window)
+    try:
+        memory = apply(state["M"], {"ops": final}, **kwargs)[0] if final else deepcopy(state["M"])
+    except InvalidAction as exc:  # 防御：单独合法的操作组合起来不应失败
+        memory, lost = deepcopy(state["M"]), set(window)
+        dropped.append({"op": None, "reason": f"combined edit invalid: {exc}", "stage": "combine"})
+    faith_dropped = [d for d in dropped if d["stage"] == "faith"]
+    checks["faith"] = ({"faithful": first_pass and not faith_dropped,
+                        "reason": faith_dropped[0]["reason"] if faith_dropped else "All written entries supported"}
+                       if env.cfg.faith_gate else None)
+    checks["clean"] = checks["legal"] and not dropped and not repairs and relocated == 0 and first_pass
+    checks["salvage"] = {"kept": len(final), "dropped": [{"op": d["op"].get("op") if isinstance(d["op"], dict)
+                                                          else None, "stage": d["stage"], "reason": d["reason"]}
+                                                         for d in dropped],
+                         "repairs": dict(repairs), "relocated": relocated, "fallback_rids": sorted(lost)}
+    return memory, checks, lost
+
+
 def raw_from_window(x, env):
     items = []
     for s in x:
@@ -359,19 +503,31 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
             tests = stream_tests(bank, x, visited, old, env)
             state = builder_state(full, full_path, context, memory, x, "stream", tests, env, ids)
             raw = propose(state, env, builder_role, f"{build_namespace}:build:{wi}")
-            proposal, checks = edit(full, state, raw, env)
             fallback = False
-            if proposal is not None:
+            if env.cfg.salvage:
+                # 按操作取舍：好的卡片照常写入，只给被丢弃条目引用的round回退原文。
+                proposal, checks, lost = salvage_edit(full, state, raw, env)
                 memory = proposal
-            elif env.cfg.fallback:
-                memory = augment(memory, raw_from_window(x, env))
-                fallback = True
+                if lost and env.cfg.fallback:
+                    memory = augment(memory, raw_from_window([s for s in x if s["rid"] in lost], env))
+                    fallback = True
+                    checks["fallback_scope"] = "window" if lost >= {s["rid"] for s in x} else "partial"
+                demo_ok = checks.get("clean", False)
+            else:
+                proposal, checks = edit(full, state, raw, env)
+                if proposal is not None:
+                    memory = proposal
+                elif env.cfg.fallback:
+                    memory = augment(memory, raw_from_window(x, env))
+                    fallback = True
+                demo_ok = proposal is not None
             if collect:
                 # 不把逐字fallback当作模型的SFT目标。无tests只用于faith+格式示范。
-                useful_demo = proposal is not None and (all_pass(proposal, state["tests"], env, full) if tests
-                                                        else bool(parse(raw)["ops"]))
+                # salvage模式下只有无需修复、整体通过的原始输出才是示范（clean）。
+                useful_demo = demo_ok and (all_pass(proposal, state["tests"], env, full) if tests
+                                           else bool(parse(raw)["ops"]))
                 collect.save(state, raw if useful_demo else None,
-                             {"faith": proposal is not None, "tests_verified": bool(tests) and useful_demo, "semantic_imitation": True})
+                             {"faith": demo_ok, "tests_verified": bool(tests) and useful_demo, "semantic_imitation": True})
             try:
                 n_ops = len(parse(raw)["ops"])
             except (InvalidAction, KeyError, TypeError):

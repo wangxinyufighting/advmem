@@ -273,6 +273,17 @@ class Config:
     # 题目有效性需包含“DEFENDER仅凭E的原文能答对”（类比Code-A1用参考解校验测试）：v2 attacker奖励把
     # 答不出的题当作被拒绝，bank不收这些题。默认关闭（旧行为）；rl_*配置打开。
     require_reader_answerable: bool = False
+    # ---- 建记忆的鲁棒性（默认=旧行为）。推荐组合见 configs/eval_hidden_4b_v2_salvage.json ----
+    # salvage=true：stream建记忆时按操作取舍，而不是整窗口全有或全无——非法操作、未通过faith的条目
+    # 单独丢弃，其余照常写入；只有被丢弃条目引用的round回退原文（输出整体不可解析时才回退整窗口）。
+    # faith未通过的条目先在整个窗口+父条目来源上复核一次并修正prov（小模型常引错round）。
+    # 只影响记忆构建；奖励仍按模型原始输出计算，示范只收逐字合法且无需修复的输出。
+    salvage: bool = False
+    # 提示超预算时先裁哪部分：catalog=旧行为（目录固定，只裁可编辑的M_old）；editable=先裁目录尾部，
+    # 保住M_old全文（UPDATE/MERGE/DELETE只能作用于M_old）。
+    budget_priority: str = "catalog"
+    # reader上下文顺序：score=检索得分（旧）；time=选中的条目按来源日期排列（知识更新/时间题需要先后）。
+    reader_order: str = "score"
 
     @classmethod
     def load(cls, path):
@@ -286,6 +297,8 @@ class Config:
             raise ValueError("Unknown hint_mode/defect_mode")
         if c.embedding not in {"none", "local", "api"} or c.gate_mode not in {"basic", "full"}:
             raise ValueError("Unknown embedding/gate_mode")
+        if c.budget_priority not in {"catalog", "editable"} or c.reader_order not in {"score", "time"}:
+            raise ValueError("Unknown budget_priority/reader_order")
         if c.attacker_view not in {"full", "compact"}:
             raise ValueError("Unknown attacker_view")
         if (min(c.seed_min_personal, c.attacker_memory_entries, c.attacker_context_items) < 0

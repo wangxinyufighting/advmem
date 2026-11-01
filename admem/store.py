@@ -58,6 +58,18 @@ def entry_dates(prov, dates):
     return values[:1] + values[-1:] if len(values) > 1 else values
 
 
+def entry_date(entry):
+    """条目的来源日期（排序用）：卡片取dates里最晚的一天，raw块取“Recorded on …”前缀；没有则None。"""
+    dates = entry.get("dates")
+    if dates:
+        return dates[-1]
+    if entry.get("kind") == "raw" and entry.get("text", "").startswith("Recorded on "):
+        head = entry["text"][len("Recorded on "):]
+        end = head.find(". ")
+        return head[:end] if end > 0 else None
+    return None
+
+
 def apply(memory, action, *, mode, visible_ids, source_ids, full_ids, counter, limit, max_ops=16,
           round_dates=None, forbid_initial_noop=True):
     """并行语义：一次输出不能重复触碰同一旧ID，不能引用本次新建的未知ID。

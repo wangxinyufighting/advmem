@@ -12,7 +12,7 @@ from . import prompts
 from .audit_prompts import (EVIDENCE_AUDIT_SYSTEM, SINGLE_SESSION, TYPES, GATE_ORACLE_SYSTEM,
                             GATE_SUPPORT_SYSTEM, personal_score, plan_item_type)
 from . import rewards as rv2
-from .store import apply, augment, question_key, raw_chunks, text_size
+from .store import apply, augment, entry_date, question_key, raw_chunks, text_size
 from .edit_checks import assess_edits, source_coverage
 from .store import round_dates
 
@@ -148,6 +148,9 @@ class Environment:
             hits = index.search(q["q"], k or self.cfg.reader_k) if index else []
             mapping = {e["id"]: e for e in memory}
             chosen = [mapping[h.id] for h in hits]
+        if getattr(self.cfg, "reader_order", "score") == "time":
+            # 选哪些条目仍按检索得分；只把呈现顺序改成按来源日期（无日期的放最后，保持得分序）。
+            chosen = sorted(chosen, key=lambda e: (entry_date(e) is None, entry_date(e) or ""))
         kept, chunks = [], []
         for entry in chosen:
             text = self.render_entry(entry)
@@ -192,6 +195,18 @@ class Environment:
             if not boolean(value, "faithful"):
                 return value
         return {"faithful": True, "reason": "All written entries supported"}
+
+    def faith_locate(self, full, entry, rids):
+        """salvage：在给定round范围（窗口+父条目来源）里复核一条条目，返回(faithful, support_rids, value)。
+        support_rids只保留范围内的rid；faithful但没给出可用rid时视为不成立。"""
+        scope = full.ordered(rids)
+        value = self.judge(prompts.FAITH_LOCATE, {"entry": {"text": entry["text"]},
+                           "history": prompts.source_view(full, scope)},
+                           "faith_locate:" + digest([full.fingerprint, entry["text"], scope]))
+        support = value.get("support_rids")
+        support = [r for r in dict.fromkeys(support) if r in set(scope)] if isinstance(support, list) else []
+        ok = boolean(value, "faithful") and bool(support)
+        return ok, (support if ok else []), value
 
     def faith_scores(self, full, changed):
         """逐条faithful判定（不提前返回），供builder_score做连续折扣；无改动返回[]。"""

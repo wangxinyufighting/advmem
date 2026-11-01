@@ -152,6 +152,8 @@ def _builder_case_metrics(case_out):
     legal = 0
     faithful = 0
     fallback = 0
+    salvaged = {"windows": 0, "partial_fallback_windows": 0, "full_fallback_windows": 0,
+                "windows_with_cards": 0, "ops_kept": 0, "ops_dropped": 0, "relocated": 0}
     for event in events:
         checks = event.get("checks") or {}
         if checks.get("legal") is True:
@@ -161,8 +163,18 @@ def _builder_case_metrics(case_out):
                 faithful += 1
         if event.get("fallback") is True:
             fallback += 1
+        info = checks.get("salvage")
+        if isinstance(info, dict):  # salvage=true：按操作取舍的统计
+            salvaged["windows"] += 1
+            salvaged["ops_kept"] += info.get("kept", 0)
+            salvaged["ops_dropped"] += len(info.get("dropped", []))
+            salvaged["relocated"] += info.get("relocated", 0)
+            salvaged["windows_with_cards"] += bool(info.get("kept"))
+            scope = checks.get("fallback_scope")
+            if event.get("fallback") is True:
+                salvaged["partial_fallback_windows" if scope == "partial" else "full_fallback_windows"] += 1
     total = len(events)
-    return {
+    result = {
         "status": "ok",
         "windows": total,
         "json_valid": legal,
@@ -171,6 +183,19 @@ def _builder_case_metrics(case_out):
         "builder_json_rate": legal / total if total else None,
         "builder_faith_rate": faithful / total if total else None,
     }
+    if salvaged["windows"]:
+        result["salvage"] = salvaged
+    return result
+
+
+def _sum_salvage(builder_cases):
+    rows = [row["salvage"] for row in builder_cases if isinstance(row.get("salvage"), dict)]
+    if not rows:
+        return None
+    total = {key: sum(r.get(key, 0) for r in rows) for key in rows[0]}
+    kept, dropped = total.get("ops_kept", 0), total.get("ops_dropped", 0)
+    total["op_keep_rate"] = kept / (kept + dropped) if kept + dropped else None
+    return total
 
 
 def _json_case_list(path):
@@ -414,6 +439,8 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
         "builder_json_rate": total_legal / total_windows if total_windows else None,
         "builder_faith_rate": total_faithful / total_windows if total_windows else None,
         "by_case": builder_cases}
+    if _sum_salvage(builder_cases):
+        builder_summary["salvage"] = _sum_salvage(builder_cases)
     write(out / "builder_summary.json", builder_summary)
     qa_summary = _evaluate_external(selected, labels,
                                     run_dir, snapshot, env, eval_dir, all_memory)
@@ -495,6 +522,8 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
         "builder_faith_rate": total_faithful / total_windows if total_windows else None,
         "by_case": builder_cases,
     }
+    if _sum_salvage(builder_cases):
+        builder_summary["salvage"] = _sum_salvage(builder_cases)
     write(out / "builder_summary.json", builder_summary)
 
     qa_summary = evaluate(prepared, run_dir, split, snapshot, env, eval_dir, limit, keys,

@@ -280,6 +280,24 @@ states have a mean below 0 (= below NOOP — RL will drift toward writing nothin
 tests are answerable at all (`raw(E) only` accuracy). If the ceiling is low, fix the reader/judge or
 the bank before spending GPU time.
 
+**Check the Builder itself.** If most windows fall back to raw text, the memory is mostly the raw
+history and QA measures retrieval over raw chunks, not the Builder. Diagnose a build run:
+
+```bash
+python scripts/diagnose_builder.py --run runs/<eval>/run --cache .cache/admem/api --since 2d \
+  --out runs/<eval>/diagnosis.json
+```
+
+It reports where windows go (illegal output by reason, NOOP, written and faithful, written but
+unfaithful), how much of the memory is raw fallback, the top faith-failure reasons, and from the API
+cache how many editable `M_old` entries the Builder actually saw (an 8k prompt budget can leave none, so
+UPDATE/MERGE/DELETE are impossible), truncated outputs and provenance errors.
+`configs/eval_hidden_4b_v2_salvage.json` turns on the fixes: `salvage` (keep the legal, faithful
+operations of a window and fall back to raw text only for the rounds of the dropped ones; re-check an
+entry against the whole window and correct its provenance before rejecting it), `budget_priority:
+editable` (trim the catalog before `M_old`) and `reader_order: time` (show the retrieved entries in date
+order). The reward still scores the model's raw output; only clean outputs become SFT demonstrations.
+
 ## 5. Optional but recommended: SFT warm start
 
 GRPO only sharpens behaviour the model already produces. If the start model's faithful-write rate is
