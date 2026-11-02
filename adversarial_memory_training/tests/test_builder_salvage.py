@@ -246,3 +246,47 @@ def test_diagnosis_reports_outcomes_growth_and_starved_prompts(tmp_path, capsys)
     assert problems["cites a catalog entry id"] == 1 and problems["extra field 'date'"] == 1
     assert dict(report["cache"]["faith_reason_keywords"])["speaker/attribution"] == 1
     assert any("raw fallback" in n for n in report["notes"]) and (tmp_path / "d.json").exists()
+
+
+# ================================================================ judge failures and the oracle ceiling
+
+def test_a_judge_failure_drops_only_that_entry(two_rounds, judging, monkeypatch):
+    from admem.common import Unknown
+    full, path, context = two_rounds
+    state = first_state(full, path, context, judging)
+    real = judging.faith
+
+    def flaky(full_, changed):
+        if "gardening" in changed[0]["text"]:
+            raise Unknown("JUDGE JSON invalid after two attempts")
+        return real(full_, changed)
+
+    monkeypatch.setattr(judging, "faith", flaky)
+    monkeypatch.setattr(judging, "faith_locate", lambda *a: (_ for _ in ()).throw(Unknown("down")))
+    memory, checks, lost = salvage_edit(full, state, out(
+        {"op": "ADD", "text": "The user's cat is named Milo.", "prov": ["s1:r1"]},
+        {"op": "ADD", "text": "The user enjoys gardening on weekends.", "prov": ["s1:r2"]}), judging)
+    assert [e["text"] for e in memory] == ["The user's cat is named Milo."] and lost == {"s1:r2"}
+    assert checks["salvage"]["dropped"][0]["reason"].startswith("judge unavailable")
+
+
+def test_evaluate_oracle_snapshot_gives_the_reader_only_the_evidence(case, env, tmp_path):
+    import copy
+    from admem.cli import evaluate
+    from admem.data import prepare
+    values = []
+    for i in range(2):
+        c = copy.deepcopy(case)
+        c["question_id"] = f"q{i}"
+        c["question"], c["answer"] = "What is my cat's name?", "Milo"
+        c["haystack_sessions"][1][0]["content"] += str(i)
+        values.append(c)
+    (tmp_path / "data.json").write_text(json.dumps(values))
+    prepare(tmp_path / "data.json", tmp_path / "prepared", env.memory_module, [0, 0, 2])
+    seen = []
+    original = env.reader
+    env.reader = lambda q, history, key, **kw: seen.append(history) or original(q, history, key, **kw)
+    summary = evaluate(tmp_path / "prepared", None, "test", "oracle", env, tmp_path / "eval", None, None)
+    assert all("Milo" in h and "gardening" not in h for h in seen) and len(seen) == 2
+    rows = [json.loads(l) for l in (tmp_path / "eval" / "cases.jsonl").read_text().splitlines()]
+    assert all(r["status"] == "ok" and r["correct"] and r["entries"] == 1 for r in rows)

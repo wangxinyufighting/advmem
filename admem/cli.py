@@ -105,13 +105,17 @@ def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memo
         key = context["key"]
         q = golds[key]
         try:
-            if snapshot == "full":
+            if snapshot in {"full", "oracle"}:
+                # full：整段历史的原文round（不经Builder，按reader_k检索）；
+                # oracle：只放官方证据round（has_answer），全部进上下文——reader在完美记忆上的上限。
                 full = env.memory_module.FullMemory.load(full_path)
+                rids = full.rounds if snapshot == "full" else [r for r in q.get("E", []) if r in full.rounds]
                 memory = [{"id": r, "text": f"Recorded on {s['date']}. {s['text']}", "prov": [r], "kind": "raw"}
-                          for r in full.ordered(full.rounds) for s in [neutral_round(full, r)]]
+                          for r in full.ordered(rids) for s in [neutral_round(full, r)]]
             else:
                 memory = read(Path(run_dir) / key / (snapshot + ".json"))
-            result = env.answer(memory, q, all_memory=all_memory, abstention=q["abstention"])
+            result = env.answer(memory, q, all_memory=all_memory or snapshot == "oracle",
+                                abstention=q["abstention"])
             details.append({"key": key, "question_id": q["question_id"], "type": q["type"],
                 "group": "abstention" if q["abstention"] else q["type"], "status": "ok",
                 "M_tokens": text_size(memory, env.counter), "entries": len(memory),
@@ -591,7 +595,9 @@ def main(argv=None):
     p.add_argument("--states", help="probe的状态JSONL或export的collector根目录")
     p.add_argument("--parquet", action="store_true")
     p.add_argument("--run-dir")
-    p.add_argument("--snapshot", default="M_final", help="M_build / M_final / M_audit_0 / full")
+    p.add_argument("--snapshot", default="M_final",
+                   help="M_build / M_final / M_audit_0；evaluate另可用full（全部原文round、检索）"
+                        "或oracle（只给官方证据round、全部进上下文=reader上限）")
     p.add_argument("--all-memory", action="store_true")
     p.add_argument("--model", default="Qwen/Qwen3-4B-Instruct-2507")
     p.add_argument("--adapter", help="merge时adapter目录；可从训练latest.json获取")

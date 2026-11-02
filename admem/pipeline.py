@@ -410,8 +410,8 @@ def salvage_edit(full, state, raw, env):
                 if ok:
                     op = {**op, "prov": [r for r in support if r in allowed]}
                     relocated += 1
-        except BudgetExceeded as exc:
-            first_pass, ok, reason = False, False, f"faith budget: {exc}"
+        except Unknown as exc:  # 超预算或judge连续给不出合法JSON：只丢这一条（回退原文），不让整个case失败
+            first_pass, ok, reason = False, False, f"judge unavailable: {exc}"
         if ok:
             final.append(op)
         else:
