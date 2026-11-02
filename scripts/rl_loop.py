@@ -34,7 +34,8 @@ if str(ROOT) not in sys.path:
 
 from admem.common import read, write  # noqa: E402
 from admem.validation import ATTACKER_GUARDS, BUILDER_GUARDS, EarlyStopper  # noqa: E402
-from admem.verl_launch import add_arguments, options_from, run as run_verl, verl_env  # noqa: E402
+from admem.verl_launch import (add_arguments, effective_lora_alpha, options_from, run as run_verl,  # noqa: E402
+                               verl_env)
 
 DEFAULT_MERGE = ("{python} -m verl.model_merger merge --backend fsdp "
                  "--local_dir {actor} --target_dir {target}")
@@ -84,15 +85,42 @@ class Loop:
         return options.log_file
 
     def merge(self, target):
+        """verl的FSDP checkpoint → 完整HF模型。
+
+        全参训练：verl.model_merger直接给出完整权重。
+        LoRA训练：verl.model_merger只写出*未合并*的底座权重（<step>.parts）和 lora_adapter/；
+        必须再用scripts/merge_lora.py把adapter折进去，否则验证评估的就是没训练过的底座。
+        先写到 <step>.parts，完成后才出现 <step>/config.json，中断重跑不会把半成品当成已合并。"""
         actor = self.out / "verl" / f"global_step_{target}" / "actor"
         merged = self.out / "merged" / f"step_{target:05d}"
-        if (merged / "config.json").exists() or self.a.dry_run:
+        parts = merged.with_name(merged.name + ".parts")
+        lora = self.a.lora_rank > 0
+        python = self.a.verl_python or sys.executable
+        merge_command = shlex.split(self.a.merge_cmd.format(python=python, actor=actor, target=parts))
+        lora_command = [python, str(ROOT / "scripts" / "merge_lora.py"), "--base", str(parts),
+                        "--adapter", str(parts / "lora_adapter"), "--rank", str(self.a.lora_rank),
+                        "--alpha", str(effective_lora_alpha(self.a)), "--out", str(merged)]
+        if self.a.dry_run:
+            print("[dry-run] merge", " ".join(shlex.quote(c) for c in merge_command), flush=True)
+            if lora:
+                print("[dry-run] merge LoRA", " ".join(shlex.quote(c) for c in lora_command), flush=True)
+            return merged
+        if (merged / "config.json").exists():
             return merged
         if not actor.exists():
             raise RuntimeError(f"verl did not write {actor}; check the training log")
-        command = self.a.merge_cmd.format(python=self.a.verl_python or sys.executable, actor=actor, target=merged)
-        subprocess.run(shlex.split(command), check=True, cwd=str(ROOT), env=verl_env(options_from(
-            self.a, out=str(self.out / "verl"))))
+        env = verl_env(options_from(self.a, out=str(self.out / "verl")))
+        if parts.exists():
+            shutil.rmtree(parts)
+        subprocess.run(merge_command, check=True, cwd=str(ROOT), env=env)
+        if lora:
+            if not (parts / "lora_adapter" / "adapter_model.safetensors").exists():
+                raise RuntimeError(f"--lora-rank {self.a.lora_rank} but {parts / 'lora_adapter'} was not written; "
+                                   "the verl checkpoint has no LoRA weights, so it was not trained with LoRA")
+            subprocess.run(lora_command, check=True, cwd=str(ROOT), env=env)
+            shutil.rmtree(parts)
+        else:
+            parts.rename(merged)
         return merged
 
     def serve(self, model, name):

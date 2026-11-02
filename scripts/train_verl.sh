@@ -20,5 +20,9 @@ args=(--role "${ROLE:-builder}" --config "$CONFIG" --train "$TRAIN" --model "$MO
 [[ -n "${VAL:-}" ]] && args+=(--val "$VAL")
 [[ -n "${PROMPT_TOKENS:-}" ]] && args+=(--prompt-tokens "$PROMPT_TOKENS")
 [[ -n "${EXPERIMENT:-}" ]] && args+=(--experiment "$EXPERIMENT")
+[[ -n "${LORA_RANK:-}" ]] && args+=(--lora-rank "$LORA_RANK")
+[[ -n "${LORA_ALPHA:-}" ]] && args+=(--lora-alpha "$LORA_ALPHA")
+[[ -n "${OFFLOAD:-}" ]] && args+=(--offload)
+[[ -n "${ROLLOUT_GPU_UTIL:-}" ]] && args+=(--rollout-gpu-util "$ROLLOUT_GPU_UTIL")
 cd "$ROOT"
 exec python -m admem.verl_launch "${args[@]}" ${DRY_RUN:+--dry-run} -- "$@"

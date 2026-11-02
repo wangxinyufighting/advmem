@@ -50,6 +50,9 @@ class LaunchOptions:
     estimator: str = "admem_grpo"      # admem_grpo（整形+std下限）| grpo（verl原版）
     std_floor: float = 0.1
     reward_keys: str = "new"           # new | legacy
+    lora_rank: int = 0                 # >0：LoRA代替全参训练（verl用不带adapter的底座作KL参考模型）
+    lora_alpha: int = 0                # 0：取2×rank
+    offload: bool = False              # actor参数/优化器与ref模型暂存到CPU（双卡全参训练）
     experiment: str | None = None
     log_file: str | None = None
     max_ckpt_to_keep: int | None = 1
@@ -60,6 +63,35 @@ def prompt_budget(config_path, role):
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     key = "builder_input_tokens" if role == "builder" else "attacker_input_tokens"
     return int(cfg.get(key, 16384)) + 256
+
+
+def effective_lora_alpha(o) -> int:
+    """LoRA缩放系数；verl的模型合并器写出的adapter_config里alpha恒为0，合并时必须由这里给出。"""
+    return int(o.lora_alpha or 2 * o.lora_rank) if o.lora_rank > 0 else 0
+
+
+def lora_overrides(o: LaunchOptions) -> list[str]:
+    if o.lora_rank < 0 or o.lora_alpha < 0:
+        raise ValueError("lora_rank and lora_alpha must be >= 0")
+    if o.lora_rank == 0:
+        if o.lora_alpha:
+            raise ValueError("--lora-alpha needs --lora-rank > 0")
+        return []
+    return [f"actor_rollout_ref.model.lora_rank={o.lora_rank}",
+            f"actor_rollout_ref.model.lora_alpha={effective_lora_alpha(o)}",
+            "actor_rollout_ref.model.target_modules=all-linear",
+            # LoRA下verl只把adapter同步给vLLM，底座权重必须由vLLM自己从磁盘加载；
+            # 默认的load_format=dummy会让rollout用随机底座权重。
+            "actor_rollout_ref.rollout.load_format=safetensors",
+            "actor_rollout_ref.rollout.layered_summon=True"]
+
+
+def offload_overrides(o: LaunchOptions) -> list[str]:
+    if not o.offload:
+        return []
+    return ["actor_rollout_ref.actor.fsdp_config.param_offload=True",
+            "actor_rollout_ref.actor.fsdp_config.optimizer_offload=True",
+            "actor_rollout_ref.ref.fsdp_config.param_offload=True"]
 
 
 def verl_overrides(o: LaunchOptions) -> list[str]:
@@ -105,6 +137,7 @@ def verl_overrides(o: LaunchOptions) -> list[str]:
         "trainer.project_name=admem", f"trainer.experiment_name={o.experiment or Path(o.out).name}",
         f"trainer.logger={loggers}",
     ]
+    overrides += lora_overrides(o) + offload_overrides(o)
     if o.max_ckpt_to_keep:
         overrides.append(f"trainer.max_actor_ckpt_to_keep={o.max_ckpt_to_keep}")
     return overrides + list(o.extra)
@@ -119,6 +152,8 @@ def verl_env(o: LaunchOptions, base=None) -> dict:
     if "admem.verl_adv" not in modules:
         modules.append("admem.verl_adv")
     env["VERL_USE_EXTERNAL_MODULES"] = ",".join(modules)
+    # 客户端的调用上限是“每进程每角色”，默认10000会在长训练的reward worker里中途耗尽。
+    env.setdefault("MAX_API_CALLS", "100000000")
     env["ADMEM_CONFIG"] = str(Path(o.config).resolve())
     env["ADMEM_ROLE"] = o.role
     env["ADMEM_STD_FLOOR"] = str(o.std_floor)
@@ -161,6 +196,9 @@ def add_arguments(p):
     p.add_argument("--estimator", choices=["admem_grpo", "grpo"], default="admem_grpo")
     p.add_argument("--std-floor", type=float, default=0.1)
     p.add_argument("--reward-keys", choices=["new", "legacy"], default="new")
+    p.add_argument("--lora-rank", type=int, default=0, help="LoRA秩（>0启用LoRA，建议64，lr约1e-5）；0=全参训练")
+    p.add_argument("--lora-alpha", type=int, default=0, help="LoRA alpha（默认2×rank）")
+    p.add_argument("--offload", action="store_true", help="actor参数/优化器与ref模型暂存CPU（全参训练省显存）")
     p.add_argument("--experiment")
 
 
@@ -170,7 +208,8 @@ def options_from(a, **override) -> LaunchOptions:
                   prompt_tokens=a.prompt_tokens, response_tokens=a.response_tokens,
                   rollout_gpu_util=a.rollout_gpu_util, tensor_parallel=a.tensor_parallel,
                   reward_workers=a.reward_workers, estimator=a.estimator, std_floor=a.std_floor,
-                  reward_keys=a.reward_keys, experiment=a.experiment, extra=list(getattr(a, "extra", []) or []))
+                  reward_keys=a.reward_keys, lora_rank=a.lora_rank, lora_alpha=a.lora_alpha,
+                  offload=a.offload, experiment=a.experiment, extra=list(getattr(a, "extra", []) or []))
     values.update(override)
     return LaunchOptions(**values)
 

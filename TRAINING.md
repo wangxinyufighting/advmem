@@ -559,6 +559,8 @@ trainer config; the `admem_grpo` estimator's registration and masking with stand
 `prepare_rl_data.sh`, both `admem.validation` modes and a dry run of `rl_loop.py` end to end; the
 stopping rules and the loop's stop/resume behaviour in unit tests; a pooled adversarial bank with
 `require_reader_answerable` through the real CLI; `alternate.py`'s round order, memory pool, cumulative
-bank, stopping rule and resume in unit tests, plus its dry run. Not yet run: an actual verl GRPO job, the
+bank, stopping rule and resume in unit tests, plus its dry run. The LoRA path (launcher keys, `scripts/merge_lora.py` checked numerically on a tiny model, `rl_loop.py`'s
+two-step merge) and `scripts/check_roles.py` (against a fake server) are covered by
+`adversarial_memory_training/tests/test_lora_launch.py`. Not yet run: an actual verl GRPO job, the
 model merger and vLLM serving on GPUs. Do a short run (`--max-steps 2 --eval-every 1` on a handful of
 states; for `alternate.py`, `--rounds 1 --phase-steps 2 --eval-every 1`) before the real one.
