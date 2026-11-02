@@ -533,6 +533,29 @@ followed by `python scripts/merge_lora.py --base <dir>.parts --adapter <dir>.par
   deepseek --price-in ... --price-out ...` (counts only real, billed calls; cache hits are free). Without
   `--base-url` it also shows the local Defender's call rate.
 
+### Speed: where the time goes and what to turn
+
+With an API judge and reader, almost all waiting is on API calls, not the GPUs. First find which stage is
+slow: `rl_loop.py` appends one line per round to `runs/<run>/logs/timing.jsonl` with the wall time of the
+training chunk, the merge and the validation, plus verl's per-step `timing_s` averages (`gen` includes
+streaming reward computation; `reward`, `old_log_prob`, `ref`, `update_actor`, `step`).
+
+| Knob | Default | Effect (results do not change) |
+| --- | --- | --- |
+| `ADMEM_PARALLEL_CALLS` | 4 | judge/reader calls inside one reward computation run concurrently: faithfulness per entry, before/after answers per test question, retention/redundancy checks and coverage run at the same time. `1` = one call at a time (old behaviour) |
+| `rl_loop.py --val-workers` | 8 | validation builds/answers this many val cases at once (`admem.validation --workers`) |
+| `WORKERS` in `prepare_rl_data.sh`, `alternate.py --data-workers`, `admem.cli --workers` | 8 / 8 / 1 | data preparation and `longmemeval-eval` process this many cases at once |
+| identical concurrent requests | — | sent once per process; the samples of a GRPO group share "before" answers and the window's fact inventory |
+
+Each call keeps its request, nonce and cache key, so rewards and metrics are identical to sequential
+runs; only the wall time changes. Peak API concurrency during training is about `batch × group ×
+ADMEM_PARALLEL_CALLS` (256 with the defaults). If the API starts answering 429, lower
+`ADMEM_PARALLEL_CALLS` before lowering the batch.
+
+If it is still too slow, these change cost but also what is measured: fewer validation cases
+(`--val-per-type 1`) or questions (`--max-bank-questions 20`), a larger `--eval-every`, `--group 4`, or a
+smaller `replay_questions` in the config (reward-relevant: re-collect the states).
+
 ## 13. Troubleshooting
 
 | Symptom | Cause / fix |

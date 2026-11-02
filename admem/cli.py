@@ -6,8 +6,9 @@ from collections import defaultdict
 from pathlib import Path
 
 import sys
+import threading
 
-from .common import (Config, Progress, TokenBudget, Unknown, connect, digest, read, rows, self_judging, write,
+from .common import (Config, Progress, TokenBudget, Unknown, connect, digest, pmap, read, rows, self_judging, write,
                      write_rows)
 from .data import contexts, history_for_builder, prepare
 from .environment import Environment
@@ -100,8 +101,8 @@ def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memo
              question_types=None, per_type=None):
     # 只有此独立命令读取官方q/a；结果不能反馈给同一test case的memory编辑。
     golds = {q["key"]: q for q in rows(Path(prepared) / "private_eval.jsonl")}
-    details = []
-    for context, full_path in contexts(prepared, split, limit, keys, question_types, per_type):
+    def one(item):
+        context, full_path = item
         key = context["key"]
         q = golds[key]
         try:
@@ -116,15 +117,18 @@ def evaluate(prepared, run_dir, split, snapshot, env, out, limit, keys, all_memo
                 memory = read(Path(run_dir) / key / (snapshot + ".json"))
             result = env.answer(memory, q, all_memory=all_memory or snapshot == "oracle",
                                 abstention=q["abstention"])
-            details.append({"key": key, "question_id": q["question_id"], "type": q["type"],
+            return {"key": key, "question_id": q["question_id"], "type": q["type"],
                 "group": "abstention" if q["abstention"] else q["type"], "status": "ok",
                 "M_tokens": text_size(memory, env.counter), "entries": len(memory),
                 "raw_entries": sum(e.get("kind") == "raw" for e in memory),
-                "raw_token_fraction": text_size([e for e in memory if e.get("kind") == "raw"], env.counter) / max(1, text_size(memory, env.counter)), **result})
+                "raw_token_fraction": text_size([e for e in memory if e.get("kind") == "raw"], env.counter) / max(1, text_size(memory, env.counter)), **result}
         except (Unknown, OSError, ValueError) as exc:
-            details.append({"key": key, "question_id": q["question_id"], "group": "abstention" if q["abstention"] else q["type"],
-                            "status": "error", "error": str(exc)})
-        write_rows(Path(out) / "cases.jsonl", details)
+            return {"key": key, "question_id": q["question_id"], "group": "abstention" if q["abstention"] else q["type"],
+                    "status": "error", "error": str(exc)}
+
+    # 每题一次reader+一次评分，题与题互不依赖：按ADMEM_PARALLEL_CALLS并发，结果顺序不变。
+    details = pmap(one, list(contexts(prepared, split, limit, keys, question_types, per_type)))
+    write_rows(Path(out) / "cases.jsonl", details)
     grouped = defaultdict(list)
     for r in details:
         grouped[r["group"]].append(r)
@@ -457,7 +461,7 @@ def longmemeval_eval_external(cases_path, labels_path, split, snapshot, env, out
 
 
 def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
-                     builder_role="BUILDER", all_memory=False, question_types=None, per_type=None):
+                     builder_role="BUILDER", all_memory=False, question_types=None, per_type=None, workers=1):
     """Run the existing Builder over a prepared LongMemEval split, then score QA.
 
     The Builder phase only receives the prepared context/full history. Official
@@ -486,7 +490,10 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
     builder_cases = []
     entries = list(contexts(prepared, split, limit, keys, question_types, per_type))
     bar = Progress(len(entries), label="longmemeval-eval")
-    for context, full_path in entries:
+    lock = threading.Lock()
+
+    def one_case(item):
+        context, full_path = item
         key = context["key"]
         state = context["question_type"] if env.cfg.hint_mode == "target_type" else "hidden"
         case_out = run_dir / key
@@ -494,21 +501,27 @@ def longmemeval_eval(prepared, split, snapshot, env, out, limit, keys,
             full = env.memory_module.FullMemory.load(full_path)
             result = run_case(full, full_path, context, env, case_out,
                               mode="build", bank=[], builder_role=builder_role)
-            metrics = _builder_case_metrics(case_out)
-            reports.append({"key": key, **result})
-            builder_cases.append({"key": key, "question_type": context["question_type"], **metrics})
+            report = {"key": key, **result}
+            row = {"key": key, "question_type": context["question_type"], **_builder_case_metrics(case_out)}
+            suffix = ""
         except Unknown as exc:
             # 单个case的API/服务失败：丢弃该样本，继续后面的case。
             report = {"key": key, "status": "unknown", "error": str(exc)}
-            reports.append(report)
-            builder_cases.append({"key": key, "question_type": context["question_type"],
-                                  "status": "unknown", "error": str(exc)})
+            row = {"key": key, "question_type": context["question_type"], "status": "unknown", "error": str(exc)}
             _mark_failed(run_dir, key, "longmemeval-eval", exc)
-            write(run_dir / "summary.json", reports)
-            bar.update(suffix=f"{key} split={split} type_hint={state} FAILED")
-            continue
-        write(run_dir / "summary.json", reports)
-        bar.update(suffix=f"{key} split={split} type_hint={state}")
+            suffix = " FAILED"
+        with lock:
+            done.append(report)
+            write(run_dir / "summary.json", done)
+            bar.update(suffix=f"{key} split={split} type_hint={state}{suffix}")
+        return report, row
+
+    done = []
+    # workers>1：多个case同时建记忆（case之间独立），结果与逐个处理相同。
+    for report, row in pmap(one_case, entries, workers=max(1, workers)):
+        reports.append(report)
+        builder_cases.append(row)
+    write(run_dir / "summary.json", reports)
     bar.close()
 
     total_windows = sum(row.get("windows", 0) for row in builder_cases)
@@ -560,6 +573,8 @@ def main(argv=None):
     p.add_argument("--per-type", type=int,
                    help="每个stratum（6个question_type + abstention）最多取N个case，做分类型均衡抽样")
     p.add_argument("--keys", nargs="+")
+    p.add_argument("--workers", type=int, default=1,
+                   help="run/bank/bootstrap/longmemeval-eval：同时处理的case数（case之间独立，结果不变）")
     p.add_argument("--question-types", nargs="+",
                    help="只评测指定 LongMemEval question_type，可与 --keys/--limit 组合")
     p.add_argument("--mode", choices=["build", "closed_loop"], default="closed_loop")
@@ -709,7 +724,7 @@ def main(argv=None):
     if a.command == "longmemeval-eval":
         print(longmemeval_eval(a.prepared, a.split, a.snapshot, env, a.out, a.limit, a.keys,
                                builder_role=a.builder_role, all_memory=a.all_memory,
-                               question_types=a.question_types, per_type=a.per_type))
+                               question_types=a.question_types, per_type=a.per_type, workers=a.workers))
         return
     reports = []
     entries = list(contexts(a.prepared, a.split, a.limit, a.keys, a.question_types, a.per_type))
@@ -729,7 +744,10 @@ def main(argv=None):
             _require_case_files(a.base_bank, [c["key"] for c, _ in entries], "bank.json", "--base-bank")
     # 带输出目录名，PARALLEL=1 时各进程的进度条才能区分。
     bar = Progress(len(entries), label=f"{a.command} {Path(a.out).name}")
-    for context, full_path in entries:
+    lock = threading.Lock()
+
+    def one_case(item):
+        context, full_path = item
         key = context["key"]
         state = context["question_type"] if cfg.hint_mode == "target_type" else "hidden"
         try:
@@ -758,16 +776,20 @@ def main(argv=None):
                 result = run_case(full, full_path, context, env, Path(a.out) / key, mode=a.mode, bank=bank,
                     builder_role=a.builder_role, attacker_role=a.attacker_role,
                     collect=Collector(a.collect) if a.collect else None)
-            reports.append({"key": key, **result})
-            write(Path(a.out) / "summary.json", reports)
-            bar.update(suffix=f"{key} split={context['split']} type_hint={state}")
+            report, suffix = {"key": key, **result}, ""
         except Unknown as exc:
             # 单个case的API/服务失败：记为unknown、丢弃该样本，继续后面的case。
-            reports.append({"key": key, "status": "unknown", "error": str(exc)})
+            report, suffix = {"key": key, "status": "unknown", "error": str(exc)}, " FAILED"
             _mark_failed(Path(a.out), key, a.command, exc)
-            write(Path(a.out) / "summary.json", reports)
-            bar.update(suffix=f"{key} split={context['split']} type_hint={state} FAILED")
-            continue
+        with lock:
+            reports.append(report)
+            write(Path(a.out) / "summary.json", sorted(reports, key=lambda r: order[r["key"]]))
+            bar.update(suffix=f"{key} split={context['split']} type_hint={state}{suffix}")
+        return report
+
+    # --workers>1：多个case同时处理（case之间互不依赖，每个case内部仍按顺序）。结果与逐个处理相同。
+    order = {context["key"]: i for i, (context, _) in enumerate(entries)}
+    pmap(one_case, entries, workers=max(1, a.workers))
     bar.close()
 
 

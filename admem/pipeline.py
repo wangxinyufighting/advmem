@@ -9,7 +9,7 @@ from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
-from .common import BudgetExceeded, InvalidAction, Progress, Unknown, digest, parse, read, write, write_rows
+from .common import BudgetExceeded, InvalidAction, Progress, Unknown, digest, parse, pmap, read, write, write_rows
 from .data import TypeScheduler, hint, policy_type, resolve_type_policy
 from .audit_prompts import TYPES, attacker_rids, feasible_types, plan_item_type, structural_types
 from .prompts import attacker_messages, attacker_view_type, builder_prompt, evidence_usage, source_view
@@ -388,30 +388,35 @@ def salvage_edit(full, state, raw, env):
         repairs.update(fixes)
         if "prov_window" in fixes:
             fixed["_coarse"] = True  # 内部标记，写入前去掉
-    final, relocated, first_pass = [], 0, True
-    for op in kept:
+    def check(op):
+        """一个写操作的faith判定（必要时在窗口范围复核并改prov）；各操作互不依赖，可并发。
+        返回(op, ok, first_pass, relocated, reason)。"""
         coarse = op.pop("_coarse", False)
         if op["op"] == "DELETE" or not env.cfg.faith_gate:
-            final.append(op)
-            continue
+            return op, True, True, False, None
         _, changed = apply(state["M"], {"ops": [op]}, **kwargs)
         entry = changed[0]
         parents = [op["id"]] if op["op"] == "UPDATE" else op.get("ids", [])
-        ok, reason = False, None
+        ok, reason, passed, moved = False, None, True, False
         try:
             if not coarse:
                 verdict = env.faith(full, [entry])
                 ok, reason = verdict["faithful"], verdict.get("reason")
             if not ok:
-                first_pass = False
+                passed = False
                 scope = set(window) | {r for i in parents for r in index[i]["prov"]}
                 ok, support, value = env.faith_locate(full, entry, scope)
                 reason = value.get("reason", reason)
                 if ok:
-                    op = {**op, "prov": [r for r in support if r in allowed]}
-                    relocated += 1
+                    op, moved = {**op, "prov": [r for r in support if r in allowed]}, True
         except Unknown as exc:  # 超预算或judge连续给不出合法JSON：只丢这一条（回退原文），不让整个case失败
-            first_pass, ok, reason = False, False, f"judge unavailable: {exc}"
+            passed, ok, reason = False, False, f"judge unavailable: {exc}"
+        return op, ok, passed, moved, reason
+
+    final, relocated, first_pass = [], 0, True
+    for op, ok, passed, moved, reason in pmap(check, kept):
+        first_pass = first_pass and passed
+        relocated += moved
         if ok:
             final.append(op)
         else:

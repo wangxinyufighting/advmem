@@ -31,7 +31,9 @@ select_args() {  # $1=split
   [[ "$1" == val ]] && per_type=$VAL_PER_TYPE
   if [[ -n "$per_type" ]]; then echo --split "$1" --per-type "$per_type"; else echo --split "$1"; fi
 }
-cli() { "$PY" -m admem.cli "$@" --config "$CONFIG"; }
+# WORKERS：同时处理的case数（case之间独立，结果不变）。被调用的本地vLLM和API会同时收到这么多case的请求。
+WORKERS=${WORKERS:-8}
+cli() { "$PY" -m admem.cli "$@" --config "$CONFIG" --workers "$WORKERS"; }
 has_stage() { [[ " $STAGES " == *" $1 "* ]]; }
 
 if has_stage prepare && [[ ! -f "$PREPARED/manifest.json" ]]; then

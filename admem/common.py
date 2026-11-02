@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import math
 import re
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -21,10 +23,37 @@ def read(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def parallel_calls():
+    """一次打分内部同时进行的judge/reader调用数（ADMEM_PARALLEL_CALLS，默认4；1=逐个调用）。
+    只改变调用的并发，不改变任何请求、nonce或结果：每个调用的缓存键与顺序执行时相同。"""
+    try:
+        return max(1, int(os.getenv("ADMEM_PARALLEL_CALLS", "4")))
+    except ValueError:
+        return 1
+
+
+def pmap(fn, items, workers=None):
+    """按输入顺序返回fn(item)；并发>1时用独立线程池（不与外层共享，嵌套调用不会死锁）。
+    出错时与顺序执行一样抛出按顺序第一个异常。"""
+    items = list(items)
+    workers = min(parallel_calls() if workers is None else workers, len(items))
+    if workers <= 1:
+        return [fn(item) for item in items]
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(fn, item) for item in items]
+    return [f.result() for f in futures]
+
+
+def run_together(*thunks):
+    """同时执行几段互不依赖的打分（各自内部再pmap）；按参数顺序返回结果。"""
+    return pmap(lambda thunk: thunk(), thunks, workers=len(thunks) if parallel_calls() > 1 else 1)
+
+
 def write(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    # 每个写者用自己的临时文件：并发写同一路径（同组采样共享的缓存项）时不会互相替换掉对方的tmp。
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     tmp.replace(path)
 
@@ -427,6 +456,10 @@ def messages(system, payload):
 
 class Remote:
     """复用旧Client.post缓存/退避，保留raw输出供SFT/奖励，区分格式错与调用错。"""
+    # 同一进程里完全相同的请求（同一模型/地址/请求体/nonce）同时只发一次：其余调用等它写完缓存再读。
+    # GRPO同组的8个采样会同时请求“编辑前”答案、窗口事实清单等共用项，否则会重复计费。
+    _inflight = {}
+    _inflight_lock = threading.Lock()
     def __init__(self, role, core, cache):
         self.role = role
         self.client = core.from_env(role, cache)
@@ -504,7 +537,7 @@ class Remote:
             # Preserve the effective request after EXTRA_BODY, including cache hits.
             # HTTP headers and API keys are not part of this request body.
             self.last_request = json.loads(json.dumps(body))
-            response = self.client.post("/chat/completions", body, nonce=nonce)
+            response = self._post_once(body, nonce)
             choice = response["choices"][0]
             value = choice["message"]["content"]
             if value is None and choice.get("finish_reason") == "length":
@@ -521,6 +554,23 @@ class Remote:
             # prompt_tokens 让超长(输入+输出>服务max_model_len)能与真正的传输故障区分开。
             raise Unknown(f"{self.role} transport/service failure "
                           f"[prompt_tokens={prompt_tokens}, max_tokens={body.get('max_tokens')}]: {exc}") from exc
+
+    def _post_once(self, body, nonce):
+        key = digest([self.client.model, self.client.base_url, body, nonce])
+        with Remote._inflight_lock:
+            event = Remote._inflight.get(key)
+            owner = event is None
+            if owner:
+                event = Remote._inflight[key] = threading.Event()
+        if not owner:
+            event.wait()  # 先发者结束后缓存已写好，这里命中缓存；先发者失败则自己再发一次
+            return self.client.post("/chat/completions", body, nonce=nonce)
+        try:
+            return self.client.post("/chat/completions", body, nonce=nonce)
+        finally:
+            with Remote._inflight_lock:
+                Remote._inflight.pop(key, None)
+            event.set()
 
     def json(self, prompt, nonce, prompt_tokens=None):
         # 判官格式错误属于环境未知，不能变成被训练策略的负奖励。

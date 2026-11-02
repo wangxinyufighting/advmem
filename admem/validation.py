@@ -30,7 +30,7 @@ import sys
 from collections import Counter
 from pathlib import Path
 
-from .common import Config, TokenBudget, Unknown, connect, digest, read, rows, write
+from .common import Config, TokenBudget, Unknown, connect, digest, pmap, read, rows, write
 from .data import TypeScheduler, contexts, resolve_type_policy
 from .pipeline import REPAIRABLE_DEFECTS, _bank_pack, make_pool, run_case
 from .store import neutral_round, question_key, text_size
@@ -79,13 +79,18 @@ def bank_questions(bank_dir, key, limit=None):
 
 
 def builder_metrics(env, prepared, split, out, *, role="BUILDER_EVAL", val_bank=None, reference=None,
-                    max_bank_questions=None, limit=None, keys=None, question_types=None, per_type=None):
+                    max_bank_questions=None, limit=None, keys=None, question_types=None, per_type=None,
+                    workers=1):
+    """workers>1：多个val case同时构建与答题（case之间互不依赖；每个case内部的窗口仍按顺序）。
+    结果与workers=1相同，只是更快。"""
     out = Path(out)
     golds = {q["key"]: q for q in rows(Path(prepared) / "private_eval.jsonl")}
-    per_question, stats, tokens, failures, unknown = {}, Counter(), [], [], 0
-    for context, full_path in contexts(prepared, split, limit, keys, question_types, per_type):
+
+    def one_case(item):
+        context, full_path = item
         key = context["key"]
         full = env.memory_module.FullMemory.load(full_path)
+        case_stats, answers, unknown = Counter(), {}, 0
         if reference == "full":
             memory = full_memory(full)
         else:
@@ -94,22 +99,41 @@ def builder_metrics(env, prepared, split, out, *, role="BUILDER_EVAL", val_bank=
                 if not (case_dir / "M_final.json").exists():
                     run_case(full, full_path, context, env, case_dir, mode="build", bank=[], builder_role=role)
             except Unknown as exc:
-                failures.append({"key": key, "error": str(exc)})
-                continue
+                return {"failure": {"key": key, "error": str(exc)}}
             memory = read(case_dir / "M_final.json")
-            stats.update(build_stats(case_dir))
-        tokens.append(text_size(memory, env.counter))
+            case_stats = build_stats(case_dir)
         gold = golds[key]
         questions = [("official:" + key, gold, gold.get("abstention", False))]
         if val_bank:
             questions += [(f"bank:{key}:{question_key(q)}", q, False)
                           for q in bank_questions(val_bank, key, max_bank_questions)]
-        for qid, q, abstention in questions:
+
+        def answer(question):
+            qid, q, abstention = question
             item = {k: q[k] for k in ("q", "a", "type", "question_date", "E")}
             try:
-                per_question[qid] = float(env.answer(memory, item, abstention=abstention)["correct"])
+                return qid, float(env.answer(memory, item, abstention=abstention)["correct"])
             except Unknown:
+                return qid, None
+
+        for qid, value in pmap(answer, questions):
+            if value is None:
                 unknown += 1
+            else:
+                answers[qid] = value
+        return {"stats": case_stats, "tokens": text_size(memory, env.counter), "answers": answers,
+                "unknown": unknown}
+
+    per_question, stats, tokens, failures, unknown = {}, Counter(), [], [], 0
+    cases = list(contexts(prepared, split, limit, keys, question_types, per_type))
+    for result in pmap(one_case, cases, workers=max(1, workers)):
+        if "failure" in result:
+            failures.append(result["failure"])
+            continue
+        stats.update(result["stats"])
+        tokens.append(result["tokens"])
+        per_question.update(result["answers"])
+        unknown += result["unknown"]
     official = [v for k, v in per_question.items() if k.startswith("official:")]
     bank = [v for k, v in per_question.items() if k.startswith("bank:")]
     if stats["windows"] and not stats["faith_judged"]:
@@ -137,11 +161,14 @@ def builder_metrics(env, prepared, split, out, *, role="BUILDER_EVAL", val_bank=
 # ================================================================ attacker
 
 def attacker_metrics(env, prepared, split, out, *, memory_run, snapshot="M_build", role="ATTACKER_EVAL",
-                     packs_per_case=8, seed=0, limit=None, keys=None, question_types=None, per_type=None):
-    """针对参考记忆的出题能力。每个pack独立（accepted从空开始），便于不同checkpoint逐pack配对比较。"""
+                     packs_per_case=8, seed=0, limit=None, keys=None, question_types=None, per_type=None,
+                     workers=1):
+    """针对参考记忆的出题能力。每个pack独立（accepted从空开始），便于不同checkpoint逐pack配对比较。
+    workers>1：多个case同时处理（case之间互不依赖），结果相同。"""
     out = Path(out)
-    per_pack, counts, failures = {}, Counter(), []
-    for context, full_path in contexts(prepared, split, limit, keys, question_types, per_type):
+
+    def one_case(item):
+        context, full_path = item
         key = context["key"]
         full = env.memory_module.FullMemory.load(full_path)
         memory = read(Path(memory_run) / key / f"{snapshot}.json")
@@ -149,27 +176,35 @@ def attacker_metrics(env, prepared, split, out, *, memory_run, snapshot="M_build
         rng = random.Random(digest([seed, key]))
         chosen = sorted(rng.sample(range(len(pool)), min(packs_per_case, len(pool))))
         scheduler = TypeScheduler(env.cfg) if resolve_type_policy(env.cfg) == "balanced" else None
-        for pi in chosen:
+        case_counts, packs, case_failures = Counter(), {}, []
+        for pi in chosen:  # 同一case的pack共用题型调度器，保持顺序
             try:
                 _, logs, _ = _bank_pack(full, full_path, context, pool[pi], pi, [], env, role,
                                         memory=memory, scheduler=scheduler)
             except Unknown as exc:
-                failures.append({"key": key, "pack": pi, "error": str(exc)})
+                case_failures.append({"key": key, "pack": pi, "error": str(exc)})
                 continue
             status = Counter(row.get("status") for row in logs)
             if status["type_infeasible"] or (status["over_budget"] and len(logs) == 1 and "item" not in logs[0]):
-                counts["not_sent"] += 1
+                case_counts["not_sent"] += 1
                 continue
-            counts["sent"] += 1
-            counts["invalid"] += status["invalid"]
-            counts["empty"] += status["empty"]
-            proposed = sum(1 for row in logs if row.get("status") in {"accepted", "rejected", "accepted_no_defect"})
-            accepted = sum(1 for row in logs if row.get("status") in {"accepted", "accepted_no_defect"})
+            case_counts["sent"] += 1
+            case_counts["invalid"] += status["invalid"]
+            case_counts["empty"] += status["empty"]
+            case_counts["proposed"] += sum(1 for row in logs if row.get("status") in
+                                           {"accepted", "rejected", "accepted_no_defect"})
+            case_counts["accepted"] += sum(1 for row in logs if row.get("status") in {"accepted", "accepted_no_defect"})
             defects = sum(1 for row in logs if row.get("defect") in REPAIRABLE_DEFECTS)
-            counts["proposed"] += proposed
-            counts["accepted"] += accepted
-            counts["defects"] += defects
-            per_pack[f"pack:{key}:{pi}"] = float(defects)
+            case_counts["defects"] += defects
+            packs[f"pack:{key}:{pi}"] = float(defects)
+        return case_counts, packs, case_failures
+
+    per_pack, counts, failures = {}, Counter(), []
+    cases = list(contexts(prepared, split, limit, keys, question_types, per_type))
+    for case_counts, packs, case_failures in pmap(one_case, cases, workers=max(1, workers)):
+        counts.update(case_counts)
+        per_pack.update(packs)
+        failures.extend(case_failures)
     metrics = {
         "role": "attacker", "split": split, "memory_run": str(memory_run), "snapshot": snapshot,
         "primary_name": "defects_per_pack", "primary": _rate(counts["defects"], counts["sent"]),
@@ -297,9 +332,11 @@ def main(argv=None):
     p.add_argument("--limit", type=int)
     p.add_argument("--keys", nargs="+")
     p.add_argument("--per-type", type=int)
+    p.add_argument("--workers", type=int, default=1,
+                   help="同时处理的val case数（case之间独立，结果不变）；每个case内的调用并发见ADMEM_PARALLEL_CALLS")
     a = p.parse_args(argv)
     env = make_env(a.config)
-    common = dict(limit=a.limit, keys=a.keys, per_type=a.per_type)
+    common = dict(limit=a.limit, keys=a.keys, per_type=a.per_type, workers=a.workers)
     if a.kind == "builder":
         metrics = builder_metrics(env, a.prepared, a.split, a.out, role=a.role or "BUILDER_EVAL",
                                   val_bank=a.val_bank, reference=a.reference,

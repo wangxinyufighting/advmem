@@ -114,7 +114,8 @@ class Alternation:
             self.stop(server)
 
     def cli(self, *args):
-        return [sys.executable, "-m", "admem.cli", *args, "--config", self.a.config]
+        return [sys.executable, "-m", "admem.cli", *args, "--config", self.a.config,
+                "--workers", str(self.a.data_workers)]
 
     def select(self, split):
         per_type = self.a.train_per_type if split == "train" else self.a.val_per_type
@@ -272,6 +273,8 @@ def parser():
     p.add_argument("--serve-gpus")
     p.add_argument("--serve-timeout", type=int, default=900)
     p.add_argument("--max-model-len", type=int, default=24576)
+    p.add_argument("--data-workers", type=int, default=8,
+                   help="数据步骤（建记忆、出题、收集状态）同时处理的case数；结果不变")
     p.add_argument("--dry-run", action="store_true")
     return p
 

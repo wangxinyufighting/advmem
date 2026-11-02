@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 import re
+import threading
 from collections import Counter, OrderedDict
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
 
-from .common import BudgetExceeded, Remote, Unknown, InvalidAction, digest, messages, parse
+from .common import BudgetExceeded, Remote, Unknown, InvalidAction, digest, messages, parse, parallel_calls, pmap, run_together
 from . import prompts
 from .audit_prompts import (EVIDENCE_AUDIT_SYSTEM, SINGLE_SESSION, TYPES, GATE_ORACLE_SYSTEM,
                             GATE_SUPPORT_SYSTEM, personal_score, plan_item_type)
@@ -49,6 +50,24 @@ def rejection_reward(gate):
     return -0.1          # schema/evidence 非法（validate_question 抛出的各类错）
 
 
+class _Serialized:
+    """把嵌入器/重排器的方法调用串行化：它们的进程内LRU缓存（OrderedDict）不是线程安全的，
+    而verl与并发打分会在多个线程里同时检索。属性（如signature）照常读取。"""
+
+    def __init__(self, inner):
+        self._inner, self._lock = inner, threading.RLock()
+
+    def __getattr__(self, name):
+        value = getattr(self._inner, name)
+        if not callable(value):
+            return value
+
+        def locked(*args, **kwargs):
+            with self._lock:
+                return value(*args, **kwargs)
+        return locked
+
+
 class Environment:
     def __init__(self, cfg, counter, legacy):
         self.cfg, self.counter = cfg, counter
@@ -58,6 +77,8 @@ class Environment:
         self.loaded = False
         self.index_cache = {}  # 每个进程仅保留最近少量M索引，不随训练无限增长。
         self._answer_cache = None
+        # verl在同一进程里用多线程并发打分，打分内部还会并发调用：共享缓存要加锁。
+        self._lock = threading.RLock()
 
     @contextmanager
     def cached_answers(self, max_entries=256):
@@ -72,9 +93,10 @@ class Environment:
             self._answer_cache = previous
 
     def policy(self, role):
-        if role not in self.clients:
-            self.clients[role] = Remote(role, self.llm_module.Client, str(Path(self.cfg.cache) / "api"))
-        return self.clients[role]
+        with self._lock:
+            if role not in self.clients:
+                self.clients[role] = Remote(role, self.llm_module.Client, str(Path(self.cfg.cache) / "api"))
+            return self.clients[role]
 
     def judge(self, system, payload, key):
         prompt = messages(system, payload)
@@ -91,21 +113,26 @@ class Environment:
         if not documents:
             return None
         key = digest([(d.id, d.text, d.date, d.session_ids, d.prov, d.neighbors) for d in documents])
-        if key in self.index_cache:
-            return self.index_cache[key]
-        if not self.loaded:
-            if self.cfg.embedding != "none":
-                self.embedder = self.retrieval_module.Embedder(self.cfg.embedding, self.cfg.embed_model,
-                                                               str(Path(self.cfg.cache) / "api"))
-            if self.cfg.reranker:
-                self.reranker = self.retrieval_module.CrossReranker(self.cfg.reranker)
-            self.loaded = True
+        with self._lock:
+            if key in self.index_cache:
+                return self.index_cache[key]
+            self._load_retrieval()
         idx = self.retrieval_module.Retriever(documents, self.embedder,
                                               str(Path(self.cfg.cache) / "index"), self.reranker)
-        if len(self.index_cache) >= 4:
-            self.index_cache.pop(next(iter(self.index_cache)))
-        self.index_cache[key] = idx
+        with self._lock:
+            if len(self.index_cache) >= 4:
+                self.index_cache.pop(next(iter(self.index_cache)))
+            self.index_cache[key] = idx
         return idx
+
+    def _load_retrieval(self):
+        if not self.loaded:
+            if self.cfg.embedding != "none":
+                self.embedder = _Serialized(self.retrieval_module.Embedder(
+                    self.cfg.embedding, self.cfg.embed_model, str(Path(self.cfg.cache) / "api")))
+            if self.cfg.reranker:
+                self.reranker = _Serialized(self.retrieval_module.CrossReranker(self.cfg.reranker))
+            self.loaded = True
 
     def memory_index(self, memory):
         # Reader只能看到M.text，不能通过prov回取F，不能在render中泄露原session ID。
@@ -170,9 +197,11 @@ class Environment:
         cache = self._answer_cache
         identity = [memory, q, all_memory, abstention, type_hint] + ([k] if k else [])
         cache_key = digest(identity) if cache is not None else None
-        if cache is not None and cache_key in cache[0]:
-            cache[0].move_to_end(cache_key)
-            return deepcopy(cache[0][cache_key])
+        if cache is not None:
+            with self._lock:
+                if cache_key in cache[0]:
+                    cache[0].move_to_end(cache_key)
+                    return deepcopy(cache[0][cache_key])
         context, ids = self.context(memory, q, all_memory, k) if k else self.context(memory, q, all_memory)
         # cache身份包含实际文本、日期、模型配置和完整问答；服务客户端还会hash完整request。
         key = digest([context, q, all_memory, abstention, type_hint])
@@ -181,17 +210,28 @@ class Environment:
         result = {"correct": correct, "answer": answer, "visible_ids": ids,
                   "context_tokens": self.counter.count(context)}
         if cache is not None:
-            cache[0][cache_key] = deepcopy(result)
-            if len(cache[0]) > cache[1]:
-                cache[0].popitem(last=False)
+            with self._lock:
+                cache[0][cache_key] = deepcopy(result)
+                if len(cache[0]) > cache[1]:
+                    cache[0].popitem(last=False)
         return result
+
+    def _faith_one(self, full, entry):
+        return self.judge(prompts.FAITH, {"entries": [entry],
+            "history": prompts.source_view(full, entry["prov"])}, digest([full.fingerprint, entry]))
 
     def faith(self, full, changed):
         if not changed:
             return {"faithful": True, "reason": "No written entry"}
-        for entry in changed:
-            value = self.judge(prompts.FAITH, {"entries": [entry],
-                "history": prompts.source_view(full, entry["prov"])}, digest([full.fingerprint, entry]))
+        if parallel_calls() <= 1:  # 顺序：遇到第一条不成立就停
+            values = []
+            for entry in changed:
+                values.append(self._faith_one(full, entry))
+                if not boolean(values[-1], "faithful"):
+                    return values[-1]
+            return {"faithful": True, "reason": "All written entries supported"}
+        # 并发：全部判定，返回按顺序第一条不成立的结果（与顺序执行的结论相同）
+        for value in pmap(lambda entry: self._faith_one(full, entry), changed):
             if not boolean(value, "faithful"):
                 return value
         return {"faithful": True, "reason": "All written entries supported"}
@@ -210,10 +250,7 @@ class Environment:
 
     def faith_scores(self, full, changed):
         """逐条faithful判定（不提前返回），供builder_score做连续折扣；无改动返回[]。"""
-        return [boolean(self.judge(prompts.FAITH, {"entries": [entry],
-                        "history": prompts.source_view(full, entry["prov"])},
-                        digest([full.fingerprint, entry])), "faithful")
-                for entry in changed]
+        return [boolean(value, "faithful") for value in pmap(lambda entry: self._faith_one(full, entry), changed)]
 
     def validate_question(self, q, pack, date, qtype, *, seed_only=False):
         if not isinstance(q, dict) or set(q) != {"q", "a", "type", "question_date", "E"}:
@@ -372,9 +409,9 @@ class Environment:
         faith_reason = ("No written entry" if not faith_scores else "All written entries supported"
                         if faithful else f"{len(faith_scores) - sum(faith_scores)} of {len(faith_scores)} written entries unsupported")
 
-        before_scores = [self.answer(state["M"], q)["correct"] for q in tests]
+        before_scores = pmap(lambda q: self.answer(state["M"], q)["correct"], tests)
         # NOOP 不重复调用有随机性的 Reader/Judge，避免凭环境噪声得到奖励。
-        after_scores = ([self.answer(proposed, q)["correct"] for q in tests]
+        after_scores = (pmap(lambda q: self.answer(proposed, q)["correct"], tests)
                         if action["ops"] else list(before_scores))
         before_acc = sum(before_scores) / len(tests)
         after_acc = sum(after_scores) / len(tests)
@@ -468,38 +505,43 @@ class Environment:
         if not tests and not coverage_on:
             raise Unknown("Empty test set and no source window: no reward is defined")
         noop = not action["ops"]
-        faith_scores = self.faith_scores(full, changed)
-        faithful = all(faith_scores)
-        faith_ratio = sum(faith_scores) / len(faith_scores) if faith_scores else 1.0
-
         x_rids = {s["rid"] for s in state["x"]}
         targets = [bool(set(q["E"]) & x_rids) for q in tests]
         denom = max(1, sum(targets))
-        before_scores, after_scores, deltas, confirmed = [], [], [], 0
-        for q in tests:
+        k2 = 2 * cfg.reader_k
+
+        def test_one(q):
+            """一道测试题：编辑前后各答一次（互不依赖，可并发）；答案翻转时用2k复核。"""
             before_memory = self._test_memory(full, state["M"], q)
-            before = self.answer(before_memory, q)["correct"]
             if noop:
-                after, delta = before, 0.0
-            else:
-                after_memory = self._test_memory(full, proposed, q)
-                after = self.answer(after_memory, q)["correct"]
-                if after != before:
-                    confirmed += 1
-                    k2 = 2 * cfg.reader_k
-                    delta = rv2.flip_delta(before, after, self.answer(before_memory, q, k=k2)["correct"],
-                                           self.answer(after_memory, q, k=k2)["correct"])
-                else:
-                    delta = 0.0
-            before_scores.append(before)
-            after_scores.append(after)
-            deltas.append(delta)
+                before = self.answer(before_memory, q)["correct"]
+                return before, before, 0.0, False
+            after_memory = self._test_memory(full, proposed, q)
+            before, after = (r["correct"] for r in run_together(lambda: self.answer(before_memory, q),
+                                                                 lambda: self.answer(after_memory, q)))
+            if after == before:
+                return before, after, 0.0, False
+            wide_before, wide_after = (r["correct"] for r in run_together(
+                lambda: self.answer(before_memory, q, k=k2), lambda: self.answer(after_memory, q, k=k2)))
+            return before, after, rv2.flip_delta(before, after, wide_before, wide_after), True
+
+        scope = set(state["old_ids"]) | set(state.get("catalog_ids", []))
+        # 四部分互不依赖：忠实度、测试题、保留/冗余检查、覆盖率。ADMEM_PARALLEL_CALLS>1时同时进行，
+        # 每个调用的请求与缓存键都和顺序执行时一样，所以奖励不变，只是等待时间变短。
+        faith_scores, results, checks, coverage = run_together(
+            lambda: self.faith_scores(full, changed),
+            lambda: pmap(test_one, tests),
+            lambda: assess_edits(self, full, state, action, proposed, changed, scope_ids=scope),
+            lambda: (source_coverage(self, state, proposed, changed) if coverage_on and not noop
+                     else {"facts": None, "new": None, "stored": 0, "ratio": None}))
+        faithful = all(faith_scores)
+        faith_ratio = sum(faith_scores) / len(faith_scores) if faith_scores else 1.0
+        before_scores = [r[0] for r in results]
+        after_scores = [r[1] for r in results]
+        deltas = [r[2] for r in results]
+        confirmed = sum(r[3] for r in results)
         gain = min(1.0, sum(d for d in deltas if d > 0) / denom)
         loss = min(1.0, -sum(d for d in deltas if d < 0) / denom)
-        scope = set(state["old_ids"]) | set(state.get("catalog_ids", []))
-        checks = assess_edits(self, full, state, action, proposed, changed, scope_ids=scope)
-        coverage = (source_coverage(self, state, proposed, changed) if coverage_on and not noop
-                    else {"facts": None, "new": None, "stored": 0, "ratio": None})
 
         before_size = text_size(state["M"], self.counter)
         after_size = text_size(proposed, self.counter)

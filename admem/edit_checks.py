@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from .common import BudgetExceeded, Unknown, digest, messages
+from .common import BudgetExceeded, Unknown, digest, messages, pmap
 from .prompts import source_view
 
 
@@ -225,29 +225,34 @@ def assess_edits(env, full, state, action, proposed, changed, scope_ids=None):
     for entry in proposed:
         proposed_texts.setdefault(entry["text"], []).append(entry["id"])
     touched = list(dict.fromkeys(eid for op in action["ops"] for eid in _parents(op)))
-    checks, required_count, lost_count = [], 0, 0
-    for eid in touched:
+
+    def retention(eid):
+        """一条被改写/删除的旧条目的事实是否仍在编辑后的记忆里；各条目互不依赖，可并发。"""
         old = before[eid]
         if old["text"] in proposed_texts:
-            checks.append({"entry_id": eid, "retained": True, "method": "exact_text",
-                           "witness_ids": proposed_texts[old["text"]], "facts": [],
-                           "missing_fact_indices": [], "searched_ids": []})
-            continue
+            return {"entry_id": eid, "retained": True, "method": "exact_text",
+                    "witness_ids": proposed_texts[old["text"]], "facts": [],
+                    "missing_fact_indices": [], "searched_ids": []}, 0, 0
         facts = _inventory(env, full, old, state["x"], "retention")
         # Try changed and provenance-related entries first, then exhaust the rest.
         ordered = sorted(proposed, key=lambda e: (e["id"] not in changed_ids,
                                                   not bool(set(e["prov"]) & set(old["prov"]))))
         witnesses, missing, searched = _coverage(env, facts, ordered)
-        required_count += sum(f["status"] != "unsupported" for f in facts)
-        lost_count += len(missing)
-        checks.append({"entry_id": eid, "retained": not missing, "method": "semantic",
-                       "facts": facts, "witnesses": witnesses,
-                       "missing_fact_indices": missing, "searched_ids": searched,
-                       "candidate_count": len(proposed)})
+        return ({"entry_id": eid, "retained": not missing, "method": "semantic",
+                 "facts": facts, "witnesses": witnesses,
+                 "missing_fact_indices": missing, "searched_ids": searched,
+                 "candidate_count": len(proposed)},
+                sum(f["status"] != "unsupported" for f in facts), len(missing))
+
+    results = pmap(retention, touched)
+    checks = [r[0] for r in results]
+    required_count = sum(r[1] for r in results)
+    lost_count = sum(r[2] for r in results)
 
     retained = {check["entry_id"]: check["retained"] for check in checks}
     written = {e["id"]: e for e in changed}
-    prior_writes, redundant, writes = [], [], 0
+    # 先不调用judge地确定每个写操作的候选集（之前写入的条目文本与judge结论无关），再并发做语义判定。
+    prior_writes, pending, writes = [], [], 0
     for index, op in enumerate(action["ops"]):
         if op["op"] == "DELETE":
             continue
@@ -265,22 +270,29 @@ def assess_edits(env, full, state, action, proposed, changed, scope_ids=None):
         # compare their own parents to recognize equivalent no-saving rewrites.
         baseline = [e for e in state["M"] if (e["id"] not in touched or e["id"] in parents)
                     and (scope_ids is None or e["id"] in scope_ids or e["id"] in parents)]
-        candidates = [{"id": "before:" + e["id"], "text": e["text"]} for e in baseline] + prior_writes
-        reason, semantic = None, False
+        candidates = [{"id": "before:" + e["id"], "text": e["text"]} for e in baseline] + list(prior_writes)
+        pending.append((index, op, entry, safe_saving, candidates))
+        prior_writes.append({"id": f"written:{index}", "text": entry["text"]})
+
+    def redundancy(item):
+        index, op, entry, safe_saving, candidates = item
         if op["op"] == "UPDATE" and entry["text"] == before[op["id"]]["text"]:
-            reason = "unchanged_text (including provenance-only update)"
-        elif not safe_saving and any(e["text"] == entry["text"] for e in candidates):
-            reason = "duplicate_text"
-        elif not safe_saving and candidates:
+            return "unchanged_text (including provenance-only update)", False
+        if not safe_saving and any(e["text"] == entry["text"] for e in candidates):
+            return "duplicate_text", False
+        if not safe_saving and candidates:
             facts = _inventory(env, full, entry, [], "novelty")
             required = [f for f in facts if f["status"] != "unsupported"]
             if required:
                 _, missing, _ = _coverage(env, facts, candidates)
                 if not missing:
-                    reason, semantic = "equivalent_write_without_token_saving", True
+                    return "equivalent_write_without_token_saving", True
+        return None, False
+
+    redundant = []
+    for (index, op, *_), (reason, semantic) in zip(pending, pmap(redundancy, pending)):
         if reason:
             redundant.append({"op_index": index, "op": op["op"], "reason": reason, "semantic": semantic})
-        prior_writes.append({"id": f"written:{index}", "text": entry["text"]})
 
     # Renaming IDs via DELETE + ADD or swapping identical texts across IDs does
     # not change the reader's information. Detect whole-action identity churn

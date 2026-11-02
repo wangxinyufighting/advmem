@@ -56,8 +56,14 @@ def train_metrics(log_file):
                   if k.endswith(suffix) and isinstance(v, (int, float))]
         return sum(values) / len(values) if values else None
 
+    timing = {}
+    for r in rows:  # verl每步的分段耗时（秒）：gen=采样（含流式奖励）、reward、old_log_prob、ref、update_actor、step
+        for k, v in r.get("data", {}).items():
+            if k.startswith("timing_s/") and isinstance(v, (int, float)):
+                timing.setdefault(k[len("timing_s/"):], []).append(v)
     return {"kl_loss": pick("kl_loss"), "train_reward": pick("critic/score/mean"),
-            "response_clip_ratio": pick("response_length/clip_ratio")}
+            "response_clip_ratio": pick("response_length/clip_ratio"),
+            "timing_s_mean": {k: round(sum(v) / len(v), 1) for k, v in sorted(timing.items())}}
 
 
 class Loop:
@@ -170,6 +176,7 @@ class Loop:
                         "--packs-per-case", str(self.a.packs_per_case)]
         command += ["--limit", str(self.a.val_limit)] if self.a.val_limit else []
         command += ["--per-type", str(self.a.val_per_type)] if self.a.val_per_type else []
+        command += ["--workers", str(self.a.val_workers)]
         if self.a.dry_run:
             print("[dry-run] serve", model, "as", name, "\n[dry-run]", " ".join(command), flush=True)
             return {"primary": 0.0, "guards": {}, "per_question": {}}
@@ -196,17 +203,32 @@ class Loop:
             self.save()
         while self.step < self.a.max_steps and not self.stopper.state["stopped"]:
             target = min(self.step + self.a.eval_every, self.a.max_steps)
+            clock = [time.time()]
             log_file = self.train_chunk(target)
+            clock.append(time.time())
             merged = self.merge(target)
+            clock.append(time.time())
             tag = f"step_{target:05d}"
             metrics = dict(self.validate(str(merged), tag))
+            clock.append(time.time())
             metrics["train"] = train_metrics(log_file)
+            self.log_timing(tag, target - self.step, clock, metrics["train"].get("timing_s_mean", {}))
             self.step = target
             decision = self.stopper.update(tag, target, metrics, str(merged))
             self.report(decision)
             self.cleanup()
             self.save()
         return self.finish()
+
+    def log_timing(self, tag, steps, clock, per_step):
+        """每轮各阶段的墙钟时间写到logs/timing.jsonl：先看慢在训练（及其中的采样/奖励/更新）、合并还是验证。"""
+        row = {"tag": tag, "steps": steps, "train_s": round(clock[1] - clock[0]),
+               "train_s_per_step": round((clock[1] - clock[0]) / max(1, steps)),
+               "merge_s": round(clock[2] - clock[1]), "validate_s": round(clock[3] - clock[2]),
+               "verl_timing_s_per_step": per_step}
+        with open(self.out / "logs" / "timing.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        print("[rl_loop] timing " + json.dumps(row), flush=True)
 
     def report(self, decision):
         keys = ("tag", "primary", "decision", "improved", "prob_better", "mean_diff", "violations", "best_tag",
@@ -267,6 +289,8 @@ def parser():
     p.add_argument("--packs-per-case", type=int, default=8)
     p.add_argument("--val-limit", type=int)
     p.add_argument("--val-per-type", type=int, help="每种题型取几个val case（控制验证成本）")
+    p.add_argument("--val-workers", type=int, default=8,
+                   help="验证时同时处理的val case数（结果不变，只是更快；被评模型由本地vLLM并发服务）")
     # 外部命令
     p.add_argument("--verl-python", help="verl环境的python（默认当前解释器）")
     p.add_argument("--merge-cmd", default=DEFAULT_MERGE)
