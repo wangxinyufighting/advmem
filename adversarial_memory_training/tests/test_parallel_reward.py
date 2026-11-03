@@ -129,3 +129,51 @@ def test_rl_loop_reports_verl_stage_timings(tmp_path):
     write_rows(log, [{"step": i, "data": {"timing_s/gen": 100.0 + i, "timing_s/update_actor": 30.0}}
                      for i in range(1, 3)])
     assert module.train_metrics(log)["timing_s_mean"] == {"gen": 101.5, "update_actor": 30.0}
+
+
+def test_probe_workers_give_identical_records_and_overlap_samples(env, tmp_path, monkeypatch):
+    """--workers：同一状态的样本先并发生成、并发打分（写入缓存），记录与逐个执行时完全相同。"""
+    from admem.common import rows, write_rows
+    from admem.probes import make_suite, run_probe
+    from test_probe_reward_diagnostics import verdict
+
+    records = make_suite(env, tmp_path / "suite", variants=1)[:2]
+    states = tmp_path / "states.jsonl"
+    write_rows(states, records)
+    generated, scored, lock = {}, {}, threading.Lock()
+
+    def complete(prompt, nonce, temperature=0.0, **kw):  # 模拟带缓存的API：同一nonce只真正生成一次
+        with lock:
+            if nonce in generated:
+                return generated[nonce]
+        time.sleep(DELAY)
+        text = json.dumps({"ops": [], "n": int(nonce[-2:], 16) % 3})
+        with lock:
+            generated[nonce] = text
+        return text
+
+    def score(full, state, raw):  # 模拟带缓存的judge
+        with lock:
+            if raw in scored:
+                return dict(scored[raw])
+        time.sleep(DELAY)
+        value = verdict(reward=float(json.loads(raw)["n"]), effective_reward=float(json.loads(raw)["n"]))
+        with lock:
+            scored[raw] = value
+        return dict(value)
+
+    monkeypatch.setattr(env.policy("BUILDER"), "complete", complete)
+    monkeypatch.setattr(env, "builder_score", score)
+    timing = {"generation_seconds", "scoring_seconds"}
+
+    def run(workers, out):
+        generated.clear(), scored.clear()
+        started = time.time()
+        run_probe(states, env, tmp_path / out, samples=6, workers=workers)
+        return [{k: v for k, v in r.items() if k not in timing} for r in rows(tmp_path / out / "samples.jsonl")], \
+            time.time() - started
+
+    sequential, slow = run(1, "seq")
+    parallel, fast = run(6, "par")
+    assert parallel == sequential and len(sequential) == 12
+    assert fast < slow / 2

@@ -574,7 +574,8 @@ def main(argv=None):
                    help="每个stratum（6个question_type + abstention）最多取N个case，做分类型均衡抽样")
     p.add_argument("--keys", nargs="+")
     p.add_argument("--workers", type=int, default=1,
-                   help="run/bank/bootstrap/longmemeval-eval：同时处理的case数（case之间独立，结果不变）")
+                   help="run/bank/bootstrap/longmemeval-eval：同时处理的case数；probe：同一状态的样本"
+                        "同时生成与打分（结果不变）")
     p.add_argument("--question-types", nargs="+",
                    help="只评测指定 LongMemEval question_type，可与 --keys/--limit 组合")
     p.add_argument("--mode", choices=["build", "closed_loop"], default="closed_loop")
@@ -680,7 +681,8 @@ def main(argv=None):
     if a.command == "probe":
         if not a.states or a.samples < 1:
             p.error("probe requires --states and positive --samples")
-        print(run_probe(a.states, env, a.out, a.samples, a.builder_role, a.limit, temperature=a.temperature))
+        print(run_probe(a.states, env, a.out, a.samples, a.builder_role, a.limit, temperature=a.temperature,
+                        workers=max(1, a.workers)))
         return
     if a.command == "attacker-probe":
         if not a.prepared:

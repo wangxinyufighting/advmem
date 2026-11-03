@@ -11,7 +11,7 @@ from pathlib import Path
 from statistics import mean, pstdev
 from time import perf_counter
 
-from .common import BudgetExceeded, Progress, Unknown, digest, read, write, write_rows, parse
+from .common import BudgetExceeded, Progress, Unknown, digest, pmap, read, write, write_rows, parse
 from .data import TypeScheduler, resolve_type_policy
 from .rewards import builder_state_scorable
 from .pipeline import attacker_state, builder_state, make_pool
@@ -289,7 +289,37 @@ def run_attacker_probe(contexts_iter, env, out, samples=4, role="ATTACKER", max_
     return summary
 
 
-def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperature=1.0):
+def _prefetch_state(env, row, full, role, samples, temperature, workers):
+    """--workers>1：同一状态的samples条样本先并发生成、再并发打分，只为把结果写进API缓存。
+    随后的逐样本循环用完全相同的请求（同一prompt、nonce、温度）命中缓存，所以记录与workers=1时相同；
+    这里的出错一律忽略，由逐样本循环按原逻辑重新调用并记unknown。返回各样本真实的生成/打分耗时。"""
+    gen_seconds, score_seconds = {}, {}
+
+    def generate(i):
+        nonce = "probe:" + digest([row["id"], i, env.policy(role).tag])
+        started = perf_counter()
+        try:
+            raw = env.policy(role).complete(row["prompt"], nonce, temperature=temperature)
+        except Exception:  # noqa: BLE001 —— 逐样本循环会重新调用并按原逻辑处理
+            return None
+        gen_seconds[i] = perf_counter() - started
+        return raw
+
+    raws = [raw for raw in pmap(generate, range(samples), workers=workers) if raw is not None]
+
+    def score(raw):
+        started = perf_counter()
+        try:
+            env.builder_score(full, row["state"], raw)
+        except Exception:  # noqa: BLE001
+            return
+        score_seconds[_json_text(raw)] = perf_counter() - started
+
+    pmap(score, list(dict.fromkeys(raws)), workers=workers)
+    return gen_seconds, score_seconds
+
+
+def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperature=1.0, workers=1):
     """运行 Builder probe，并保存逐样本、可审计的评估记录。
 
     采样温度默认 1.0，对齐 VERL GRPO 的 rollout.temperature，否则诊断比训练保守。
@@ -334,6 +364,8 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
             score_cache = OrderedDict()
 
             with env.cached_answers():
+                prefetched_gen, prefetched_score = (
+                    _prefetch_state(env, row, full, role, samples, temperature, workers) if workers > 1 else ({}, {}))
                 for i in range(samples):
                     # 禁用逐字回退；所有结果完全来自该模型本次提议。
                     nonce = "probe:" + digest([row["id"], i, env.policy(role).tag])
@@ -345,7 +377,7 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
                         raw = env.policy(role).complete(
                             row["prompt"], nonce, temperature=temperature
                         )
-                        generation_seconds = perf_counter() - started
+                        generation_seconds = prefetched_gen.get(i, perf_counter() - started)
                         phase, started = "scoring", perf_counter()
                         raw_text = _json_text(raw)
                         raw_hash = hashlib.sha256(
@@ -390,7 +422,10 @@ def run_probe(records, env, out, samples=8, role="BUILDER", limit=None, temperat
                             score_cache[raw_text] = deepcopy(result)
                             if len(score_cache) > 64:
                                 score_cache.popitem(last=False)
+                        # 并发预取时记录真实打分耗时；重复样本命中score_cache，仍按≈0计
                         scoring_seconds = perf_counter() - started
+                        if not score_cache_hit:
+                            scoring_seconds = prefetched_score.get(raw_text, scoring_seconds)
                         consecutive_errors = 0
                     except Unknown as exc:
                         # 瞬时/服务端失败记unknown（不计入reward统计）；连续失败到上限才中止。
