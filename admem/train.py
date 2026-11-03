@@ -89,7 +89,7 @@ def main(argv=None):
     if not 0 < a.clip < 1 or a.beta < 0 or a.lr <= 0:
         p.error("Invalid optimization parameters")
     cfg = Config.load(a.config)
-    v2_reward = (cfg.builder_reward if a.role == "builder" else cfg.attacker_reward) == "v2"
+    v2_reward = (cfg.builder_reward if a.role == "builder" else cfg.attacker_reward) in {"v2", "v3"}
     if a.max_prompt_tokens is None:
         a.max_prompt_tokens = (cfg.builder_input_tokens if a.role == "builder" else cfg.attacker_input_tokens) + 256
     if a.std_floor is None:

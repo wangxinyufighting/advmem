@@ -297,6 +297,8 @@ class Config:
     attacker_repair_credit: float = 0.5   # v2：gate修补过E的题只拿这个比例
     builder_reward: str = "v1"
     builder_coverage_weight: float = 0.5  # v2：x里新事实被存下的比例（不依赖题库）
+    # v3：窗口里有新事实却没存下（包括NOOP）按比例扣分；NOOP不再是“零风险”的选择。
+    builder_omission_weight: float = 0.5
     builder_redundancy_cap: int = 10      # v2：冗余罚分最多计这么多个操作
     builder_prompt: str = "v1"            # v2：精简Builder提示词+卡片日期+按相关性排序的目录
     # 题目有效性需包含“DEFENDER仅凭E的原文能答对”（类比Code-A1用参考解校验测试）：v2 attacker奖励把
@@ -352,11 +354,12 @@ class Config:
         if (min(c.neighbor_session_cap, c.fact_queries, c.fact_query_k, c.screen_k, c.types_per_pack) < 1
                 or c.neighbors < 0 or not 0 <= c.pack_neighbor_reserve < 1):
             raise ValueError("Invalid pack/neighbor/type settings")
-        if (c.attacker_reward not in {"v1", "v2"} or c.builder_reward not in {"v1", "v2"}
+        if (c.attacker_reward not in {"v1", "v2"} or c.builder_reward not in {"v1", "v2", "v3"}
                 or c.builder_prompt not in {"v1", "v2"}):
-            raise ValueError("attacker_reward/builder_reward/builder_prompt must be v1 or v2")
+            raise ValueError("attacker_reward/builder_prompt must be v1 or v2; builder_reward v1, v2 or v3")
         if (not 0 <= c.attacker_reject_penalty <= 1 or not 0 <= c.attacker_repair_credit <= 1
-                or not 0 <= c.builder_coverage_weight <= 2 or c.builder_redundancy_cap < 1):
+                or not 0 <= c.builder_coverage_weight <= 2 or c.builder_redundancy_cap < 1
+                or not 0 <= c.builder_omission_weight <= 2):
             raise ValueError("Invalid v2 reward settings")
         if c.type_weights is not None:
             from .audit_prompts import TYPES  # 局部导入，避免循环依赖

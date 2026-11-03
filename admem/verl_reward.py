@@ -41,7 +41,7 @@ def _result(role, score, detail):
     values = {key: 0.0 for key in _EXTRA_FIELDS[role]}
     if role == "builder":
         values.update({"component_" + k: 0.0 for k in ("gain", "loss", "faith", "retention", "coverage",
-                                                         "compression", "growth", "redundancy")})
+                                                         "compression", "growth", "redundancy", "omission")})
     values.update(_details(role, detail or {}))
     return {"score": float(score), **values}
 

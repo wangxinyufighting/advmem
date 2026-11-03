@@ -14,7 +14,7 @@ from .audit_prompts import (EVIDENCE_AUDIT_SYSTEM, SINGLE_SESSION, TYPES, GATE_O
                             GATE_SUPPORT_SYSTEM, personal_score, plan_item_type)
 from . import rewards as rv2
 from .store import apply, augment, entry_date, question_key, raw_chunks, text_size
-from .edit_checks import assess_edits, source_coverage
+from .edit_checks import assess_edits, source_coverage, source_coverage_v3
 from .store import round_dates
 
 
@@ -382,7 +382,7 @@ class Environment:
         正向答题奖励要求所有写入忠实；压缩还要求没有已答对题目退化，
         并通过被编辑旧条目的事实保留检查。合法 NOOP 的奖励恒为 0。
         """
-        if self.cfg.builder_reward == "v2":
+        if self.cfg.builder_reward in {"v2", "v3"}:
             return self._builder_score_v2(full, state, completion)
         cfg = self.cfg
         # 每项负奖励有界；非法输出严格低于合法输出的理论下界，避免
@@ -486,8 +486,16 @@ class Environment:
         - 新增覆盖率项：x里Builder可见范围内尚未存过的事实被存下的比例（不依赖题库，需忠实）；
         - 冗余只对照Builder看得到的条目，且最多计builder_redundancy_cap个；
         - 没有测试题但有x的stream/patch状态也能评分（只有覆盖率/忠实/保留/长度/冗余项）。
-        合法NOOP仍为0；非法输出低于合法下界（rewards.builder_invalid_reward_v2）。"""
+        合法NOOP仍为0；非法输出低于合法下界（rewards.builder_invalid_reward_v2）。
+
+        v3（builder_reward="v3"）只改三处计分，测试题、状态和其余各项与v2相同：
+        - gain按忠实条目比例给分（gain×faith_ratio），不再因为一条不忠实就清零；
+        - 覆盖率只把“由忠实条目（或原有条目）见证”的新事实算作存下，同样不再全有或全无；
+        - 漏存扣分：窗口有n个新事实、忠实地存下k个，扣omission_weight×(1−k/n)。NOOP也计算，
+          所以窗口里有该存的新事实时NOOP为负——不写不再是零风险的选择；
+        - faith权重由配置给出（rl_hidden_4b_v3.json里降到1.0）；保留/冗余检查用限30条的事实清单。"""
         cfg = self.cfg
+        v3 = cfg.builder_reward == "v3"
         invalid_reward = rv2.builder_invalid_reward_v2(cfg)
         try:
             action = parse(completion)
@@ -498,7 +506,7 @@ class Environment:
                    if cfg.builder_prompt == "v2" else {}))
         except InvalidAction as exc:
             return {"reward": invalid_reward, "effective_reward": invalid_reward,
-                    "legal": False, "edit_quality_pass": None, "reward_version": "v2",
+                    "legal": False, "edit_quality_pass": None, "reward_version": cfg.builder_reward,
                     "legal_reason": str(exc), "reason": str(exc)}
         tests = state["tests"]
         coverage_on = cfg.builder_coverage_weight > 0 and bool(state["x"]) and state["mode"] in {"stream", "patch"}
@@ -532,10 +540,20 @@ class Environment:
             lambda: self.faith_scores(full, changed),
             lambda: pmap(test_one, tests),
             lambda: assess_edits(self, full, state, action, proposed, changed, scope_ids=scope),
-            lambda: (source_coverage(self, state, proposed, changed) if coverage_on and not noop
+            lambda: (source_coverage_v3(self, state, proposed, changed) if v3 and coverage_on
+                     else source_coverage(self, state, proposed, changed) if coverage_on and not noop
                      else {"facts": None, "new": None, "stored": 0, "ratio": None}))
         faithful = all(faith_scores)
         faith_ratio = sum(faith_scores) / len(faith_scores) if faith_scores else 1.0
+        if v3 and coverage_on:
+            # 只有忠实写入的条目、或本来就在M_old里的条目，才算把新事实存下了。
+            changed_ids = {e["id"] for e in changed}
+            trusted = ({e["id"] for e, ok in zip(changed, faith_scores) if ok}
+                       | {e["id"] for e in proposed if e["id"] in set(state["old_ids"]) - changed_ids})
+            stored = sum(bool(set(ids) & trusted) for ids in coverage["witnesses"].values())
+            coverage = {"facts": coverage["facts"], "new": coverage["new"], "stored": stored,
+                        "stored_any": len(coverage["witnesses"]),
+                        "ratio": stored / coverage["new"] if coverage["new"] else None}
         before_scores = [r[0] for r in results]
         after_scores = [r[1] for r in results]
         deltas = [r[2] for r in results]
@@ -552,21 +570,26 @@ class Environment:
         compression_eligible = faithful and loss == 0 and checks["retention_pass"]
         safe_compression = compression_eligible and shrink_ratio > 0
         redundant = min(len(checks["redundant_ops"]), cfg.builder_redundancy_cap)
+        has_new = coverage["ratio"] is not None
         components = {
-            "gain": cfg.builder_gain_weight * gain if faithful else 0.0,
+            "gain": (cfg.builder_gain_weight * gain * faith_ratio if v3
+                     else cfg.builder_gain_weight * gain if faithful else 0.0),
             "loss": -cfg.builder_loss_weight * loss,
             "faith": -cfg.builder_faith_weight * (1.0 - faith_ratio),
             "retention": -cfg.builder_retention_weight * checks["information_loss"],
             "coverage": (cfg.builder_coverage_weight * coverage["ratio"]
-                         if faithful and coverage["ratio"] is not None else 0.0),
+                         if has_new and (v3 or faithful) else 0.0),
             "compression": cfg.size_weight * shrink_ratio if safe_compression else 0.0,
             "growth": -cfg.size_weight * growth_ratio,
             "redundancy": -cfg.builder_redundancy_weight * redundant,
         }
+        if v3:
+            components["omission"] = -cfg.builder_omission_weight * (1.0 - coverage["ratio"]) if has_new else 0.0
         reward = sum(components.values())
         quality_ok = faithful and loss == 0 and checks["retention_pass"] and not checks["redundant_ops"]
         return {"reward": reward, "effective_reward": reward, "reward_components": components,
-                "reward_version": "v2", "edit_quality_pass": quality_ok, "legal": True, "faith": faithful,
+                "reward_version": cfg.builder_reward, "edit_quality_pass": quality_ok, "legal": True,
+                "faith": faithful,
                 "faith_reason": ("No written entry" if not faith_scores else "All written entries supported"
                                  if faithful else f"{len(faith_scores) - sum(faith_scores)} of "
                                  f"{len(faith_scores)} written entries unsupported"),

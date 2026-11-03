@@ -124,7 +124,7 @@ def stream_tests(bank, x, visited, old, env):
     complete = visible & visited  # 调用前visited已加入本窗口读完的round
     plain = [q for q in bank or [] if set(q["E"]) <= visited and set(q["E"]) <= visible | old]
     tests = sorted(plain, key=lambda q: bool(set(q["E"]) & visible), reverse=True)
-    if env.cfg.builder_reward == "v2":
+    if env.cfg.builder_reward in {"v2", "v3"}:
         keys = {question_key(q) for q in plain}
         ahead = [{**q, "context_rids": sorted(set(q["E"]) - visible)} for q in bank or []
                  if question_key(q) not in keys and set(q["E"]) & complete]
@@ -176,7 +176,7 @@ def builder_state(full, full_path, context, memory, x, mode, tests, env, old_ids
              "full_path": str(Path(full_path).resolve()), "full_hash": full.fingerprint,
              "hint_mode": env.cfg.hint_mode, "environment_fingerprint": env.cfg.fingerprint(), "M": deepcopy(memory), "old_ids": visible,
              "x": deepcopy(x), "entry_limit": cap, "tests": tests, "prompt": prompt}
-    if env.cfg.builder_reward == "v2":
+    if env.cfg.builder_reward in {"v2", "v3"}:
         # 冗余只对照Builder看得到的条目（M_old全文+目录摘要）；有x时没有测试题也能按覆盖率评分。
         payload = json.loads(prompt[-1]["content"])
         state["catalog_ids"] = [item["id"] for item in payload.get("stored_catalog", [])]

@@ -61,10 +61,17 @@ def novelty_weight_v2(usage, evidence):
     return 1.0 / (1.0 + max(usage.get(rid, 0) for rid in evidence))
 
 
+def builder_v2_family(cfg):
+    """v2与v3共用v2的状态、测试题与评分流程（v3只改了几项的计分方式）。"""
+    return cfg.builder_reward in {"v2", "v3"}
+
+
 def builder_invalid_reward_v2(cfg):
-    """v2合法奖励的下界：loss、faith、retention各≤1×权重，growth≤size_weight，冗余≤cap个操作。"""
+    """v2/v3合法奖励的下界：loss、faith、retention各≤1×权重，growth≤size_weight，冗余≤cap个操作；
+    v3的覆盖项最低为−omission_weight。非法输出再低1。"""
+    omission = cfg.builder_omission_weight if cfg.builder_reward == "v3" else 0.0
     return -(cfg.builder_loss_weight + cfg.builder_faith_weight + cfg.builder_retention_weight
-             + cfg.size_weight + cfg.builder_redundancy_weight * cfg.builder_redundancy_cap + 1.0)
+             + cfg.size_weight + cfg.builder_redundancy_weight * cfg.builder_redundancy_cap + omission + 1.0)
 
 
 def flip_delta(before_k, after_k, before_2k=None, after_2k=None):
@@ -112,7 +119,7 @@ def invalid_threshold(cfg, role):
     v2 attacker：非法 = −(penalty+0.1)，合法下界 = −penalty，阈值取中点。
     v1 attacker：非法(−0.1)与合法下界(−0.1)重合，无法区分，返回None（不整形）。"""
     if role == "builder":
-        if cfg.builder_reward == "v2":
+        if builder_v2_family(cfg):
             return builder_invalid_reward_v2(cfg) + 0.5
         invalid = -(cfg.builder_loss_weight + cfg.builder_faith_weight + cfg.builder_retention_weight
                     + cfg.size_weight + cfg.builder_redundancy_weight * cfg.max_ops + 1.0)

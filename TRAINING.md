@@ -280,6 +280,18 @@ states have a mean below 0 (= below NOOP — RL will drift toward writing nothin
 tests are answerable at all (`raw(E) only` accuracy). If the ceiling is low, fix the reader/judge or
 the bank before spending GPU time.
 
+**Builder reward v3** (`configs/rl_hidden_4b_v3.json`). With v2, one unfaithful entry zeroes the gain and
+coverage terms and costs `2 × unfaithful share`, while NOOP scores exactly 0 even when the window has
+facts worth storing. For a start model whose entries are ~70% faithful, most writes then score below
+NOOP and GRPO drifts toward writing nothing. v3 keeps the v2 states and tests and changes only the
+scoring: gain is scaled by the faithful share, coverage counts only facts stored by faithful (or
+existing) entries, an omission term charges `builder_omission_weight × (1 − stored share)` to every legal
+output including NOOP, the faith weight is 1.0, and the retention/novelty fact inventories are capped
+at 30 facts with short reasons (long inventories were truncated and re-generated, the main cause of slow
+scoring and `JUDGE JSON invalid` samples). Expected order within a state: fully faithful write >
+partly faithful write > NOOP ≈ unfaithful write > invalid output. In the probe, check that most
+states' mean reward is above the NOOP sample's. v3 changes the reward, so collect states with it.
+
 **Check the Builder itself.** If most windows fall back to raw text, the memory is mostly the raw
 history and QA measures retrieval over raw chunks, not the Builder. Diagnose a build run:
 

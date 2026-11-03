@@ -191,6 +191,14 @@ IDENTIFIERS AND LIMITS
 OUTPUT
 Exactly one JSON object {"ops": [...]} with no prose, markdown or thinking. Fields per operation:
 ADD: op, text, prov; UPDATE: op, id, text, prov; MERGE: op, ids, text, prov; DELETE: op, id.
+ADD has no id field: the host assigns ids to new entries. To change an existing entry, use UPDATE
+with its id from editable_entry_ids; ids that appear only in stored_catalog cannot be edited.
+Shapes (replace every <...>; never copy the placeholders):
+{"ops": [
+  {"op": "ADD", "text": "<new fact>", "prov": ["<rid from allowed_source_rids>"]},
+  {"op": "UPDATE", "id": "<id from editable_entry_ids>", "text": "<full new text>", "prov": []},
+  {"op": "MERGE", "ids": ["<editable id>", "<another editable id>"], "text": "<combined text>", "prov": []},
+  {"op": "DELETE", "id": "<editable id>"}]}
 Write text in English and keep names and quoted strings verbatim.
 """
 
