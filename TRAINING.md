@@ -291,6 +291,10 @@ at 30 facts with short reasons (long inventories were truncated and re-generated
 scoring and `JUDGE JSON invalid` samples). Expected order within a state: fully faithful write >
 partly faithful write > NOOP ≈ unfaithful write > invalid output. In the probe, check that most
 states' mean reward is above the NOOP sample's. v3 changes the reward, so collect states with it.
+The v3 config also limits cards to `entry_tokens: 200` (one entity or event per card), and the Builder
+prompt asks for short cards, UPDATEs that copy every still-valid old fact, and MERGEs only within one
+entity or event. In the first probe with 600-token cards, edits of old entries lost a third of their
+facts and scored far below NOOP, while add-only writes already beat it.
 
 **Check the Builder itself.** If most windows fall back to raw text, the memory is mostly the raw
 history and QA measures retrieval over raw chunks, not the Builder. Diagnose a build run:

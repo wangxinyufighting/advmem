@@ -109,12 +109,15 @@ def test_v3_inventory_is_capped(env):
 
 def test_builder_prompt_states_that_add_has_no_id():
     assert "ADD has no id field" in prompts.BUILDER_V2
+    assert "Never merge different topics" in prompts.BUILDER_V2
+    assert "copy every still-valid fact" in prompts.BUILDER_V2 and "one entity or event per card" in prompts.BUILDER_V2
     assert '{"op": "ADD", "text": "<new fact>", "prov": ["<rid from allowed_source_rids>"]}' in prompts.BUILDER_V2
 
 
 def test_v3_config_validates():
     cfg = Config.load(str(__import__("pathlib").Path(__file__).resolve().parents[2] / "configs" / "rl_hidden_4b_v3.json"))
     assert cfg.builder_reward == "v3" and cfg.builder_faith_weight == 1.0 and cfg.salvage
+    assert cfg.entry_tokens == 200  # 短卡：一张卡一个实体/事件
     with pytest.raises(ValueError):
         Config(builder_reward="v4").validate()
     with pytest.raises(ValueError):

@@ -165,14 +165,20 @@ TIME
   when useful. Otherwise never treat the conversation date as the event date.
 
 OPERATIONS
-- ADD: an entity, event or fact not yet represented in M_old or stored_catalog.
-- UPDATE: same entity or event. The new text keeps still-valid old details and adds the new ones. A
-  later mention is not automatically a correction; keep earlier states that remain informative
-  ("moved from Boston to Denver in March 2023").
+- Keep cards short: one entity or event per card, well within max_entry_tokens. Split a long
+  assistant answer into several cards (one per recommendation group or list range); never pack a whole
+  conversation into one card. A new topic always gets its own ADD.
+- ADD: an entity, event or fact not yet represented in M_old or stored_catalog. When unsure whether a
+  detail belongs to an existing entry, ADD a new entry rather than editing an old one.
+- UPDATE: the same entity or event only. UPDATE replaces the whole text, so copy every still-valid fact
+  of the old entry into the new text and add the new details; a fact you do not copy is lost. Never use
+  UPDATE to attach an unrelated topic. A later mention is not automatically a correction; keep earlier
+  states that remain informative ("moved from Boston to Denver in March 2023").
 - DELETE: an exact duplicate, or an entry explicitly contradicted by a correction (store the
   corrected fact with UPDATE or ADD).
-- MERGE: two or more entries about the same entity or topic, combined into one shorter card that
-  keeps every fact.
+- MERGE: only entries about the same entity or event, combined into one shorter card that keeps every
+  fact. Never merge different topics or conversations, and do not MERGE when the combined text would
+  not fit within max_entry_tokens.
 - NOOP is {"ops": []}: x adds nothing worth storing.
 - Modes: stream and patch may use every operation; in patch, restore details from x that M_old lost
   or never stored. refine must not ADD: it only shortens memory (DELETE duplicates, MERGE related
