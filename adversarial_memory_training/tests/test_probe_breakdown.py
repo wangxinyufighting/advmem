@@ -48,3 +48,23 @@ def test_ceiling_separates_builder_misses_from_unanswerable_questions(setup_case
     write_rows(states, [{"id": "s0", "state": state}])
     result = tool.ceiling(env, states, {"s0"})
     assert result["accuracy"] == {"before": 0.0, "M+raw(E)": 1.0, "raw(E) only": 1.0}
+
+
+def test_v3_noop_baseline_uses_the_omission_penalty_not_zero():
+    add = {"op": "ADD", "text": "Bought bike", "prov": ["s2:r1"]}
+    upd = {"op": "UPDATE", "id": "m1", "text": "Rewritten card", "prov": []}
+
+    def v3(state, reward, ops, new=3, noop=False):
+        s = sample(state, reward, ops, [True], [False], [False], noop=noop)
+        s.update(reward_version="v3", coverage={"facts": 3, "new": new, "stored": 0, "ratio": 0.0})
+        return s
+
+    samples = [v3("a", -0.3, [add]), v3("a", -1.5, [upd]),        # NOOP推算为-0.5：均值-0.9低于它
+               v3("b", -0.2, [add]), v3("b", -0.5, [], noop=True),  # 有NOOP样本：用它的实际奖励
+               v3("c", -0.1, [add], new=0)]                        # 窗口没有新事实：NOOP为0
+    report = tool.breakdown(samples, omission_weight=0.5)["noop_comparison"]
+    assert report["states_mean_below_noop"] == 2  # a（-0.9<-0.5）和c（-0.1<0）；b的均值-0.35高于-0.5
+    assert report["noop_reward_mean"] == round((-0.5 - 0.5 + 0.0) / 3, 3)
+    kinds = report["by_sample_kind"]
+    assert kinds["add_only"]["samples"] == 3 and kinds["add_only"]["above_noop_rate"] == round(2 / 3, 3)
+    assert kinds["touches_old_entries"]["mean_reward_minus_noop"] == -1.0

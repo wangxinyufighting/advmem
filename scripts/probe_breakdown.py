@@ -54,7 +54,25 @@ def written_entries(sample):
             [op for op in ops if op.get("op") in {"ADD", "MERGE"}])
 
 
-def breakdown(samples, examples=5):
+def sample_kind(sample):
+    """只做ADD，还是改动了旧条目（UPDATE/MERGE/DELETE）。"""
+    ops = ops_of(sample)
+    return "touches_old_entries" if any(op.get("op") in {"UPDATE", "MERGE", "DELETE"} for op in ops) else "add_only"
+
+
+def noop_baseline(group, omission_weight=0.5):
+    """同一状态下NOOP的奖励：有NOOP样本就用它们的实际奖励；否则v3按“窗口有无新事实”推算，v1/v2为0。"""
+    noops = [s["reward"] for s in group if s.get("noop")]
+    if noops:
+        return statistics.mean(noops)
+    if any(s.get("reward_version") == "v3" for s in group):
+        news = [(s.get("coverage") or {}).get("new") for s in group]
+        if any(isinstance(n, (int, float)) and n > 0 for n in news):
+            return -omission_weight
+    return 0.0
+
+
+def breakdown(samples, examples=5, omission_weight=0.5):
     ok = [s for s in samples if s.get("status") == "ok" and s.get("legal")]
     groups = defaultdict(list)
     for s in ok:
@@ -78,12 +96,27 @@ def breakdown(samples, examples=5):
     report["reward"] = {"mean": r3(mean([s["reward"] for s in ok])),
                         "within_state_std": r3(mean(reward_within)), "components": comp}
 
-    # 3. 与NOOP（奖励恒为0）比较：组均值<0时，RL会被推向“什么都不写”
-    state_means = [statistics.mean(s["reward"] for s in g) for g in groups.values()]
+    # 3. 与该状态下NOOP的奖励比较：组均值低于它时，RL会被推向“什么都不写”。
+    #    v1/v2：NOOP恒为0。v3：窗口有新事实时NOOP要扣漏存分（−omission_weight），
+    #    取该状态里NOOP样本的实际奖励；没有NOOP样本时由覆盖率记录推算。
+    baselines = {sid: noop_baseline(g, omission_weight) for sid, g in groups.items()}
+    state_means = {sid: statistics.mean(s["reward"] for s in g) for sid, g in groups.items()}
+    margins = {sid: state_means[sid] - baselines[sid] for sid in groups}
+
+    def kind_margin(kind):
+        values = [s["reward"] - baselines[s["state_id"]] for s in ok
+                  if not s.get("noop") and sample_kind(s) == kind]
+        return {"samples": len(values), "mean_reward_minus_noop": r3(mean(values)),
+                "above_noop_rate": r3(mean([float(v > 0) for v in values]))}
+
     report["noop_comparison"] = {
-        "states_mean_below_noop": sum(m < 0 for m in state_means),
-        "states": len(state_means),
-        "samples_above_noop_rate": r3(mean([float(s["reward"] > 0) for s in ok])),
+        "noop_reward_mean": r3(mean(list(baselines.values()))),
+        "states_mean_below_noop": sum(m < 0 for m in margins.values()),
+        "states": len(groups),
+        "mean_state_margin_over_noop": r3(mean(list(margins.values()))),
+        "samples_above_noop_rate": r3(mean([float(s["reward"] > baselines[s["state_id"]]) for s in ok
+                                            if not s.get("noop")])),
+        "by_sample_kind": {kind: kind_margin(kind) for kind in ("add_only", "touches_old_entries")},
         "noop_samples": sum(bool(s.get("noop")) for s in ok)}
 
     # 4. 测试题：编辑前后可答性
@@ -181,7 +214,11 @@ def main(argv=None):
     p.add_argument("--ceiling-states", type=int, help="ceiling最多检查几个状态")
     a = p.parse_args(argv)
     samples = rows(a.samples)
-    report = breakdown(samples, a.examples)
+    omission = 0.5
+    if a.config:
+        from admem.common import Config
+        omission = Config.load(a.config).builder_omission_weight
+    report = breakdown(samples, a.examples, omission)
     if a.ceiling:
         if not a.config or not a.states:
             p.error("--ceiling needs --config and --states")
