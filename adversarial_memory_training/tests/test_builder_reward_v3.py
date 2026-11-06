@@ -1,4 +1,5 @@
-"""Builder奖励v3：忠实条目按比例给分、漏存扣分（NOOP也扣）、faith权重可降、事实清单限30条；Builder提示词的ADD/id契约。"""
+"""Builder奖励v3：忠实条目按比例给分、漏存扣分（NOOP也扣）、faith权重可降、事实清单限条数；
+按操作的无损压缩奖励与软长度惩罚；Builder提示词的ADD/id契约。"""
 import json
 
 import pytest
@@ -103,22 +104,122 @@ def test_v3_inventory_is_capped(env):
     edit_checks._inventory(env, full, entry, [], "retention")
     env.cfg.builder_reward = "v3"
     edit_checks._inventory(env, full, entry, [], "retention")
-    assert seen == [edit_checks.INVENTORY, edit_checks.INVENTORY_V3]
+    edit_checks._inventory(env, full, entry, [], "novelty")
+    assert seen == [edit_checks.INVENTORY, edit_checks.INVENTORY_V3_RETENTION, edit_checks.INVENTORY_V3]
     assert "at most 30 facts" in edit_checks.INVENTORY_V3 and "at most 30" not in edit_checks.INVENTORY
+    assert "at most 60 facts" in edit_checks.INVENTORY_V3_RETENTION  # 压缩只在“全保留”时给分，保留检查要查得全
 
 
 def test_builder_prompt_states_that_add_has_no_id():
     assert "ADD has no id field" in prompts.BUILDER_V2
     assert "Never merge different topics" in prompts.BUILDER_V2
-    assert "copy every still-valid fact" in prompts.BUILDER_V2 and "one entity or event per card" in prompts.BUILDER_V2
+    assert "copy every still-valid fact" in prompts.BUILDER_V2 and "One entity or event per card" in prompts.BUILDER_V2
     assert '{"op": "ADD", "text": "<new fact>", "prov": ["<rid from allowed_source_rids>"]}' in prompts.BUILDER_V2
 
 
 def test_v3_config_validates():
     cfg = Config.load(str(__import__("pathlib").Path(__file__).resolve().parents[2] / "configs" / "rl_hidden_4b_v3.json"))
     assert cfg.builder_reward == "v3" and cfg.builder_faith_weight == 1.0 and cfg.salvage
-    assert cfg.entry_tokens == 200  # 短卡：一张卡一个实体/事件
+    # 软长度：不设设计上限，entry_tokens只是可评分的技术上限；超出target按比例扣分
+    assert cfg.entry_tokens == 4000 and cfg.entry_target_tokens == 200
+    assert cfg.builder_length_weight == 1.0 and cfg.builder_compression_weight == 1.0
     with pytest.raises(ValueError):
         Config(builder_reward="v4").validate()
     with pytest.raises(ValueError):
         Config(builder_reward="v3", builder_omission_weight=3.0).validate()
+    with pytest.raises(ValueError):
+        Config(builder_reward="v3", entry_target_tokens=-1).validate()
+    with pytest.raises(ValueError):
+        Config(builder_reward="v3", builder_length_weight=-0.1).validate()
+
+
+# ---------- 按操作的无损压缩 + 软长度 ----------
+OLD = [{"id": "m0", "text": "The user adopted a dog yesterday. The dog is a beagle.", "prov": ["s1:r1"], "kind": "card"},
+       {"id": "m1", "text": "The user's beagle, adopted yesterday, is named Biscuit.", "prov": ["s1:r1"], "kind": "card"}]
+SHORT = "User adopted beagle Biscuit yesterday."
+
+
+def edit_world(env, monkeypatch, retained=True, target=0):
+    world(env, monkeypatch, "v3")
+    env.cfg.entry_target_tokens = target
+    monkeypatch.setattr(envmod, "assess_edits", lambda env_, full, state, action, proposed, changed, scope_ids=None: {
+        "retention_pass": retained, "information_loss": 0.0 if retained else 0.5, "redundant_ops": [],
+        "redundancy_ratio": 0.0,
+        "retention_checks": [{"entry_id": p, "retained": retained} for op in action["ops"]
+                             for p in ([op["id"]] if op["op"] == "UPDATE" else op.get("ids", []))]})
+
+
+def edit_score(env, ops_):
+    full = builder_case()
+    return env.builder_score(full, bstate(full, TESTS, memory=[dict(e) for e in OLD]), json.dumps({"ops": ops_}))
+
+
+def merge(text):
+    return [{"op": "MERGE", "ids": ["m0", "m1"], "text": text, "prov": ["s1:r1"]}]
+
+
+def test_lossless_shorter_merge_is_rewarded_by_tokens_saved(env, monkeypatch):
+    edit_world(env, monkeypatch)
+    result = edit_score(env, merge(SHORT))
+    parents = sum(len(e["text"]) for e in OLD)  # 测试计数器按字符数计
+    assert result["edit_parent_tokens"] == parents
+    assert result["edit_saving_ratio"] == pytest.approx((parents - len(SHORT)) / parents)
+    assert result["reward_components"]["compression"] == pytest.approx(result["edit_saving_ratio"])
+    concat = edit_score(env, merge(OLD[0]["text"] + " " + OLD[1]["text"]))
+    assert concat["reward_components"]["compression"] == 0.0  # 原样拼接：没有节省
+    assert result["reward"] > concat["reward"]
+
+
+def test_lossy_or_unfaithful_rewrite_earns_no_compression(env, monkeypatch):
+    edit_world(env, monkeypatch, retained=False)
+    lossy = edit_score(env, merge("User has a beagle."))
+    assert lossy["reward_components"]["compression"] == 0.0 and lossy["edit_saving_ratio"] == 0.0
+    edit_world(env, monkeypatch)
+    bad = edit_score(env, [{"op": "UPDATE", "id": "m1", "text": "UNSUPPORTED: beagle Biscuit.", "prov": ["s1:r1"]}])
+    assert bad["reward_components"]["compression"] == 0.0
+    good = edit_score(env, [{"op": "UPDATE", "id": "m1", "text": "Beagle Biscuit, adopted yesterday.", "prov": ["s1:r1"]}])
+    assert good["reward_components"]["compression"] > 0  # 单条UPDATE的无损缩写也计分
+
+
+def test_soft_length_penalty_is_proportional_to_excess_tokens(env, monkeypatch):
+    long_text = "Biscuit " * 30  # 240字符
+    edit_world(env, monkeypatch, target=0)
+    off = score(env, ops(long_text))
+    assert "length" not in off["reward_components"]
+    edit_world(env, monkeypatch, target=120)
+    half = score(env, ops(long_text))
+    assert half["length_excess"] == pytest.approx((len(long_text) - 120) / len(long_text))
+    assert half["reward_components"]["length"] == pytest.approx(-env.cfg.builder_length_weight * half["length_excess"])
+    short = score(env, ops("Biscuit is a beagle."))
+    assert short["reward_components"]["length"] == 0.0
+    # 没有硬上限：远超target仍是合法输出，只是扣分更多
+    edit_world(env, monkeypatch, target=24)
+    longer = score(env, ops(long_text))
+    assert longer["legal"] and longer["reward_components"]["length"] < half["reward_components"]["length"]
+
+
+def test_invalid_output_stays_below_legal_rewards_with_length_term(env, monkeypatch):
+    edit_world(env, monkeypatch, target=24)
+    cfg = env.cfg
+    worst_legal = -(cfg.builder_loss_weight + cfg.builder_faith_weight + cfg.builder_retention_weight
+                    + cfg.size_weight + cfg.builder_redundancy_weight * cfg.builder_redundancy_cap
+                    + cfg.builder_omission_weight + cfg.builder_length_weight)
+    invalid = score(env, '{"ops": [{"op": "ADD", "id": "m9", "text": "x", "prov": ["s2:r1"]}]}')
+    assert invalid["reward"] == pytest.approx(worst_legal - 1.0)
+
+
+def test_builder_prompt_carries_target_entry_tokens(env):
+    full = builder_case()
+    state = bstate(full, TESTS)
+
+    def payload_text():
+        prompt, _, _ = prompts.builder_prompt(full, state["M"], state["old_ids"], state["x"], "stream", None,
+                                              env.cfg, env.counter)
+        return json.dumps(prompt, ensure_ascii=False)
+
+    env.cfg.entry_target_tokens = 0
+    assert "target_entry_tokens" not in payload_text()
+    env.cfg.entry_target_tokens = 200
+    assert 'target_entry_tokens\\": 200' in payload_text()
+    assert "token beyond it is penalized" in prompts.BUILDER_V2
+    assert "a dropped fact costs more than any saving" in prompts.BUILDER_V2

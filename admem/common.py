@@ -299,6 +299,14 @@ class Config:
     builder_coverage_weight: float = 0.5  # v2：x里新事实被存下的比例（不依赖题库）
     # v3：窗口里有新事实却没存下（包括NOOP）按比例扣分；NOOP不再是“零风险”的选择。
     builder_omission_weight: float = 0.5
+    # v3软长度：entry_target_tokens>0时不再用设计上的长度上限，写入的条目超出目标长度的部分按比例扣分
+    # （−builder_length_weight×超出token占写入token的比例）。entry_tokens此时只是“还能被judge/reader
+    # 完整检查”的技术上限（rl_hidden_4b_v3.json里为4000），超过它的输出无法评分，按非法处理。
+    entry_target_tokens: int = 0
+    builder_length_weight: float = 1.0
+    # v3按操作的无损压缩：每个UPDATE/MERGE，若结果忠实且旧条目的事实全部保留，按节省的token计分
+    # （builder_compression_weight×节省token/被改写旧条目的总token）；有损或不忠实的改写不得分。
+    builder_compression_weight: float = 1.0
     builder_redundancy_cap: int = 10      # v2：冗余罚分最多计这么多个操作
     builder_prompt: str = "v1"            # v2：精简Builder提示词+卡片日期+按相关性排序的目录
     # 题目有效性需包含“DEFENDER仅凭E的原文能答对”（类比Code-A1用参考解校验测试）：v2 attacker奖励把
@@ -359,7 +367,8 @@ class Config:
             raise ValueError("attacker_reward/builder_prompt must be v1 or v2; builder_reward v1, v2 or v3")
         if (not 0 <= c.attacker_reject_penalty <= 1 or not 0 <= c.attacker_repair_credit <= 1
                 or not 0 <= c.builder_coverage_weight <= 2 or c.builder_redundancy_cap < 1
-                or not 0 <= c.builder_omission_weight <= 2):
+                or not 0 <= c.builder_omission_weight <= 2 or c.entry_target_tokens < 0
+                or not 0 <= c.builder_length_weight <= 3 or not 0 <= c.builder_compression_weight <= 3):
             raise ValueError("Invalid v2 reward settings")
         if c.type_weights is not None:
             from .audit_prompts import TYPES  # 局部导入，避免循环依赖

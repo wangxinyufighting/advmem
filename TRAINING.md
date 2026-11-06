@@ -291,10 +291,22 @@ at 30 facts with short reasons (long inventories were truncated and re-generated
 scoring and `JUDGE JSON invalid` samples). Expected order within a state: fully faithful write >
 partly faithful write > NOOP ≈ unfaithful write > invalid output. In the probe, check that most
 states' mean reward is above the NOOP sample's. v3 changes the reward, so collect states with it.
-The v3 config also limits cards to `entry_tokens: 200` (one entity or event per card), and the Builder
-prompt asks for short cards, UPDATEs that copy every still-valid old fact, and MERGEs only within one
-entity or event. In the first probe with 600-token cards, edits of old entries lost a third of their
-facts and scored far below NOOP, while add-only writes already beat it.
+v3 has no design cap on entry length; learning to merge memories faithfully and compactly is part of
+what the Builder is trained for. Two terms carry this instead:
+
+- `length = −builder_length_weight × Σ max(0, tokens − entry_target_tokens) / Σ tokens` over the
+  entries the action writes (target 200, weight 1.0). A longer card is always legal, it just costs more.
+- `compression = builder_compression_weight × Σ saved / Σ parent tokens` over UPDATE/MERGE ops, where an
+  op's saving (parent tokens − result tokens) counts only if the result is faithful and every parent's
+  facts are retained. Concatenating N entries unchanged earns ≈0; a lossless rewrite to fewer tokens
+  earns up to the weight (1.0); a lossy or unfaithful rewrite earns nothing and also pays retention/faith.
+  This replaces v2's whole-memory compression term in v3. The retention inventory is capped at 60 facts
+  (novelty stays at 30), because compression is paid only when the inventory finds nothing missing.
+
+`entry_tokens` (4000 in rl_hidden_4b_v3.json) is now only the technical bound under which an entry can
+still be faith-checked and read in full; anything above it cannot be scored and stays illegal. The
+prompt shows `target_entry_tokens` and says that tokens beyond it are penalized, that UPDATE/MERGE must
+be lossless and short, and that MERGE is only for one entity or event.
 
 **Check the Builder itself.** If most windows fall back to raw text, the memory is mostly the raw
 history and QA measures retrieval over raw chunks, not the Builder. Diagnose a build run:

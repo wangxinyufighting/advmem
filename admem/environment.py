@@ -451,6 +451,31 @@ class Environment:
                 "compression_eligible": compression_eligible, "safe_compression": safe_compression,
                 "noop": not action["ops"], **checks, "proposed": proposed}
 
+    def _edit_compression(self, state, action, changed, faith_scores, checks):
+        """v3按操作的无损压缩：Σ(忠实且旧条目全保留的UPDATE/MERGE节省的token) / Σ(被改写旧条目的token)。
+        原样拼接≈0；有损或不忠实的改写不计节省（但其旧条目token仍计入分母）。返回(比例, 分母)。"""
+        index = {e["id"]: e for e in state["M"]}
+        written = {e["id"]: (e, ok) for e, ok in zip(changed, faith_scores)}
+        retained = {c["entry_id"]: c.get("retained", False) for c in checks.get("retention_checks", [])}
+        saved = total = 0
+        for i, op in enumerate(action["ops"]):
+            if op["op"] not in {"UPDATE", "MERGE"}:
+                continue
+            parents = [op["id"]] if op["op"] == "UPDATE" else list(op["ids"])
+            eid = op["id"] if op["op"] == "UPDATE" else "m_" + digest([digest(state["M"]), i, op])[:20]
+            entry, ok = written.get(eid, (None, False))
+            parent_tokens = sum(self.counter.count(index[p]["text"]) for p in parents)
+            total += parent_tokens
+            if entry is not None and ok and all(retained.get(p, False) for p in parents):
+                saved += max(0, parent_tokens - self.counter.count(entry["text"]))
+        return (saved / total if total else 0.0), total
+
+    def _length_excess(self, changed):
+        """写入条目超出entry_target_tokens的token数占写入token总数的比例（0…1）。"""
+        target = self.cfg.entry_target_tokens
+        sizes = [self.counter.count(e["text"]) for e in changed]
+        return sum(max(0, n - target) for n in sizes) / sum(sizes) if sizes and sum(sizes) else 0.0
+
     def _test_memory(self, full, memory, q):
         rids = q.get("context_rids") or []
         return augment(memory, raw_chunks(full, rids, self.counter, self.cfg.timeline_tokens)) if rids else memory
@@ -493,7 +518,9 @@ class Environment:
         - 覆盖率只把“由忠实条目（或原有条目）见证”的新事实算作存下，同样不再全有或全无；
         - 漏存扣分：窗口有n个新事实、忠实地存下k个，扣omission_weight×(1−k/n)。NOOP也计算，
           所以窗口里有该存的新事实时NOOP为负——不写不再是零风险的选择；
-        - faith权重由配置给出（rl_hidden_4b_v3.json里降到1.0）；保留/冗余检查用限30条的事实清单。"""
+        - faith权重由配置给出（rl_hidden_4b_v3.json里降到1.0）；冗余检查的事实清单限30条，保留检查限60条；
+        - 压缩按操作计：每个UPDATE/MERGE若结果忠实且旧条目事实全保留，按节省token/旧条目总token计分；
+        - 软长度（entry_target_tokens>0）：写入条目超出目标长度的token占写入token的比例×length_weight扣分。"""
         cfg = self.cfg
         v3 = cfg.builder_reward == "v3"
         invalid_reward = rv2.builder_invalid_reward_v2(cfg)
@@ -585,6 +612,15 @@ class Environment:
         }
         if v3:
             components["omission"] = -cfg.builder_omission_weight * (1.0 - coverage["ratio"]) if has_new else 0.0
+            edit_saving, edit_parent_tokens = self._edit_compression(state, action, changed, faith_scores, checks)
+            components["compression"] = cfg.builder_compression_weight * edit_saving
+            length_excess = self._length_excess(changed) if cfg.entry_target_tokens > 0 else 0.0
+            if cfg.entry_target_tokens > 0:
+                components["length"] = -cfg.builder_length_weight * length_excess
+            v3_extra = {"edit_saving_ratio": edit_saving, "edit_parent_tokens": edit_parent_tokens,
+                        "length_excess": length_excess}
+        else:
+            v3_extra = {}
         reward = sum(components.values())
         quality_ok = faithful and loss == 0 and checks["retention_pass"] and not checks["redundant_ops"]
         return {"reward": reward, "effective_reward": reward, "reward_components": components,
@@ -601,7 +637,7 @@ class Environment:
                 "coverage": coverage, "before_tokens": before_size, "after_tokens": after_size,
                 "growth_ratio": growth_ratio, "shrink_ratio": shrink_ratio,
                 "compression_eligible": compression_eligible, "safe_compression": safe_compression,
-                "noop": noop, **checks, "proposed": proposed}
+                "noop": noop, **v3_extra, **checks, "proposed": proposed}
 
     def attacker_score(self, full, state, completion):
         if self.cfg.attacker_reward == "v2":

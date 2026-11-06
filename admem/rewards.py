@@ -69,9 +69,12 @@ def builder_v2_family(cfg):
 def builder_invalid_reward_v2(cfg):
     """v2/v3合法奖励的下界：loss、faith、retention各≤1×权重，growth≤size_weight，冗余≤cap个操作；
     v3的覆盖项最低为−omission_weight。非法输出再低1。"""
-    omission = cfg.builder_omission_weight if cfg.builder_reward == "v3" else 0.0
+    v3 = cfg.builder_reward == "v3"
+    omission = cfg.builder_omission_weight if v3 else 0.0
+    length = cfg.builder_length_weight if v3 and cfg.entry_target_tokens > 0 else 0.0
     return -(cfg.builder_loss_weight + cfg.builder_faith_weight + cfg.builder_retention_weight
-             + cfg.size_weight + cfg.builder_redundancy_weight * cfg.builder_redundancy_cap + omission + 1.0)
+             + cfg.size_weight + cfg.builder_redundancy_weight * cfg.builder_redundancy_cap + omission + length
+             + 1.0)
 
 
 def flip_delta(before_k, after_k, before_2k=None, after_2k=None):

@@ -165,9 +165,13 @@ TIME
   when useful. Otherwise never treat the conversation date as the event date.
 
 OPERATIONS
-- Keep cards short: one entity or event per card, well within max_entry_tokens. Split a long
-  assistant answer into several cards (one per recommendation group or list range); never pack a whole
-  conversation into one card. A new topic always gets its own ADD.
+- One entity or event per card. Split a long assistant answer into several cards (one per
+  recommendation group or list range); never pack a whole conversation into one card. A new topic
+  always gets its own ADD.
+- Length: when target_entry_tokens is given, aim for it (about 3 English words per 4 tokens). Every
+  token beyond it is penalized, so a longer card is never free; max_entry_tokens is only the
+  validator's ceiling. UPDATE and MERGE must be lossless and as short as possible: a shorter rewrite
+  that keeps every fact of the old entries is rewarded, and a dropped fact costs more than any saving.
 - ADD: an entity, event or fact not yet represented in M_old or stored_catalog. When unsure whether a
   detail belongs to an existing entry, ADD a new entry rather than editing an old one.
 - UPDATE: the same entity or event only. UPDATE replaces the whole text, so copy every still-valid fact
@@ -412,6 +416,8 @@ def builder_prompt(full, memory, old_ids, x, mode, hint, cfg, counter,
             "max_ops": cfg.max_ops,
             "max_entry_tokens": limit,
         }
+        if getattr(cfg, "entry_target_tokens", 0) > 0:
+            payload["target_entry_tokens"] = cfg.entry_target_tokens
         if v2:
             payload.pop("write_required")
         if hint is not None:

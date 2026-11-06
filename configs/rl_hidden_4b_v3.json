@@ -14,7 +14,7 @@
   "judge_input_tokens": 30000,
   "window_tokens": 1800,
   "old_entries": 40,
-  "entry_tokens": 200,
+  "entry_tokens": 4000,
   "timeline_tokens": 300,
   "catalog_entry_tokens": 96,
   "catalog_tokens": 3200,
@@ -65,5 +65,8 @@
   "salvage": true,
   "budget_priority": "editable",
   "reader_order": "time",
-  "builder_omission_weight": 0.5
+  "builder_omission_weight": 0.5,
+  "entry_target_tokens": 200,
+  "builder_length_weight": 1.0,
+  "builder_compression_weight": 1.0
 }
