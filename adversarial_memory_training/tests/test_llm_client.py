@@ -81,3 +81,29 @@ def test_post_retries_http_200_provider_error_without_caching(tmp_path, monkeypa
     assert result["choices"]
     assert client.calls == 2
     assert list(tmp_path.glob("*.json"))
+
+
+def test_extra_headers_are_sent_but_not_part_of_cache_key(tmp_path, monkeypatch):
+    monkeypatch.setenv("JUDGE_MODEL", "fake")
+    monkeypatch.setenv("JUDGE_BASE_URL", "http://fake/v1")
+    monkeypatch.setenv("JUDGE_EXTRA_HEADERS", '{"X-Response-Format": "openai"}')
+    client = Client.from_env("JUDGE", tmp_path)
+    seen = {}
+
+    def capture(req, timeout):
+        seen.update({k.lower(): v for k, v in req.header_items()})
+        return _Response({"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", capture)
+    payload = {"model": "fake", "messages": [], "max_tokens": 8}
+    client.post("/chat/completions", payload, "n")
+    assert seen["x-response-format"] == "openai" and seen["authorization"].startswith("Bearer ")
+    assert _request_cache_path(client, tmp_path, payload, "n").exists()  # 缓存键不含请求头
+
+
+def test_extra_headers_must_be_a_string_map(tmp_path, monkeypatch):
+    import pytest
+    monkeypatch.setenv("JUDGE_MODEL", "fake")
+    monkeypatch.setenv("JUDGE_EXTRA_HEADERS", '["X-Response-Format"]')
+    with pytest.raises(ValueError):
+        Client.from_env("JUDGE", tmp_path)

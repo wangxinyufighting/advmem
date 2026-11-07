@@ -19,20 +19,28 @@ class ModelError(RuntimeError):
 
 class Client:
     def __init__(self, model: str, base_url: str, api_key: str = "EMPTY",
-                 cache_dir: str | Path = ".cache/api", max_calls: int = 10000):
+                 cache_dir: str | Path = ".cache/api", max_calls: int = 10000, headers: dict | None = None):
         if not model:
             raise ValueError("请配置模型名，例如 LLM_MODEL 或 ATTACKER_MODEL")
         self.model, self.base_url, self.api_key = model, base_url.rstrip("/"), api_key
+        # 额外请求头（例如Cline需要 X-Response-Format: openai 才返回usage）；不进缓存键。
+        self.headers = dict(headers or {})
         self.cache_dir = Path(cache_dir)
         self.max_calls, self.calls, self.cache_hits = max_calls, 0, 0
 
     @classmethod
     def from_env(cls, role: str, cache_dir: str | Path = ".cache/api") -> "Client":
         # 各角色可用不同模型/服务；没有覆盖时共用 LLM_*。
+        # <ROLE>_EXTRA_HEADERS / LLM_EXTRA_HEADERS：JSON对象，例如 '{"X-Response-Format": "openai"}'。
+        raw = os.getenv(f"{role}_EXTRA_HEADERS", os.getenv("LLM_EXTRA_HEADERS", "")).strip()
+        headers = json.loads(raw) if raw else {}
+        if not isinstance(headers, dict) or not all(isinstance(k, str) and isinstance(v, str)
+                                                    for k, v in headers.items()):
+            raise ValueError(f"{role}_EXTRA_HEADERS 必须是字符串到字符串的JSON对象")
         return cls(os.getenv(f"{role}_MODEL", os.getenv("LLM_MODEL", "")),
                    os.getenv(f"{role}_BASE_URL", os.getenv("LLM_BASE_URL", "https://api.openai.com/v1")),
                    os.getenv(f"{role}_API_KEY", os.getenv("LLM_API_KEY", "EMPTY")), cache_dir,
-                   int(os.getenv("MAX_API_CALLS", "10000")))
+                   int(os.getenv("MAX_API_CALLS", "10000")), headers)
 
     @staticmethod
     def _response_error(endpoint: str, result: Any) -> str | None:
@@ -82,7 +90,7 @@ class Client:
         req = urllib.request.Request(self.base_url + endpoint, raw, method="POST", headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
-                "User-Agent": "Mozilla/5.0"}) 
+                "User-Agent": "Mozilla/5.0", **self.headers})
         
         last = None
         # 服务端瞬时过载/断连时多给几次机会，退避可配：API_RETRIES / API_BACKOFF。
