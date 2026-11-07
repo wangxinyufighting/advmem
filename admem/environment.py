@@ -323,12 +323,19 @@ class Environment:
         key = digest([full.fingerprint, q])
         oracle = self.judge(GATE_ORACLE_SYSTEM, {"q": q["q"], "question_date": date, "type": qtype,
                               "E_history": evidence}, "oracle:" + key)
-        valid = all(boolean(oracle, k) for k in ["answerable", "user_relevant", "type_valid", "no_answer_leak"])
-        if qtype == "multi-session":
-            valid = valid and len({full.rounds[r].session_id for r in q["E"]}) >= 2
+        failed = []
+        for k in ["answerable", "user_relevant", "type_valid", "no_answer_leak"]:
+            if failed:  # 已判失败：其余字段只用于诊断，非布尔值不再当作服务失败
+                if oracle.get(k) is False:
+                    failed.append(k)
+            elif not boolean(oracle, k):
+                failed.append(k)
+        if qtype == "multi-session" and len({full.rounds[r].session_id for r in q["E"]}) < 2:
+            failed.append("single_session_evidence")
         result = {"item": q, "oracle": oracle}
-        if not valid:
-            return dict(result, status="rejected", reason="oracle_or_type")
+        if failed:
+            # reason保持oracle_or_type（奖励映射依赖它）；failed_checks说明具体是哪一项。
+            return dict(result, status="rejected", reason="oracle_or_type", failed_checks=failed)
         support = self.judge(GATE_SUPPORT_SYSTEM, {"q": q["q"], "a": q["a"], "oracle_answer": oracle.get("answer"),
             "type": qtype, "question_date": date, "E_history": evidence}, "support:" + key)
         result["support"] = support

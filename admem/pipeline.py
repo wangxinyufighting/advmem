@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
 import time
 from collections import Counter
 from copy import deepcopy
@@ -476,7 +477,7 @@ def all_pass(memory, questions, env, full=None):
 
 
 def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=None,
-             builder_role="BUILDER", attacker_role="ATTACKER", collect=None):
+             builder_role="BUILDER", attacker_role="ATTACKER", collect=None, verify_demos=True):
     out = Path(out)
     # 保存策略服务身份和所有输入：更换checkpoint必须换模型名/out，避免缓存混用。
     signature = {"full": full.fingerprint, "context": context, "config": env.cfg.fingerprint(), "mode": mode,
@@ -529,10 +530,17 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
             if collect:
                 # 不把逐字fallback当作模型的SFT目标。无tests只用于faith+格式示范。
                 # salvage模式下只有无需修复、整体通过的原始输出才是示范（clean）。
-                useful_demo = demo_ok and (all_pass(proposal, state["tests"], env, full) if tests
-                                           else bool(parse(raw)["ops"]))
+                # verify_demos=False（CLI默认）：不为判断“能否当SFT示范”而把每道测试题再答一遍
+                # （每窗口最多 replay_questions×2 次调用）；GRPO只用状态，不用示范。有测试题的窗口
+                # 此时不保存示范；收集teacher示范时用 run --verify-demos。
+                if tests and not verify_demos:
+                    useful_demo = False
+                else:
+                    useful_demo = demo_ok and (all_pass(proposal, state["tests"], env, full) if tests
+                                               else bool(parse(raw)["ops"]))
                 collect.save(state, raw if useful_demo else None,
-                             {"faith": demo_ok, "tests_verified": bool(tests) and useful_demo, "semantic_imitation": True})
+                             {"faith": demo_ok, "tests_verified": bool(tests) and useful_demo,
+                              "demo_checked": bool(verify_demos or not tests), "semantic_imitation": True})
             try:
                 n_ops = len(parse(raw)["ops"])
             except (InvalidAction, KeyError, TypeError):
@@ -662,7 +670,8 @@ def run_case(full, full_path, context, env, out, *, mode="closed_loop", bank=Non
 
 
 def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_path=None, attempt=0,
-               memory=None, scheduler=None, defects_only=False, collect=None):
+               memory=None, scheduler=None, defects_only=False, collect=None, teacher_role=None,
+               teacher_types=()):
     """Run one pack (attacker propose + gate). Raises Unknown on API/service failure.
 
     Pure with respect to the caller's ``accepted``/``logs`` so a failed pack can
@@ -672,6 +681,9 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
     题级（gate的judge装不下）只把该题记为over_budget，同包其余题照常判定。
     memory非空时attacker针对这份记忆出题（看得到provenance标记与memory_entries），通过gate的题
     记录defect类别；defects_only=True时不暴露缺陷的题记为accepted_no_defect、不进bank。
+
+    teacher_role：计划题型与teacher_types有交集的pack改由该角色出题（例如multi-session交给DeepSeek）。
+    同一批题的gate并发执行（每题的判定只依赖题目本身；日志、去重和入库顺序与逐题执行相同）。
     """
     memory = list(memory or [])
     balanced = resolve_type_policy(env.cfg) == "balanced"
@@ -722,6 +734,10 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
             info["type_plan"] = dict(state["type_plan"])
         if state.get("budget_dropped_rids"):
             info["budget_dropped_rounds"] = len(state["budget_dropped_rids"])
+        planned = set(state.get("type_plan") or {state["qtype"]: 1})
+        if teacher_role and planned & set(teacher_types):
+            role = teacher_role
+        info["policy_role"] = role
         remote = env.policy(role)
         nonce = "bank:" + digest([state["prompt"], remote.tag])
         snapshot("prepared", prompt=state["prompt"], prompt_hash=digest(state["prompt"]),
@@ -746,17 +762,17 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
             logs.append({**info, "status": "empty"})
         new_items, seen = [], {question_key(x) for x in accepted}
         plan, used = state.get("type_plan"), Counter()
-        for q in data["items"]:
-            qtype = plan_item_type(state, q, used)
+        # 题型槽位按原顺序分配（与逐题执行相同），之后各题的gate并发执行。
+        jobs = [(q, plan_item_type(state, q, used)) for q in data["items"]]
+        def judge_item(job):
+            q, qtype = job
             try:
                 if plan:
                     result = env.gate(full, pack, q, state["date"], qtype, seed_only=True)
                 else:
                     result = env.gate(full, pack, q, state["date"], qtype)
             except BudgetExceeded as exc:
-                logs.append({**info, "status": "over_budget", **exc.details(), "item": q})
-                snapshot("gating", logs=logs, added_items=new_items)
-                continue
+                return {**info, "status": "over_budget", **exc.details(), "item": q}
             row = {**info, **result}
             if plan and isinstance(q, dict) and q.get("type") in TYPES:
                 row["qtype"] = q["type"]
@@ -781,11 +797,36 @@ def _bank_pack(full, full_path, context, pack, pi, accepted, env, role, trace_pa
                         row.update(defect="over_budget", defect_budget=exc.details())
                     if defects_only and row["defect"] not in REPAIRABLE_DEFECTS:
                         row["status"] = "accepted_no_defect"
-                if row["status"] == "accepted" and question_key(checked) not in seen:
-                    seen.add(question_key(checked))
-                    new_items.append(checked)
-            logs.append(row)
-            snapshot("gating", logs=logs, added_items=new_items)
+            return row
+
+        # 已完成的判定随时写进trace（顺序与逐题执行相同）：后面的题API失败时，前面题的判定仍可查。
+        done, lock = [None] * len(jobs), threading.Lock()
+
+        def committed(rows):
+            keys, added = set(seen), []
+            for row in rows:
+                if row["status"] == "accepted" and question_key(row["item"]) not in keys:
+                    keys.add(question_key(row["item"]))
+                    added.append(row["item"])
+            return added
+
+        def run(indexed):
+            i, job = indexed
+            row = judge_item(job)
+            with lock:
+                done[i] = row
+                prefix = []
+                for item in done:
+                    if item is None:
+                        break
+                    prefix.append(item)
+                snapshot("gating", logs=prefix, added_items=committed(prefix))
+            return row
+
+        snapshot("gating", logs=[], added_items=[])
+        logs.extend(pmap(run, list(enumerate(jobs))))
+        new_items = committed(logs)
+        snapshot("gating", logs=logs, added_items=new_items)
         snapshot("complete", logs=logs, added_items=new_items)
         if collect is not None:
             # attacker GRPO状态（与closed_loop相同的规则）：只有每题都原样通过gate时才保存为SFT示范。
@@ -811,7 +852,8 @@ def pool_index(cfg, key, pi, size, latest_share):
 
 
 def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory=None, base_bank=None,
-                  memory_source=None, defects_only=False, collect=None, memory_pool=None, latest_share=0.5):
+                  memory_source=None, defects_only=False, collect=None, memory_pool=None, latest_share=0.5,
+                  teacher_role=None, teacher_types=()):
     """为一个case生成题库。
 
     memory：attacker针对的当前M（默认空M，即旧行为的冷启动题库）。base_bank：已有题库，作为
@@ -870,7 +912,8 @@ def generate_bank(full, full_path, context, env, out, role="ATTACKER", *, memory
                 info, pack_logs, new_items = _bank_pack(
                     full, full_path, context, pack, pi, accepted, env, role,
                     trace_path=trace_path, attempt=attempt, memory=memories[chosen][1], scheduler=scheduler,
-                    defects_only=defects_only, collect=collect)
+                    defects_only=defects_only, collect=collect, teacher_role=teacher_role,
+                    teacher_types=teacher_types)
                 if len(memories) > 1:
                     for row in pack_logs:
                         row["memory_pool_index"] = chosen

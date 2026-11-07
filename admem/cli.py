@@ -582,6 +582,13 @@ def main(argv=None):
     p.add_argument("--builder-role", default="BUILDER")
     p.add_argument("--attacker-role", default="ATTACKER")
     p.add_argument("--collect", help="保存状态和通过验证的模型示范")
+    p.add_argument("--verify-demos", action="store_true",
+                   help="run --collect：把每个有测试题的窗口的Builder输出用全部测试题再答一遍，通过的才存为SFT示范"
+                        "（每窗口最多 replay_questions×2 次API调用）。只做GRPO时不需要；收集teacher示范时打开")
+    p.add_argument("--teacher-role",
+                   help="bank：计划题型属于--teacher-types的pack改由该角色出题（如 ATTACKER_EVAL 指向DeepSeek）")
+    p.add_argument("--teacher-types", nargs="+", default=["multi-session"],
+                   help="与--teacher-role配合的题型，默认 multi-session")
     p.add_argument("--bank", help="bank命令输出根目录，用于stream训练状态的自生成问答奖励")
     p.add_argument("--memory-run", help="bank/attacker-probe：用该run目录下每个case的记忆快照作为attacker"
                    "针对的当前M（默认空M，即冷启动题库）")
@@ -771,13 +778,14 @@ def main(argv=None):
                                   memory=memory, base_bank=base, memory_source=source,
                                   defects_only=a.defects_only,
                                   collect=Collector(a.collect) if a.collect else None,
-                                  memory_pool=pool, latest_share=a.memory_latest_share)
+                                  memory_pool=pool, latest_share=a.memory_latest_share,
+                                  teacher_role=a.teacher_role, teacher_types=tuple(a.teacher_types))
                 result = {"status": "ok", "questions": n}
             else:
                 bank = read(Path(a.bank) / key / "bank.json") if a.bank else []
                 result = run_case(full, full_path, context, env, Path(a.out) / key, mode=a.mode, bank=bank,
                     builder_role=a.builder_role, attacker_role=a.attacker_role,
-                    collect=Collector(a.collect) if a.collect else None)
+                    collect=Collector(a.collect) if a.collect else None, verify_demos=a.verify_demos)
             report, suffix = {"key": key, **result}, ""
         except Unknown as exc:
             # 单个case的API/服务失败：记为unknown、丢弃该样本，继续后面的case。

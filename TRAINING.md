@@ -340,6 +340,15 @@ python -m admem.cli merge --config configs/rl_hidden_4b_v2.json --model /models/
   --out /models/builder_sft
 ```
 
+To collect demonstrations, run the collector with `--verify-demos` (and a strong `BUILDER`, e.g. the API
+model) — without it, windows with test questions store states only.
+
+Multi-session questions are hard for a 4B attacker (in one bank only 4 of 285 passed the gate). `bank
+--teacher-role ATTACKER_EVAL --teacher-types multi-session` lets the role configured as `ATTACKER_EVAL_*`
+(e.g. DeepSeek) write the packs whose planned type is listed; the other types still come from the
+attacker, and `--collect` stores the teacher's accepted outputs as attacker demonstrations. Rejected
+multi-session questions now record `failed_checks` (`type_valid`, `single_session_evidence`, ...).
+
 Use the merged model as `--model` below. If you change the Builder this way, re-run the
 `builder_states` stage with it, so the states reflect the policy you start RL from.
 
@@ -579,6 +588,20 @@ Each call keeps its request, nonce and cache key, so rewards and metrics are ide
 runs; only the wall time changes. Peak API concurrency during training is about `batch × group ×
 ADMEM_PARALLEL_CALLS` (256 with the defaults). If the API starts answering 429, lower
 `ADMEM_PARALLEL_CALLS` before lowering the batch.
+
+Data preparation (`bank`, `run --collect`) avoids calls that do not change the data:
+
+- `run --collect` no longer re-answers every test question of a window just to decide whether the
+  Builder's output is a verified SFT demonstration (up to `replay_questions × 2` calls per window).
+  GRPO only uses the states. Pass `--verify-demos` when you collect teacher demonstrations for SFT.
+- `bank` sends the questions of one pack through the gate concurrently (up to `ADMEM_PARALLEL_CALLS`
+  at a time). Logs, deduplication and the bank are identical to one-at-a-time gating.
+- To see where the calls go, `python scripts/api_breakdown.py --cache <cache>/api --since 2h` groups the
+  cached requests by prompt (gate oracle/support/screen, reader, grade, faith, ...).
+
+Per accepted bank question the gate costs oracle + support (+ screen for multi-session, knowledge-update,
+temporal and "all/total/latest" questions) + closed-book reader and grade + the reader check on the cited
+evidence (`require_reader_answerable`, reader and grade); a question rejected by the oracle costs one call.
 
 If it is still too slow, these change cost but also what is measured: fewer validation cases
 (`--val-per-type 1`) or questions (`--max-bank-questions 20`), a larger `--eval-every`, `--group 4`, or a
