@@ -303,6 +303,14 @@ what the Builder is trained for. Two terms carry this instead:
   This replaces v2's whole-memory compression term in v3. The retention inventory is capped at 60 facts
   (novelty stays at 30), because compression is paid only when the inventory finds nothing missing.
 
+In v3 the fact inventories (retention and novelty) count only information a user could ask about:
+entities and names, numbers, dates and order, the user's preferences, plans, decisions and experiences,
+and concrete assistant outputs (each recommendation or list item, steps, identifiers, created content).
+Wording, tone, promotional phrasing, generic explanations and the conversation process itself ("the
+user asked to expand the text") are not facts, so a shorter rewrite that keeps the information counts as
+lossless. An entry with none of this information has an empty inventory (nothing to retain); a write
+with none of it is redundant (`no_answerable_facts`).
+
 `entry_tokens` (4000 in rl_hidden_4b_v3.json) is now only the technical bound under which an entry can
 still be faith-checked and read in full; anything above it cannot be scored and stays illegal. The
 prompt shows `target_entry_tokens` and says that tokens beyond it are penalized, that UPDATE/MERGE must
@@ -608,6 +616,12 @@ If it is still too slow, these change cost but also what is measured: fewer vali
 smaller `replay_questions` in the config (reward-relevant: re-collect the states).
 
 ## 13. Troubleshooting
+
+Judge and reader replies that are valid JSON but do not match the expected fields (a string instead of
+a boolean, a missing field, an inventory fact with extra keys) are asked again with the error attached,
+up to `JUDGE_SCHEMA_RETRIES` times (default 2; `0` restores the old behaviour, where the sample became
+Unknown). The first request is unchanged, so cached results still apply; retries use their own cache
+keys. Transport failures are retried by the client (`API_RETRIES`), not here.
 
 | Symptom | Cause / fix |
 | --- | --- |

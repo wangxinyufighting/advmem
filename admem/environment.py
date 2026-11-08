@@ -19,9 +19,35 @@ from .store import round_dates
 
 
 def boolean(value, field):
-    if type(value.get(field)) is not bool:
+    if not isinstance(value, dict) or type(value.get(field)) is not bool:
         raise Unknown(f"Judge field {field} must be boolean")
     return value[field]
+
+
+SCHEMA_RETRY = ("Your previous reply could not be used: {error}. Answer the same task again and reply with "
+                "exactly one JSON object in the required format, with every required field and the required "
+                "value types (true/false for booleans, lists for lists).")
+
+
+def schema_retries():
+    """judge/reader格式不合时的重问次数（JUDGE_SCHEMA_RETRIES，默认2；0=不重问，旧行为）。"""
+    import os
+    return max(0, int(os.getenv("JUDGE_SCHEMA_RETRIES", "2")))
+
+
+def _requires_bool(field):
+    def check(value):
+        boolean(value, field)
+        return value
+    return check
+
+
+def _oracle_check(value):
+    """与gate的判定顺序一致：第一个False之前的字段都必须是布尔值；之后的只做诊断。"""
+    for field in ["answerable", "user_relevant", "type_valid", "no_answer_leak"]:
+        if not boolean(value, field):
+            break
+    return value
 
 
 def rejection_reward(gate):
@@ -98,6 +124,28 @@ class Environment:
                 self.clients[role] = Remote(role, self.llm_module.Client, str(Path(self.cfg.cache) / "api"))
             return self.clients[role]
 
+    def judge_checked(self, system, payload, key, check):
+        """judge + 格式校验。check校验并转换JSON（不合格式时抛Unknown）；格式不合时在payload里附上
+        错误说明重问，最多JUDGE_SCHEMA_RETRIES次（默认2）。第一次请求与以前完全相同，已有缓存照常
+        命中；重问用新的key，结果同样进缓存，重跑可复现。传输失败不在这里重试。"""
+        value = self.judge(system, payload, key)  # 传输失败在这里直接抛出
+        try:
+            return check(value)
+        except Unknown as exc:
+            error = exc
+        for attempt in range(1, schema_retries() + 1):
+            retry = {**payload, "previous_reply_error": SCHEMA_RETRY.format(error=str(error)[:300])}
+            value = self.judge(system, retry, f"{key}:schema-retry{attempt}")
+            try:
+                result = check(value)
+            except Unknown as exc:
+                error = exc
+                continue
+            with self._lock:
+                self.schema_retry_successes = getattr(self, "schema_retry_successes", 0) + 1
+            return result
+        raise error
+
     def judge(self, system, payload, key):
         prompt = messages(system, payload)
         count = self.counter.prompt_count(prompt)
@@ -108,6 +156,30 @@ class Environment:
                                   "faith" if system == prompts.FAITH else "other"),
                 tokens=count, limit=self.cfg.judge_input_tokens)
         return self.policy("JUDGE").json(prompt, "judge:" + key, prompt_tokens=count)
+
+    def checked_json(self, role, prompt, nonce, count, check=None):
+        """role的JSON调用 + 格式校验。传输失败（Remote抛的Unknown）不在这里重试；只有check判定
+        格式不合时才带着错误说明重问（新的nonce，结果同样进缓存，重跑时可复现）。"""
+        value = self.policy(role).json(prompt, nonce, prompt_tokens=count)
+        if check is None:
+            return value
+        try:
+            return check(value)
+        except Unknown as exc:
+            error = exc
+        for attempt in range(1, schema_retries() + 1):
+            retry = prompt + [{"role": "user", "content": SCHEMA_RETRY.format(error=str(error)[:300])}]
+            value = self.policy(role).json(retry, f"{nonce}:schema-retry{attempt}",
+                                           prompt_tokens=self.counter.prompt_count(retry))
+            try:
+                result = check(value)
+            except Unknown as exc:
+                error = exc
+                continue
+            with self._lock:
+                self.schema_retry_successes = getattr(self, "schema_retry_successes", 0) + 1
+            return result
+        raise error
 
     def index(self, documents):
         if not documents:
@@ -148,15 +220,17 @@ class Environment:
         if count > self.cfg.reader_tokens + 1500:
             raise BudgetExceeded(f"Reader prompt exceeds budget ({count}>{self.cfg.reader_tokens + 1500})",
                                  stage="reader", tokens=count, limit=self.cfg.reader_tokens + 1500)
-        value = self.policy("DEFENDER").json(prompt, "reader:" + key, prompt_tokens=count)
-        if not isinstance(value.get("answer"), str):
-            raise Unknown("Reader response has no answer string")
-        return value["answer"]
+        def check(value):
+            if not isinstance(value, dict) or not isinstance(value.get("answer"), str):
+                raise Unknown("Reader response has no answer string")
+            return value["answer"]
+
+        return self.checked_json("DEFENDER", prompt, "reader:" + key, count, check)
 
     def grade(self, q, answer, key, abstention=False):
-        value = self.judge(prompts.GRADE, {"question": q["q"], "reference": q["a"],
-            "prediction": answer, "type": q["type"], "abstention": abstention}, "grade:" + key)
-        return boolean(value, "correct")
+        return self.judge_checked(prompts.GRADE, {"question": q["q"], "reference": q["a"],
+            "prediction": answer, "type": q["type"], "abstention": abstention}, "grade:" + key,
+            lambda v: boolean(v, "correct"))
 
     def render_entry(self, entry):
         """reader看到的条目文本。builder_prompt=v2时，模型卡片前加host记录的来源日期；
@@ -217,8 +291,9 @@ class Environment:
         return result
 
     def _faith_one(self, full, entry):
-        return self.judge(prompts.FAITH, {"entries": [entry],
-            "history": prompts.source_view(full, entry["prov"])}, digest([full.fingerprint, entry]))
+        return self.judge_checked(prompts.FAITH, {"entries": [entry],
+            "history": prompts.source_view(full, entry["prov"])}, digest([full.fingerprint, entry]),
+            _requires_bool("faithful"))
 
     def faith(self, full, changed):
         if not changed:
@@ -240,9 +315,10 @@ class Environment:
         """salvage：在给定round范围（窗口+父条目来源）里复核一条条目，返回(faithful, support_rids, value)。
         support_rids只保留范围内的rid；faithful但没给出可用rid时视为不成立。"""
         scope = full.ordered(rids)
-        value = self.judge(prompts.FAITH_LOCATE, {"entry": {"text": entry["text"]},
+        value = self.judge_checked(prompts.FAITH_LOCATE, {"entry": {"text": entry["text"]},
                            "history": prompts.source_view(full, scope)},
-                           "faith_locate:" + digest([full.fingerprint, entry["text"], scope]))
+                           "faith_locate:" + digest([full.fingerprint, entry["text"], scope]),
+                           _requires_bool("faithful"))
         support = value.get("support_rids")
         support = [r for r in dict.fromkeys(support) if r in set(scope)] if isinstance(support, list) else []
         ok = boolean(value, "faithful") and bool(support)
@@ -321,8 +397,8 @@ class Environment:
             return {"status": "rejected", "reason": str(exc), "item": q}
         evidence = prompts.source_view(full, q["E"])
         key = digest([full.fingerprint, q])
-        oracle = self.judge(GATE_ORACLE_SYSTEM, {"q": q["q"], "question_date": date, "type": qtype,
-                              "E_history": evidence}, "oracle:" + key)
+        oracle = self.judge_checked(GATE_ORACLE_SYSTEM, {"q": q["q"], "question_date": date, "type": qtype,
+                              "E_history": evidence}, "oracle:" + key, _oracle_check)
         failed = []
         for k in ["answerable", "user_relevant", "type_valid", "no_answer_leak"]:
             if failed:  # 已判失败：其余字段只用于诊断，非布尔值不再当作服务失败
@@ -336,8 +412,9 @@ class Environment:
         if failed:
             # reason保持oracle_or_type（奖励映射依赖它）；failed_checks说明具体是哪一项。
             return dict(result, status="rejected", reason="oracle_or_type", failed_checks=failed)
-        support = self.judge(GATE_SUPPORT_SYSTEM, {"q": q["q"], "a": q["a"], "oracle_answer": oracle.get("answer"),
-            "type": qtype, "question_date": date, "E_history": evidence}, "support:" + key)
+        support = self.judge_checked(GATE_SUPPORT_SYSTEM, {"q": q["q"], "a": q["a"], "oracle_answer": oracle.get("answer"),
+            "type": qtype, "question_date": date, "E_history": evidence}, "support:" + key,
+            _requires_bool("correct"))
         result["support"] = support
         if not boolean(support, "correct"):
             return dict(result, status="rejected", reason="unsupported_answer")
@@ -347,12 +424,18 @@ class Environment:
             rids, fitted = self._screen_rids(full, q)
             if fitted:
                 result["screen_budget"] = fitted
-            screen = self.judge(prompts.SCREEN, {"candidate": q, "history": prompts.source_view(full, rids)},
-                                "screen:" + key)
-            for field in ("additional_rids", "wrong_rids"):
-                value = screen.get(field, [])
-                if not isinstance(value, list) or any(not isinstance(r, str) for r in value) or not set(value) <= rids:
-                    raise Unknown(f"Screen returned invalid {field}")
+
+            def screen_check(value):
+                for field in ("additional_rids", "wrong_rids"):
+                    found = value.get(field, []) if isinstance(value, dict) else None
+                    if not isinstance(found, list) or any(not isinstance(r, str) for r in found) \
+                            or not set(found) <= rids:
+                        raise Unknown(f"Screen returned invalid {field}")
+                boolean(value, "stable")
+                return value
+
+            screen = self.judge_checked(prompts.SCREEN, {"candidate": q, "history": prompts.source_view(full, rids)},
+                                "screen:" + key, screen_check)
             result["screen"] = screen
             if not boolean(screen, "stable"):
                 return dict(result, status="rejected", reason="scope_or_completeness")
@@ -702,16 +785,19 @@ class Environment:
         payload = {"q": q["q"], "a": q["a"], "type": q["type"],
                    "E_history": prompts.source_view(full, q["E"]),
                    "prior_questions": [{"index": i, "q": p["q"]} for i, p in enumerate(prior)]}
-        value = self.judge(EVIDENCE_AUDIT_SYSTEM, payload, "audit:" + digest([full.fingerprint, q, prior]))
-        needed = value.get("necessary_rids")
-        if (not isinstance(needed, list) or not needed or any(not isinstance(r, str) for r in needed)
-                or not set(needed) <= set(q["E"])):
-            raise Unknown("Evidence audit returned invalid necessary_rids")
-        duplicate = value.get("duplicate_of")
-        if duplicate is not None and (type(duplicate) is not int or not 0 <= duplicate < len(prior)):
-            raise Unknown("Evidence audit returned invalid duplicate_of")
-        return {"necessary_rids": sorted(set(needed)), "personal": boolean(value, "personal"),
-                "duplicate_of": duplicate, "reason": value.get("reason")}
+        def check(value):
+            needed = value.get("necessary_rids") if isinstance(value, dict) else None
+            if (not isinstance(needed, list) or not needed or any(not isinstance(r, str) for r in needed)
+                    or not set(needed) <= set(q["E"])):
+                raise Unknown("Evidence audit returned invalid necessary_rids")
+            duplicate = value.get("duplicate_of")
+            if duplicate is not None and (type(duplicate) is not int or not 0 <= duplicate < len(prior)):
+                raise Unknown("Evidence audit returned invalid duplicate_of")
+            return {"necessary_rids": sorted(set(needed)), "personal": boolean(value, "personal"),
+                    "duplicate_of": duplicate, "reason": value.get("reason")}
+
+        return self.judge_checked(EVIDENCE_AUDIT_SYSTEM, payload, "audit:" + digest([full.fingerprint, q, prior]),
+                                  check)
 
     def _attacker_score_v2(self, full, state, completion):
         """v2 attacker奖励（README第14.1节）。每题：
